@@ -1,0 +1,12 @@
+apiVersion: v2
+name: secaudit
+description: SecAudit compliance platform (API, workers, frontend)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - compliance
+  - security
+  - audit
+maintainers:
+  - name: SecAudit

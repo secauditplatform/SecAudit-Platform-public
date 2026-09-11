@@ -1,0 +1,175 @@
+# Default values for SecAudit production installs.
+# External PostgreSQL, Redis, and Keycloak are expected (BYO).
+# Bundled Postgres/Redis charts are intentionally not included; set postgresql.enabled
+# only if you wire an optional subchart later.
+
+nameOverride: ""
+fullnameOverride: ""
+
+appEnv: production
+
+# Chart does not ship in-cluster Postgres/Redis by default (BYO).
+postgresql:
+  enabled: false
+redis:
+  enabled: false
+
+imagePullSecrets: []
+
+api:
+  replicaCount: 2
+  image:
+    repository: secaudit/api
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8000
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+worker:
+  replicaCount: 2
+  image:
+    repository: secaudit/worker
+    tag: ""
+    pullPolicy: IfNotPresent
+  queues: "compliance,remediation,inventory,maintenance"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+beat:
+  replicaCount: 1
+  image:
+    repository: secaudit/worker
+    tag: ""
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+frontend:
+  replicaCount: 2
+  image:
+    repository: secaudit/frontend
+    tag: ""
+    pullPolicy: IfNotPresent
+  service:
+    type: ClusterIP
+    port: 8080
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+migrate:
+  image:
+    repository: secaudit/api
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Job is recreated on each upgrade when this changes.
+  hookWeight: "-5"
+
+# Prefer an existing Secret (recommended). When empty, chart creates one from values below.
+existingSecret: ""
+
+# Used only when existingSecret is empty. Do not commit real passwords into git.
+secrets:
+  secretKey: ""
+  postgresPassword: ""
+  redisPassword: ""
+  metricsBearerToken: ""
+  # Opt-in only during Fernet→KMS/Vault migration.
+  secretsFernetAllowedInProduction: "false"
+
+config:
+  authEnabled: "true"
+  localAuthEnabled: "false"
+  consoleEnabled: "false"
+  consoleAllowInProduction: "false"
+  secretsBackend: "fernet"
+  corsOrigins: "https://secaudit.example.com"
+  frontendBaseUrl: "https://secaudit.example.com"
+  profilesAutoSeed: "false"
+  sshStrictHostKeyChecking: "true"
+  winrmServerCertValidation: "validate"
+  otelEnabled: "false"
+  otelExporterOtlpEndpoint: ""
+  keycloakUrl: "https://keycloak.example.com"
+  keycloakIssuer: "https://keycloak.example.com/realms/secaudit"
+  keycloakRealm: "secaudit"
+  keycloakClientId: "secaudit-frontend"
+  keycloakAudience: "secaudit-api"
+
+externalDatabase:
+  host: postgres.example.com
+  port: 5432
+  database: secaudit
+  username: secaudit
+  # password comes from secret key postgres-password
+
+externalRedis:
+  # Example: redis://:PASSWORD@redis.example.com:6379/0
+  # When host is set, chart builds URLs from host/port/db + redis-password secret.
+  host: redis.example.com
+  port: 6379
+  db: 0
+  resultDb: 1
+
+profiles:
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteMany
+  # Optional hostPath / existing PVC
+  existingClaim: ""
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: secaudit.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: frontend
+        - path: /api
+          pathType: Prefix
+          service: api
+  tls: []
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

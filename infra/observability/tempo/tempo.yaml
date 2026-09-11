@@ -1,0 +1,75 @@
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+ingester:
+  max_block_duration: 5m
+  trace_idle_period: 10s
+  max_block_bytes: 1_000_000
+
+compactor:
+  compaction:
+    block_retention: 48h
+
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+      cluster: secaudit-local
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+  traces_storage:
+    path: /var/tempo/generator/traces
+  processor:
+    span_metrics:
+      dimensions:
+        - http.method
+        - http.route
+        - http.status_code
+        - secaudit.executor
+        - messaging.destination
+      histogram_buckets:
+        [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
+    service_graphs:
+      dimensions:
+        - http.method
+        - http.status_code
+      wait: 10s
+      max_items: 10000
+    local_blocks:
+      flush_to_storage: true
+      filter_server_spans: false
+
+overrides:
+  defaults:
+    metrics_generator:
+      processors: [service-graphs, span-metrics, local-blocks]
+      generate_native_histograms: classic
+
+storage:
+  trace:
+    backend: local
+    wal:
+      path: /var/tempo/wal
+    local:
+      path: /var/tempo/blocks
+
+query_frontend:
+  search:
+    max_duration: 0s
+  metrics:
+    max_duration: 3h
+
+usage_report:
+  reporting_enabled: false

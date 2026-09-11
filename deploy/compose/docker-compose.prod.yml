@@ -1,0 +1,267 @@
+# SecAudit production Compose — standalone (do NOT merge with lab docker-compose.yml).
+#
+#   cp deploy/compose/.env.production.example deploy/compose/.env
+#   # fill required secrets
+#   docker compose -f deploy/compose/docker-compose.prod.yml --env-file deploy/compose/.env up -d --build
+#
+# Observability (optional):
+#   docker compose -f deploy/compose/docker-compose.prod.yml --env-file deploy/compose/.env --profile observability up -d
+
+name: secaudit-prod
+
+x-app-env: &app-env
+  APP_ENV: production
+  API_DEBUG: "false"
+  SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+  SECRETS_BACKEND: ${SECRETS_BACKEND:-fernet}
+  SECRETS_FERNET_ALLOWED_IN_PRODUCTION: ${SECRETS_FERNET_ALLOWED_IN_PRODUCTION:?set true only during Fernet migration}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-secaudit}
+  POSTGRES_USER: ${POSTGRES_USER:-secaudit}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379/0
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+  REDIS_SENTINEL_HOSTS: ""
+  REDIS_PASSWORD: ${REDIS_PASSWORD}
+  AUTH_ENABLED: ${AUTH_ENABLED:-true}
+  LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+  DEMO_MODE: ${DEMO_MODE:-false}
+  CONSOLE_ENABLED: "false"
+  CONSOLE_ALLOW_IN_PRODUCTION: "false"
+# Also make Keycloak optional when LOCAL_AUTH-only demo uses placeholders.
+  KEYCLOAK_URL: ${KEYCLOAK_URL:-http://127.0.0.1:9}
+  KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://127.0.0.1:9/realms/secaudit}
+  KEYCLOAK_REALM: ${KEYCLOAK_REALM:-secaudit}
+  KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-secaudit-frontend}
+  KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-secaudit-api}
+  CORS_ORIGINS: ${CORS_ORIGINS:?CORS_ORIGINS is required}
+  FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:?FRONTEND_BASE_URL is required}
+  PROFILES_PATH: /profiles
+  PROFILES_STORAGE_PATH: /data/profiles
+  PROFILES_AUTO_SEED: ${PROFILES_AUTO_SEED:-false}
+  METRICS_BEARER_TOKEN: ${METRICS_BEARER_TOKEN:?METRICS_BEARER_TOKEN is required}
+  SSH_STRICT_HOST_KEY_CHECKING: ${SSH_STRICT_HOST_KEY_CHECKING:-true}
+  WINRM_SERVER_CERT_VALIDATION: ${WINRM_SERVER_CERT_VALIDATION:-validate}
+  OTEL_ENABLED: ${OTEL_ENABLED:-false}
+  OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4318}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-secaudit}
+      POSTGRES_USER: ${POSTGRES_USER:-secaudit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks: [internal]
+
+  redis:
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks: [internal]
+
+  migrate:
+    build:
+      context: ../..
+      dockerfile: api/Dockerfile
+    environment:
+      <<: *app-env
+      SKIP_MIGRATIONS: "0"
+    volumes:
+      - ${PROFILES_SOURCE_PATH:-../../profiles}:/profiles:ro
+      - profiles_data:/data/profiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    networks: [internal]
+
+  api:
+    build:
+      context: ../..
+      dockerfile: api/Dockerfile
+    environment:
+      <<: *app-env
+      SKIP_MIGRATIONS: "1"
+      OTEL_SERVICE_NAME: secaudit-api
+    volumes:
+      - ${PROFILES_SOURCE_PATH:-../../profiles}:/profiles:ro
+      - profiles_data:/data/profiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+    ports:
+      - "${API_PUBLISH_PORT:-127.0.0.1:8000}:8000"
+    restart: unless-stopped
+    networks: [internal]
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: workers/Dockerfile
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: secaudit-worker
+    volumes:
+      - ${PROFILES_SOURCE_PATH:-../../profiles}:/profiles:ro
+      - profiles_data:/data/profiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command:
+      [
+        "celery",
+        "-A",
+        "app.celery_app",
+        "worker",
+        "--loglevel=info",
+        "-Q",
+        "compliance,remediation,inventory,maintenance",
+      ]
+    restart: unless-stopped
+    networks: [internal]
+
+  beat:
+    build:
+      context: ../..
+      dockerfile: workers/Dockerfile
+    environment:
+      <<: *app-env
+      OTEL_SERVICE_NAME: secaudit-beat
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]
+    restart: unless-stopped
+    networks: [internal]
+
+  frontend:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+      target: production
+      args:
+        VITE_AUTH_ENABLED: ${AUTH_ENABLED:-true}
+        VITE_LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+        VITE_DEMO_MODE: ${DEMO_MODE:-false}
+        VITE_SSO_ENABLED: ${VITE_SSO_ENABLED:-true}
+        VITE_SHOW_SSO_BUTTON: ${VITE_SHOW_SSO_BUTTON:-true}
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-}
+        VITE_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-secaudit}
+        VITE_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-secaudit-frontend}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PUBLISH_PORT:-8080}:8080"
+    restart: unless-stopped
+    networks: [internal]
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ../../infra/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    networks: [internal]
+
+  tempo:
+    profiles: ["observability"]
+    image: grafana/tempo:2.6.0
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ../../infra/observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks: [internal]
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_SECURITY_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:?GF_SECURITY_ADMIN_PASSWORD is required}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor,traceqlMetrics"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/secaudit_overview.json
+    volumes:
+      - ../../infra/observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../../infra/observability/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ../../infra/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PUBLISH_PORT:-127.0.0.1:3000}:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks: [internal]
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  profiles_data:
+  grafana_data:
+  prometheus_data:
+  tempo_data:

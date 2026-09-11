@@ -1,0 +1,17 @@
+SecAudit Platform
+Copyright 2026 secauditplatform@proton.me
+
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+Required Notice: Copyright 2026 secauditplatform@proton.me
+
+This software is licensed under the PolyForm Noncommercial License 1.0.0.
+See the LICENSE file in this repository and
+https://polyformproject.org/licenses/noncommercial/1.0.0
+
+Commercial use requires a separate license from the licensor
+(secauditplatform@proton.me).
+
+Third-party open-source dependencies retain their own licenses.
+Compliance profile content (CIS/STIG/vendor/regulator packages) is
+licensed separately and is not covered by this NOTICE.

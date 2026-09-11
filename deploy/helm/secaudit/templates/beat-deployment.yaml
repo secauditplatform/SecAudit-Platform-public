@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secaudit.fullname" . }}-beat
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beat
+spec:
+  replicas: {{ .Values.beat.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "secaudit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beat
+  template:
+    metadata:
+      labels:
+        {{- include "secaudit.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: beat
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "secaudit.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: beat
+          image: {{ include "secaudit.beatImage" . }}
+          imagePullPolicy: {{ .Values.beat.image.pullPolicy }}
+          args: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]
+          {{- include "secaudit.env" . | nindent 10 }}
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: secaudit-beat
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.beat.resources | nindent 12 }}

@@ -1,0 +1,37 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "secaudit.fullname" . }}-config
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+data:
+  APP_ENV: {{ .Values.appEnv | quote }}
+  API_DEBUG: "false"
+  AUTH_ENABLED: {{ .Values.config.authEnabled | quote }}
+  LOCAL_AUTH_ENABLED: {{ .Values.config.localAuthEnabled | quote }}
+  CONSOLE_ENABLED: {{ .Values.config.consoleEnabled | quote }}
+  CONSOLE_ALLOW_IN_PRODUCTION: {{ .Values.config.consoleAllowInProduction | quote }}
+  SECRETS_BACKEND: {{ .Values.config.secretsBackend | quote }}
+  CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
+  FRONTEND_BASE_URL: {{ .Values.config.frontendBaseUrl | quote }}
+  PROFILES_PATH: /profiles
+  PROFILES_STORAGE_PATH: /data/profiles
+  PROFILES_AUTO_SEED: {{ .Values.config.profilesAutoSeed | quote }}
+  SSH_STRICT_HOST_KEY_CHECKING: {{ .Values.config.sshStrictHostKeyChecking | quote }}
+  WINRM_SERVER_CERT_VALIDATION: {{ .Values.config.winrmServerCertValidation | quote }}
+  OTEL_ENABLED: {{ .Values.config.otelEnabled | quote }}
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelExporterOtlpEndpoint | quote }}
+  KEYCLOAK_URL: {{ .Values.config.keycloakUrl | quote }}
+  KEYCLOAK_ISSUER: {{ .Values.config.keycloakIssuer | quote }}
+  KEYCLOAK_REALM: {{ .Values.config.keycloakRealm | quote }}
+  KEYCLOAK_CLIENT_ID: {{ .Values.config.keycloakClientId | quote }}
+  KEYCLOAK_AUDIENCE: {{ .Values.config.keycloakAudience | quote }}
+  POSTGRES_HOST: {{ .Values.externalDatabase.host | quote }}
+  POSTGRES_PORT: {{ .Values.externalDatabase.port | quote }}
+  POSTGRES_DB: {{ .Values.externalDatabase.database | quote }}
+  POSTGRES_USER: {{ .Values.externalDatabase.username | quote }}
+  REDIS_HOST: {{ .Values.externalRedis.host | quote }}
+  REDIS_PORT: {{ .Values.externalRedis.port | quote }}
+  REDIS_DB: {{ .Values.externalRedis.db | quote }}
+  REDIS_RESULT_DB: {{ .Values.externalRedis.resultDb | quote }}
+  REDIS_SENTINEL_HOSTS: ""

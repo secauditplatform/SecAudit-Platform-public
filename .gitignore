@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+!.env.production.example
+!.env.demo.example
+!deploy/compose/.env.demo.example
+!deploy/compose/.env.production.example
+*.db
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+api/.coverage
+api/tmp-*.pdf
+**/test-results/
+*.log
+
+# Node
+node_modules/
+dist/
+*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker volumes
+data/
+backups/
+profiles_data/
+
+# Compliance profile packages are not stored in this repository.
+# Keep only profiles/README.md tracked; place local packages under ./profiles
+# or set PROFILES_SOURCE_PATH.
+profiles/**
+!profiles/README.md
+
+# Reports artifacts
+reports/*.pdf
+reports/*.xlsx
+
+# Celery runtime state
+celerybeat-schedule
+celerybeat-schedule.*
+workers/celerybeat-schedule
+
+# OS
+.DS_Store
+Thumbs.db

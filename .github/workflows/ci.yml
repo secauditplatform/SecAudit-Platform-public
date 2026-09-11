@@ -1,0 +1,209 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: secaudit
+          POSTGRES_USER: secaudit
+          POSTGRES_PASSWORD: secaudit_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U secaudit -d secaudit"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: secaudit
+      POSTGRES_USER: secaudit
+      POSTGRES_PASSWORD: secaudit_dev
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/1
+      SECRET_KEY: ci-test-secret
+      SKIP_MIGRATIONS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+
+      - name: Install API dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/secaudit_core
+          pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Run Alembic migrations
+        working-directory: api
+        env:
+          SKIP_MIGRATIONS: "0"
+        run: alembic upgrade head
+
+      - name: Run pytest with coverage gate
+        working-directory: api
+        run: pytest tests -v -m "not integration" --cov=app --cov-report=term-missing --cov-fail-under=45
+
+      - name: Run integration tests (Testcontainers)
+        working-directory: api
+        run: pytest tests/test_redis_observability_integration.py -v -m integration
+
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install and build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run build
+          npm test
+
+  e2e-critical:
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: secaudit
+          POSTGRES_USER: secaudit
+          POSTGRES_PASSWORD: secaudit_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U secaudit -d secaudit"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: secaudit
+      POSTGRES_USER: secaudit
+      POSTGRES_PASSWORD: secaudit_dev
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/1
+      SECRET_KEY: ci-test-secret-key-32chars-minimum
+      AUTH_ENABLED: "true"
+      LOCAL_AUTH_ENABLED: "true"
+      E2E_ADMIN_USERNAME: e2e-admin
+      E2E_ADMIN_PASSWORD: e2e-admin-password-32chars-min
+      CI: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            api/requirements.txt
+            api/requirements-dev.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install API dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/secaudit_core
+          pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Run Alembic migrations
+        working-directory: api
+        env:
+          SKIP_MIGRATIONS: "0"
+        run: alembic upgrade head
+
+      - name: Seed E2E fixtures
+        run: python scripts/e2e_seed.py
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright critical journeys
+        working-directory: frontend
+        run: npm run test:e2e
+
+  worker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            workers/requirements.txt
+            api/requirements-dev.txt
+
+      - name: Install worker dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/secaudit_core
+          pip install -r workers/requirements.txt
+          pip install pytest
+
+      - name: Run worker unit tests
+        run: pytest workers/tests -v

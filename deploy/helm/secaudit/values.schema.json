@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "appEnv": { "type": "string", "enum": ["production", "staging", "development"] },
+    "existingSecret": { "type": "string" },
+    "secrets": {
+      "type": "object",
+      "description": "Required when existingSecret is empty; prefer existingSecret in real prod.",
+      "properties": {
+        "secretKey": { "type": "string" },
+        "postgresPassword": { "type": "string" },
+        "redisPassword": { "type": "string" },
+        "metricsBearerToken": { "type": "string" },
+        "secretsFernetAllowedInProduction": { "type": ["string", "boolean"] }
+      }
+    },
+    "externalDatabase": {
+      "type": "object",
+      "required": ["host", "database", "username"],
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": ["integer", "string"] },
+        "database": { "type": "string", "minLength": 1 },
+        "username": { "type": "string", "minLength": 1 }
+      }
+    },
+    "externalRedis": {
+      "type": "object",
+      "required": ["host"],
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": ["integer", "string"] },
+        "db": { "type": ["integer", "string"] },
+        "resultDb": { "type": ["integer", "string"] }
+      }
+    },
+    "config": {
+      "type": "object",
+      "required": ["keycloakUrl", "keycloakIssuer", "corsOrigins", "frontendBaseUrl"],
+      "properties": {
+        "keycloakUrl": { "type": "string", "minLength": 1 },
+        "keycloakIssuer": { "type": "string", "minLength": 1 },
+        "corsOrigins": { "type": "string", "minLength": 1 },
+        "frontendBaseUrl": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

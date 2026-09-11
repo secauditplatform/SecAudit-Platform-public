@@ -1,0 +1,18 @@
+1. Get the application URL:
+{{- if .Values.ingress.enabled }}
+{{- range .Values.ingress.hosts }}
+  https://{{ .host }}
+{{- end }}
+{{- else }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "secaudit.fullname" . }}-frontend {{ .Values.frontend.service.port }}:{{ .Values.frontend.service.port }}
+{{- end }}
+
+2. Ensure external PostgreSQL / Redis / Keycloak match values under:
+   externalDatabase.*, externalRedis.*, config.keycloak*
+
+3. Prefer existingSecret for production credentials. Required keys:
+   SECRET_KEY, POSTGRES_PASSWORD, REDIS_PASSWORD, METRICS_BEARER_TOKEN,
+   REDIS_URL, CELERY_BROKER_URL, CELERY_RESULT_BACKEND,
+   SECRETS_FERNET_ALLOWED_IN_PRODUCTION
+
+4. Migrations run as a pre-install/pre-upgrade Job ({{ include "secaudit.fullname" . }}-migrate-*).

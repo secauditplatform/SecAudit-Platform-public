@@ -1,0 +1,253 @@
+---
+- name: Linux compliance baseline (detailed)
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: COMPLIANCE | SSH and remote access
+      ansible.builtin.shell: |
+        set -o pipefail
+        emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+        sshd_val() {
+          local key="$1" default="$2" v
+          v=$(grep -iE "^[[:space:]]*${key}[[:space:]]+" /etc/ssh/sshd_config 2>/dev/null | tail -1 | awk '{print $2}')
+          printf '%s' "${v:-$default}"
+        }
+        root_login=$(sshd_val PermitRootLogin "prohibit-password")
+        case "$(echo "$root_login" | tr '[:upper:]' '[:lower:]')" in
+          no|prohibit-password|without-password|forced-commands-only)
+            emit PASS ssh_permit_root "SSH PermitRootLogin restricted" "$root_login" ;;
+          *) emit FAIL ssh_permit_root "SSH PermitRootLogin restricted" "$root_login" ;;
+        esac
+        pass_auth=$(sshd_val PasswordAuthentication "yes")
+        if [ "$(echo "$pass_auth" | tr '[:upper:]' '[:lower:]')" = "no" ]; then
+          emit PASS ssh_password_auth "SSH PasswordAuthentication disabled" "$pass_auth"
+        else
+          emit FAIL ssh_password_auth "SSH PasswordAuthentication disabled" "$pass_auth"
+        fi
+        empty_pass=$(sshd_val PermitEmptyPasswords "no")
+        if [ "$(echo "$empty_pass" | tr '[:upper:]' '[:lower:]')" = "no" ]; then
+          emit PASS ssh_empty_passwords "SSH PermitEmptyPasswords disabled" "$empty_pass"
+        else
+          emit FAIL ssh_empty_passwords "SSH PermitEmptyPasswords disabled" "$empty_pass"
+        fi
+        pubkey=$(sshd_val PubkeyAuthentication "yes")
+        if [ "$(echo "$pubkey" | tr '[:upper:]' '[:lower:]')" != "no" ]; then
+          emit PASS ssh_pubkey_auth "SSH PubkeyAuthentication enabled" "$pubkey"
+        else
+          emit FAIL ssh_pubkey_auth "SSH PubkeyAuthentication enabled" "$pubkey"
+        fi
+        max_auth=$(sshd_val MaxAuthTries "6")
+        if [ "$max_auth" -le 4 ] 2>/dev/null; then
+          emit PASS ssh_max_auth_tries "SSH MaxAuthTries <= 4" "$max_auth"
+        else
+          emit FAIL ssh_max_auth_tries "SSH MaxAuthTries <= 4" "$max_auth"
+        fi
+        x11=$(sshd_val X11Forwarding "no")
+        if [ "$(echo "$x11" | tr '[:upper:]' '[:lower:]')" = "no" ]; then
+          emit PASS ssh_x11_forwarding "SSH X11Forwarding disabled" "$x11"
+        else
+          emit FAIL ssh_x11_forwarding "SSH X11Forwarding disabled" "$x11"
+        fi
+        alive=$(sshd_val ClientAliveInterval "0")
+        if [ "$alive" -ge 60 ] 2>/dev/null; then
+          emit PASS ssh_client_alive "SSH ClientAliveInterval configured" "$alive"
+        else
+          emit FAIL ssh_client_alive "SSH ClientAliveInterval configured (>=60)" "$alive"
+        fi
+        banner=$(grep -iE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null | tail -1 | awk '{print $2}')
+        if [ -n "$banner" ] && [ -f "$banner" ]; then
+          emit PASS ssh_banner "SSH login banner configured" "$banner"
+        else
+          emit FAIL ssh_banner "SSH login banner configured" "${banner:-none}"
+        fi
+        if [ -f /etc/ssh/sshd_config ]; then
+          perms=$(stat -c '%a %U:%G' /etc/ssh/sshd_config 2>/dev/null)
+          mode=${perms%% *}
+          if [ "$mode" -le 600 ] 2>/dev/null; then
+            emit PASS ssh_config_perms "sshd_config permissions <= 600" "$perms"
+          else
+            emit FAIL ssh_config_perms "sshd_config permissions <= 600" "$perms"
+          fi
+        else
+          emit FAIL ssh_config_perms "sshd_config permissions <= 600" "missing"
+        fi
+      register: compliance_ssh
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Password policy and authentication
+      ansible.builtin.shell: |
+        set -o pipefail
+        emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+        login_defs() { grep -E "^${1}[[:space:]]" /etc/login.defs 2>/dev/null | awk '{print $2}' | tail -1; }
+        max_days=$(login_defs PASS_MAX_DAYS); max_days=${max_days:-99999}
+        if [ "$max_days" -le 365 ] 2>/dev/null; then
+          emit PASS pwd_max_days "Password PASS_MAX_DAYS <= 365" "$max_days"
+        else
+          emit FAIL pwd_max_days "Password PASS_MAX_DAYS <= 365" "$max_days"
+        fi
+        min_days=$(login_defs PASS_MIN_DAYS); min_days=${min_days:-0}
+        if [ "$min_days" -ge 1 ] 2>/dev/null; then
+          emit PASS pwd_min_days "Password PASS_MIN_DAYS >= 1" "$min_days"
+        else
+          emit FAIL pwd_min_days "Password PASS_MIN_DAYS >= 1" "$min_days"
+        fi
+        warn_age=$(login_defs PASS_WARN_AGE); warn_age=${warn_age:-7}
+        if [ "$warn_age" -ge 7 ] 2>/dev/null; then
+          emit PASS pwd_warn_age "Password PASS_WARN_AGE >= 7" "$warn_age"
+        else
+          emit FAIL pwd_warn_age "Password PASS_WARN_AGE >= 7" "$warn_age"
+        fi
+        encrypt=$(login_defs ENCRYPT_METHOD); encrypt=${encrypt:-unknown}
+        case "$encrypt" in
+          SHA512|YESCRYPT|BLOWFISH|6|yescrypt)
+            emit PASS pwd_encrypt_method "Password hashing strength" "$encrypt" ;;
+          *) emit FAIL pwd_encrypt_method "Password hashing strength (SHA512/yescrypt)" "$encrypt" ;;
+        esac
+        if grep -qiE 'pam_(pwquality|cracklib)\\.so' /etc/pam.d/system-auth /etc/pam.d/common-password /etc/pam.d/password-auth 2>/dev/null; then
+          emit PASS pam_password_quality "PAM password quality module present" "configured"
+        else
+          emit FAIL pam_password_quality "PAM password quality module present" "not found"
+        fi
+        if grep -qiE 'pam_(faillock|tally2|tally)\.so' /etc/pam.d/system-auth /etc/pam.d/common-auth /etc/pam.d/password-auth 2>/dev/null; then
+          emit PASS pam_faillock "PAM account lockout configured" "configured"
+        else
+          emit FAIL pam_faillock "PAM account lockout configured" "not found"
+        fi
+      register: compliance_password
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Accounts and privileges
+      ansible.builtin.shell: |
+        set -o pipefail
+        emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+        empty_pw=$(awk -F: '($2=="" || $2=="!" || $2=="*") && $1!="root" {c++} END {print c+0}' /etc/shadow 2>/dev/null)
+        if [ "${empty_pw:-0}" -eq 0 ]; then
+          emit PASS acct_no_empty_password "No non-root accounts with empty password" "0"
+        else
+          emit FAIL acct_no_empty_password "No non-root accounts with empty password" "$empty_pw"
+        fi
+        uid0=$(awk -F: '($3==0){print $1}' /etc/passwd | tr '\n' ',' | sed 's/,$//')
+        uid0_count=$(awk -F: '($3==0){c++} END {print c+0}' /etc/passwd)
+        if [ "$uid0_count" -eq 1 ]; then
+          emit PASS acct_uid_zero "Only root has UID 0" "$uid0"
+        else
+          emit FAIL acct_uid_zero "Only root has UID 0" "$uid0"
+        fi
+        if grep -Riq 'NOPASSWD' /etc/sudoers /etc/sudoers.d 2>/dev/null; then
+          emit FAIL sudo_nopasswd "No passwordless sudo (NOPASSWD)" "found"
+        else
+          emit PASS sudo_nopasswd "No passwordless sudo (NOPASSWD)" "none"
+        fi
+        if [ -f /etc/passwd ]; then
+          perms=$(stat -c '%a %U:%G' /etc/passwd)
+          mode=${perms%% *}
+          if [ "$mode" -le 644 ] 2>/dev/null; then emit PASS file_passwd_perms "/etc/passwd permissions" "$perms"; else emit FAIL file_passwd_perms "/etc/passwd permissions <=644" "$perms"; fi
+        fi
+        if [ -f /etc/shadow ]; then
+          perms=$(stat -c '%a %U:%G' /etc/shadow)
+          mode=${perms%% *}
+          if [ "$mode" -le 640 ] 2>/dev/null; then emit PASS file_shadow_perms "/etc/shadow permissions" "$perms"; else emit FAIL file_shadow_perms "/etc/shadow permissions <=640" "$perms"; fi
+        fi
+        if [ -f /etc/group ]; then
+          perms=$(stat -c '%a %U:%G' /etc/group)
+          mode=${perms%% *}
+          if [ "$mode" -le 644 ] 2>/dev/null; then emit PASS file_group_perms "/etc/group permissions" "$perms"; else emit FAIL file_group_perms "/etc/group permissions <=644" "$perms"; fi
+        fi
+      register: compliance_accounts
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Network firewall and hardening
+      ansible.builtin.shell: |
+        set -o pipefail
+        emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+        fw="none"
+        if systemctl is-active firewalld >/dev/null 2>&1; then fw="firewalld:active"
+        elif systemctl is-active ufw >/dev/null 2>&1; then fw="ufw:active"
+        elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q .; then fw="nftables:rules"
+        elif command -v iptables >/dev/null 2>&1 && iptables -S 2>/dev/null | grep -qv '^-P'; then fw="iptables:rules"
+        fi
+        case "$fw" in
+          none) emit FAIL firewall_active "Host firewall enabled" "$fw" ;;
+          *) emit PASS firewall_active "Host firewall enabled" "$fw" ;;
+        esac
+        ip_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)
+        if [ "$ip_fwd" = "0" ]; then emit PASS kernel_ip_forward "IPv4 forwarding disabled" "$ip_fwd"; else emit FAIL kernel_ip_forward "IPv4 forwarding disabled" "$ip_fwd"; fi
+        rp_filter=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo unknown)
+        if [ "$rp_filter" = "1" ]; then emit PASS kernel_rp_filter "Reverse path filtering enabled" "$rp_filter"; else emit FAIL kernel_rp_filter "Reverse path filtering enabled" "$rp_filter"; fi
+        syncookies=$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null || echo unknown)
+        if [ "$syncookies" = "1" ]; then emit PASS kernel_syncookies "TCP SYN cookies enabled" "$syncookies"; else emit FAIL kernel_syncookies "TCP SYN cookies enabled" "$syncookies"; fi
+        accept_redirects=$(sysctl -n net.ipv4.conf.all.accept_redirects 2>/dev/null || echo unknown)
+        if [ "$accept_redirects" = "0" ]; then emit PASS kernel_no_icmp_redirects "ICMP redirects disabled" "$accept_redirects"; else emit FAIL kernel_no_icmp_redirects "ICMP redirects disabled" "$accept_redirects"; fi
+        risky=""
+        for port in 23 513 514 512; do
+          if ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${port}$"; then risky="${risky}${port},"; fi
+        done
+        if [ -z "$risky" ]; then emit PASS net_no_legacy_ports "No legacy rlogin/telnet ports listening" "none"
+        else emit FAIL net_no_legacy_ports "No legacy rlogin/telnet ports listening" "${risky%,}"; fi
+      register: compliance_network
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Services logging and patching
+      ansible.builtin.shell: |
+        set -o pipefail
+        emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+        for svc in telnet.socket telnet rsh.socket rlogin rsh; do
+          if systemctl is-active "$svc" >/dev/null 2>&1; then
+            emit FAIL svc_insecure "Insecure legacy services inactive" "$svc active"
+            legacy_bad=1
+            break
+          fi
+        done
+        if [ "${legacy_bad:-0}" -eq 0 ]; then
+          emit PASS svc_insecure "Insecure legacy services inactive" "ok"
+        fi
+        if systemctl is-active auditd >/dev/null 2>&1; then emit PASS svc_auditd "Audit daemon (auditd) running" "active"
+        else emit FAIL svc_auditd "Audit daemon (auditd) running" "inactive"; fi
+        if systemctl is-active rsyslog >/dev/null 2>&1 || systemctl is-active syslog-ng >/dev/null 2>&1 || systemctl is-active systemd-journald >/dev/null 2>&1; then
+          emit PASS svc_logging "System logging service active" "active"
+        else
+          emit FAIL svc_logging "System logging service active" "inactive"
+        fi
+        if systemctl is-active chronyd >/dev/null 2>&1 || systemctl is-active ntpd >/dev/null 2>&1 || systemctl is-active systemd-timesyncd >/dev/null 2>&1; then
+          emit PASS svc_time_sync "Time synchronization service active" "active"
+        else
+          emit FAIL svc_time_sync "Time synchronization service active" "inactive"
+        fi
+        if [ -f /etc/selinux/config ] && grep -qi '^SELINUX=enforcing' /etc/selinux/config 2>/dev/null; then
+          emit PASS mac_selinux "SELinux enforcing" "enforcing"
+        elif [ -d /sys/module/apparmor/parameters ] && aa-status 2>/dev/null | grep -qi 'enforce'; then
+          emit PASS mac_apparmor "AppArmor enforcing profiles loaded" "enforcing"
+        elif [ -f /etc/selinux/config ]; then
+          mode=$(grep -i '^SELINUX=' /etc/selinux/config | cut -d= -f2)
+          emit FAIL mac_selinux "SELinux enforcing" "${mode:-unknown}"
+        else
+          emit FAIL mac_mandatory "Mandatory access control (SELinux/AppArmor)" "not detected"
+        fi
+        if systemctl is-enabled unattended-upgrades >/dev/null 2>&1 || systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 || systemctl is-enabled yum-cron >/dev/null 2>&1; then
+          emit PASS patch_auto_updates "Automatic security updates configured" "enabled"
+        else
+          emit FAIL patch_auto_updates "Automatic security updates configured" "not enabled"
+        fi
+        world=$(find /tmp /var/tmp /dev/shm -xdev -type f -perm -0002 2>/dev/null | head -n 5 | wc -l)
+        if [ "${world:-0}" -eq 0 ]; then emit PASS fs_world_writable "No world-writable files in temp dirs (sample)" "0"
+        else emit FAIL fs_world_writable "No world-writable files in temp dirs (sample)" "$world found"; fi
+      register: compliance_services
+      changed_when: false
+      failed_when: false
+
+    - name: Compliance summary
+      ansible.builtin.debug:
+        msg:
+          target: "{{ inventory_hostname }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          kernel: "{{ ansible_kernel }}"
+          checks_ssh: "{{ compliance_ssh.stdout_lines | default([]) }}"
+          checks_password: "{{ compliance_password.stdout_lines | default([]) }}"
+          checks_accounts: "{{ compliance_accounts.stdout_lines | default([]) }}"
+          checks_network: "{{ compliance_network.stdout_lines | default([]) }}"
+          checks_services: "{{ compliance_services.stdout_lines | default([]) }}"
+          format: "STATUS|check_id|title|detail"

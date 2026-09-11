@@ -1,0 +1,63 @@
+# Demo stand overlay for production Compose.
+#
+# Usage (from repo root):
+#   cp deploy/compose/.env.demo.example deploy/compose/.env
+#   # fill secrets + bootstrap password file
+#   docker compose \
+#     -f deploy/compose/docker-compose.prod.yml \
+#     -f deploy/compose/docker-compose.demo.yml \
+#     --env-file deploy/compose/.env \
+#     up -d --build
+#
+# Redis is already standalone in prod Compose. Do NOT enable --profile observability.
+
+services:
+  api:
+    environment:
+      DEMO_MODE: "true"
+      LOCAL_AUTH_ENABLED: "true"
+      NOTIFICATIONS_ENABLED: "false"
+      SCHEDULED_REPORTS_ENABLED: "false"
+      PROFILES_AUTO_SEED: "false"
+      BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
+      BOOTSTRAP_ADMIN_PASSWORD_FILE: /run/secrets/bootstrap_admin_password
+      # Keycloak unused on local-only demo; placeholders satisfy prod base env.
+      KEYCLOAK_URL: ${KEYCLOAK_URL:-http://127.0.0.1:9}
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://127.0.0.1:9/realms/secaudit}
+      # Ping-only console demo (in-process; no separate sandbox service).
+      CONSOLE_ENABLED: "true"
+      CONSOLE_ALLOW_IN_PRODUCTION: "true"
+      CONSOLE_SANDBOX_ENABLED: "false"
+    cap_add:
+      - NET_RAW
+    secrets:
+      - bootstrap_admin_password
+
+  worker:
+    environment:
+      DEMO_MODE: "true"
+      LOCAL_AUTH_ENABLED: "true"
+      NOTIFICATIONS_ENABLED: "false"
+      SCHEDULED_REPORTS_ENABLED: "false"
+
+  beat:
+    environment:
+      DEMO_MODE: "true"
+      NOTIFICATIONS_ENABLED: "false"
+      SCHEDULED_REPORTS_ENABLED: "false"
+
+  frontend:
+    build:
+      args:
+        VITE_AUTH_ENABLED: "true"
+        VITE_LOCAL_AUTH_ENABLED: "true"
+        VITE_DEMO_MODE: "true"
+        VITE_SSO_ENABLED: "false"
+        VITE_SHOW_SSO_BUTTON: "true"
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-}
+        VITE_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-secaudit}
+        VITE_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-secaudit-frontend}
+
+secrets:
+  bootstrap_admin_password:
+    file: ${BOOTSTRAP_ADMIN_PASSWORD_FILE_HOST:-./secrets/bootstrap_admin_password.txt}

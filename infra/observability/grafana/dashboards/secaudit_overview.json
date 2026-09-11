@@ -1,0 +1,450 @@
+{
+  "title": "SecAudit — Observability",
+  "uid": "secaudit-traces",
+  "schemaVersion": 39,
+  "version": 3,
+  "editable": true,
+  "timezone": "browser",
+  "time": {"from": "now-1h", "to": "now"},
+  "refresh": "30s",
+  "tags": ["secaudit", "traces", "metrics"],
+  "annotations": {"list": []},
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "custom",
+        "includeAll": false,
+        "multi": false,
+        "options": [
+          {"text": "All", "value": ".*", "selected": true},
+          {"text": "secaudit-api", "value": "secaudit-api", "selected": false},
+          {"text": "secaudit-worker", "value": "secaudit-worker", "selected": false},
+          {"text": "secaudit-beat", "value": "secaudit-beat", "selected": false}
+        ],
+        "current": {"text": "All", "value": ".*"},
+        "query": "All : .*,secaudit-api : secaudit-api,secaudit-worker : secaudit-worker,secaudit-beat : secaudit-beat"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "id": 1,
+      "gridPos": {"h": 2, "w": 24, "x": 0, "y": 0},
+      "options": {
+        "mode": "markdown",
+        "content": "**SecAudit observability** — traces via Tempo (OTLP) + application metrics via Prometheus (`/api/v1/metrics`) + span-metrics from Tempo. Filter by **Service**; open a row in the tables to inspect the full TraceQL waterfall."
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Trace rate (spans/s)",
+      "id": 10,
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(traces_spanmetrics_calls_total{service=~\"$service\"}[5m])) or vector(0)",
+          "legendFormat": "rate"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error spans/s",
+      "id": 11,
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "decimals": 2,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 0.01}
+            ]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(traces_spanmetrics_calls_total{service=~\"$service\", status_code=\"STATUS_CODE_ERROR\"}[5m])) or vector(0)",
+          "legendFormat": "errors"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "p95 latency",
+      "id": 12,
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.5},
+              {"color": "red", "value": 2}
+            ]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "area"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket{service=~\"$service\"}[5m])) by (le)) or vector(0)",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "HTTP req total (scraped)",
+      "id": 13,
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "purple", "value": null}]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(secaudit_http_requests_total) or vector(0)",
+          "legendFormat": "http"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Celery queue depth",
+      "id": 14,
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 5},
+              {"color": "red", "value": 20}
+            ]
+          }
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(secaudit_celery_queue_depth) or vector(0)",
+          "legendFormat": "depth"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Celery tasks total",
+      "id": 15,
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 2},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "orange", "value": null}]}
+        }
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value", "graphMode": "none"},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(secaudit_celery_tasks_total) or vector(0)",
+          "legendFormat": "tasks"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Span call rate by service",
+      "id": 20,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2, "showPoints": "never"}
+        }
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{service=~\"$service\"}[5m]))",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate by service",
+      "id": 21,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "showPoints": "never"},
+          "color": {"mode": "palette-classic"}
+        }
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["mean", "max"]}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (rate(traces_spanmetrics_calls_total{service=~\"$service\", status_code=\"STATUS_CODE_ERROR\"}[5m]))",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency percentiles (p50 / p95 / p99)",
+      "id": 22,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never"}
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum(rate(traces_spanmetrics_latency_bucket{service=~\"$service\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket{service=~\"$service\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum(rate(traces_spanmetrics_latency_bucket{service=~\"$service\"}[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP request rate by route (API)",
+      "id": 23,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1, "stacking": {"mode": "normal"}}
+        }
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "right", "calcs": ["sum"]}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (method, path) (rate(secaudit_http_requests_total[5m]))",
+          "legendFormat": "{{method}} {{path}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Celery tasks by status",
+      "id": 24,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "fillOpacity": 15, "lineWidth": 2}
+        }
+      },
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task, status) (secaudit_celery_tasks_total)",
+          "legendFormat": "{{task}} — {{status}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Celery queue depth by queue",
+      "id": 25,
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2}
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "secaudit_celery_queue_depth",
+          "legendFormat": "{{queue}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Executor spans rate",
+      "id": 26,
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 22},
+      "datasource": {"type": "prometheus", "uid": "secaudit-prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {"drawStyle": "bars", "fillOpacity": 50, "stacking": {"mode": "normal"}}
+        }
+      },
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (secaudit_executor) (rate(traces_spanmetrics_calls_total{secaudit_executor!=\"\"}[5m]))",
+          "legendFormat": "{{secaudit_executor}}"
+        }
+      ]
+    },
+    {
+      "type": "nodeGraph",
+      "title": "Service map",
+      "id": 30,
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 30},
+      "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "serviceMap",
+          "serviceMapQuery": "{resource.service.name=~\"$service\"}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Recent traces — $service",
+      "id": 40,
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 40},
+      "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {"show": false}
+      },
+      "transformations": [],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+          "queryType": "traceql",
+          "limit": 50,
+          "tableType": "traces",
+          "query": "{ resource.service.name =~ \"$service\" }"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Error / failed traces",
+      "id": 41,
+      "gridPos": {"h": 10, "w": 12, "x": 0, "y": 52},
+      "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+      "options": {"showHeader": true, "cellHeight": "sm"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+          "queryType": "traceql",
+          "limit": 30,
+          "tableType": "traces",
+          "query": "{ resource.service.name =~ \"$service\" && status = error }"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Compliance / remediation job spans",
+      "id": 42,
+      "gridPos": {"h": 10, "w": 12, "x": 12, "y": 52},
+      "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+      "options": {"showHeader": true, "cellHeight": "sm"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+          "queryType": "traceql",
+          "limit": 30,
+          "tableType": "traces",
+          "query": "{ resource.service.name =~ \"$service\" && (name =~ \".*run_compliance_job.*\" || name =~ \".*run_remediation_job.*\" || .\"secaudit.job_run_id\" != nil || .\"secaudit.remediation_run_id\" != nil) }"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Host executor spans (SSH / WinRM / OpenSCAP / Ansible)",
+      "id": 43,
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 62},
+      "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+      "options": {"showHeader": true, "cellHeight": "sm"},
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {"type": "tempo", "uid": "secaudit-tempo"},
+          "queryType": "traceql",
+          "limit": 40,
+          "tableType": "spans",
+          "query": "{ resource.service.name =~ \"$service\" && .\"secaudit.executor\" != nil } | select(.\"secaudit.executor\", .\"net.peer.name\", name, duration, status)"
+        }
+      ]
+    }
+  ]
+}

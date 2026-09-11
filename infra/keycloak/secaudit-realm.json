@@ -1,0 +1,91 @@
+{
+  "realm": "secaudit",
+  "enabled": true,
+  "displayName": "SecAudit",
+  "registrationEmailAsUsername": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "verifyEmail": false,
+  "roles": {
+    "realm": [
+      { "name": "admin" },
+      { "name": "engineer" },
+      { "name": "operator" },
+      { "name": "auditor" },
+      { "name": "viewer" }
+    ]
+  },
+  "requiredActions": [
+    {
+      "alias": "VERIFY_PROFILE",
+      "name": "Verify Profile",
+      "providerId": "VERIFY_PROFILE",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 90,
+      "config": {}
+    },
+    {
+      "alias": "UPDATE_PROFILE",
+      "name": "Update Profile",
+      "providerId": "UPDATE_PROFILE",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 40,
+      "config": {}
+    },
+    {
+      "alias": "VERIFY_EMAIL",
+      "name": "Verify Email",
+      "providerId": "VERIFY_EMAIL",
+      "enabled": false,
+      "defaultAction": false,
+      "priority": 50,
+      "config": {}
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "secaudit-frontend",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect"
+    },
+    {
+      "clientId": "secaudit-api",
+      "enabled": true,
+      "bearerOnly": true,
+      "protocol": "openid-connect"
+    }
+  ],
+  "users": [
+    {
+      "username": "admin",
+      "enabled": true,
+      "email": "admin@secaudit.local",
+      "emailVerified": true,
+      "firstName": "Admin",
+      "lastName": "User",
+      "requiredActions": [],
+      "credentials": [{ "type": "password", "value": "admin", "temporary": false }],
+      "realmRoles": ["admin", "engineer", "operator", "auditor", "viewer"]
+    },
+    {
+      "username": "dev",
+      "enabled": true,
+      "email": "dev@secaudit.local",
+      "emailVerified": true,
+      "firstName": "Dev",
+      "lastName": "User",
+      "requiredActions": [],
+      "credentials": [{ "type": "password", "value": "dev", "temporary": false }],
+      "realmRoles": ["admin", "engineer", "operator", "auditor", "viewer"]
+    }
+  ]
+}

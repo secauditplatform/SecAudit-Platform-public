@@ -1,0 +1,52 @@
+---
+- name: Linux compliance baseline (fast)
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: COMPLIANCE | Essential Linux checks
+      ansible.builtin.shell: |
+        set -o pipefail
+        emit() { printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4"; }
+        sshd_val() {
+          local key="$1" default="$2" v
+          v=$(grep -iE "^[[:space:]]*${key}[[:space:]]+" /etc/ssh/sshd_config 2>/dev/null | tail -1 | awk '{print $2}')
+          printf '%s' "${v:-$default}"
+        }
+        root_login=$(sshd_val PermitRootLogin "prohibit-password")
+        case "$(echo "$root_login" | tr '[:upper:]' '[:lower:]')" in
+          no|prohibit-password|without-password|forced-commands-only)
+            emit PASS ssh_permit_root "SSH PermitRootLogin restricted" "$root_login" ;;
+          *) emit FAIL ssh_permit_root "SSH PermitRootLogin restricted" "$root_login" ;;
+        esac
+        pass_auth=$(sshd_val PasswordAuthentication "yes")
+        if [ "$(echo "$pass_auth" | tr '[:upper:]' '[:lower:]')" = "no" ]; then
+          emit PASS ssh_password_auth "SSH PasswordAuthentication disabled" "$pass_auth"
+        else
+          emit FAIL ssh_password_auth "SSH PasswordAuthentication disabled" "$pass_auth"
+        fi
+        uid0_count=$(awk -F: '($3==0){c++} END {print c+0}' /etc/passwd)
+        if [ "$uid0_count" -eq 1 ]; then emit PASS acct_uid_zero "Only root has UID 0" "root"
+        else emit FAIL acct_uid_zero "Only root has UID 0" "count=$uid0_count"; fi
+        fw="none"
+        if systemctl is-active firewalld >/dev/null 2>&1; then fw="firewalld"
+        elif systemctl is-active ufw >/dev/null 2>&1; then fw="ufw"
+        elif command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q .; then fw="nftables"
+        fi
+        if [ "$fw" = "none" ]; then emit FAIL firewall_active "Host firewall enabled" "$fw"; else emit PASS firewall_active "Host firewall enabled" "$fw"; fi
+        if systemctl is-active auditd >/dev/null 2>&1; then emit PASS svc_auditd "Audit daemon running" "active"; else emit FAIL svc_auditd "Audit daemon running" "inactive"; fi
+        if systemctl is-active chronyd >/dev/null 2>&1 || systemctl is-active systemd-timesyncd >/dev/null 2>&1; then
+          emit PASS svc_time_sync "Time sync service active" "active"
+        else
+          emit FAIL svc_time_sync "Time sync service active" "inactive"
+        fi
+      register: compliance_core
+      changed_when: false
+      failed_when: false
+
+    - name: Compliance summary
+      ansible.builtin.debug:
+        msg:
+          target: "{{ inventory_hostname }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          checks: "{{ compliance_core.stdout_lines | default([]) }}"
+          format: "STATUS|check_id|title|detail"

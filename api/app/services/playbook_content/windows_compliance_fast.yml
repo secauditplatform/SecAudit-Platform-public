@@ -1,0 +1,42 @@
+---
+- name: Windows compliance baseline (fast)
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: COMPLIANCE | Essential Windows checks
+      ansible.windows.win_shell: |
+        function Emit-Check($Status, $Id, $Title, $Detail) {
+          Write-Output ("{0}|{1}|{2}|{3}" -f $Status, $Id, $Title, $Detail)
+        }
+        $admins = @(Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue)
+        Emit-Check "PASS" "acct_local_admins" "Local Administrators inventory" ("count={0}" -f $admins.Count)
+        $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+        if ($guest -and -not $guest.Enabled) { Emit-Check "PASS" "acct_guest_disabled" "Guest account disabled" "disabled" }
+        else { Emit-Check "FAIL" "acct_guest_disabled" "Guest account disabled" "enabled" }
+        $profiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+        $disabled = @($profiles | Where-Object { -not $_.Enabled })
+        if ($disabled.Count -eq 0) { Emit-Check "PASS" "fw_profiles_enabled" "Firewall profiles enabled" "all" }
+        else { Emit-Check "FAIL" "fw_profiles_enabled" "Firewall profiles enabled" (($disabled.Name -join ",")) }
+        $hotfix = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1
+        if ($hotfix -and $hotfix.InstalledOn -gt (Get-Date).AddDays(-60)) {
+          Emit-Check "PASS" "patch_recent_hotfix" "Recent update within 60 days" ($hotfix.HotFixID)
+        } else {
+          Emit-Check "FAIL" "patch_recent_hotfix" "Recent update within 60 days" "stale"
+        }
+        $defender = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($defender -and $defender.AntivirusEnabled) { Emit-Check "PASS" "defender_enabled" "Defender enabled" "enabled" }
+        else { Emit-Check "FAIL" "defender_enabled" "Defender enabled" "disabled" }
+        $uac = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction SilentlyContinue
+        if ($uac -and $uac.EnableLUA -eq 1) { Emit-Check "PASS" "sec_uac_enabled" "UAC enabled" "enabled" }
+        else { Emit-Check "FAIL" "sec_uac_enabled" "UAC enabled" "disabled" }
+      register: compliance_core
+      changed_when: false
+      failed_when: false
+
+    - name: Compliance summary
+      ansible.builtin.debug:
+        msg:
+          target: "{{ inventory_hostname }}"
+          os: "{{ ansible_os_name | default('Windows') }}"
+          checks: "{{ compliance_core.stdout_lines | default([]) }}"
+          format: "STATUS|check_id|title|detail"

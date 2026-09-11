@@ -1,0 +1,211 @@
+---
+- name: Windows compliance baseline (detailed)
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: COMPLIANCE | Local accounts and groups
+      ansible.windows.win_shell: |
+        function Emit-Check($Status, $Id, $Title, $Detail) {
+          Write-Output ("{0}|{1}|{2}|{3}" -f $Status, $Id, $Title, $Detail)
+        }
+        $admins = @(Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue)
+        Emit-Check "PASS" "acct_local_admins" "Local Administrators group inventory" ("count={0}" -f $admins.Count)
+        $guest = Get-LocalUser -Name "Guest" -ErrorAction SilentlyContinue
+        if ($guest -and -not $guest.Enabled) {
+          Emit-Check "PASS" "acct_guest_disabled" "Built-in Guest account disabled" "disabled"
+        } else {
+          Emit-Check "FAIL" "acct_guest_disabled" "Built-in Guest account disabled" ($(if ($guest) { "enabled" } else { "missing" }))
+        }
+        $admin = Get-LocalUser -Name "Administrator" -ErrorAction SilentlyContinue
+        if ($admin -and -not $admin.Enabled) {
+          Emit-Check "PASS" "acct_builtin_admin_disabled" "Built-in Administrator disabled" "disabled"
+        } else {
+          Emit-Check "FAIL" "acct_builtin_admin_disabled" "Built-in Administrator disabled" ($(if ($admin) { "enabled" } else { "missing" }))
+        }
+        $enabledUsers = @(Get-LocalUser | Where-Object { $_.Enabled -eq $true })
+        Emit-Check "PASS" "acct_enabled_users" "Enabled local users inventory" ("count={0}" -f $enabledUsers.Count)
+        $blankPwd = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Lsa" -Name LimitBlankPasswordUse -ErrorAction SilentlyContinue
+        if ($blankPwd -and $blankPwd.LimitBlankPasswordUse -eq 1) {
+          Emit-Check "PASS" "acct_limit_blank_password" "Limit blank password use" "enabled"
+        } else {
+          Emit-Check "FAIL" "acct_limit_blank_password" "Limit blank password use" "disabled"
+        }
+      register: compliance_accounts
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Password and lockout policy
+      ansible.windows.win_shell: |
+        function Emit-Check($Status, $Id, $Title, $Detail) {
+          Write-Output ("{0}|{1}|{2}|{3}" -f $Status, $Id, $Title, $Detail)
+        }
+        $net = net accounts 2>$null
+        $minLen = [regex]::Match($net, 'Minimum password length\s*:\s*(\d+)').Groups[1].Value
+        if ($minLen -and [int]$minLen -ge 14) {
+          Emit-Check "PASS" "pwd_min_length" "Minimum password length >= 14" $minLen
+        } else {
+          Emit-Check "FAIL" "pwd_min_length" "Minimum password length >= 14" ($(if ($minLen) { $minLen } else { "unknown" }))
+        }
+        $maxAge = [regex]::Match($net, 'Maximum password age\s*:\s*(\d+)').Groups[1].Value
+        if ($maxAge -and [int]$maxAge -gt 0 -and [int]$maxAge -le 365) {
+          Emit-Check "PASS" "pwd_max_age" "Maximum password age <= 365 days" $maxAge
+        } else {
+          Emit-Check "FAIL" "pwd_max_age" "Maximum password age <= 365 days" ($(if ($maxAge) { $maxAge } else { "unknown" }))
+        }
+        $history = [regex]::Match($net, 'Length of password history maintained\s*:\s*(\d+)').Groups[1].Value
+        if ($history -and [int]$history -ge 24) {
+          Emit-Check "PASS" "pwd_history" "Password history >= 24" $history
+        } else {
+          Emit-Check "FAIL" "pwd_history" "Password history >= 24" ($(if ($history) { $history } else { "unknown" }))
+        }
+        $lockout = [regex]::Match($net, 'Lockout threshold\s*:\s*(\d+)').Groups[1].Value
+        if ($lockout -and [int]$lockout -gt 0 -and [int]$lockout -le 5) {
+          Emit-Check "PASS" "pwd_lockout_threshold" "Account lockout threshold configured" $lockout
+        } else {
+          Emit-Check "FAIL" "pwd_lockout_threshold" "Account lockout threshold configured" ($(if ($lockout) { $lockout } else { "unknown" }))
+        }
+      register: compliance_password
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Firewall and network exposure
+      ansible.windows.win_shell: |
+        function Emit-Check($Status, $Id, $Title, $Detail) {
+          Write-Output ("{0}|{1}|{2}|{3}" -f $Status, $Id, $Title, $Detail)
+        }
+        $profiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+        $disabled = @($profiles | Where-Object { -not $_.Enabled })
+        if ($disabled.Count -eq 0) {
+          Emit-Check "PASS" "fw_profiles_enabled" "All firewall profiles enabled" "Domain,Private,Public"
+        } else {
+          Emit-Check "FAIL" "fw_profiles_enabled" "All firewall profiles enabled" (($disabled.Name -join ","))
+        }
+        $rdp = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction SilentlyContinue
+        if ($rdp -and $rdp.fDenyTSConnections -eq 1) {
+          Emit-Check "PASS" "net_rdp_disabled" "Remote Desktop disabled" "disabled"
+        } else {
+          Emit-Check "FAIL" "net_rdp_disabled" "Remote Desktop disabled" "enabled"
+        }
+        $smb1 = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+        if ($smb1 -and $smb1.State -eq "Disabled") {
+          Emit-Check "PASS" "net_smbv1_disabled" "SMBv1 protocol disabled" "disabled"
+        } elseif ($smb1) {
+          Emit-Check "FAIL" "net_smbv1_disabled" "SMBv1 protocol disabled" $smb1.State
+        } else {
+          Emit-Check "PASS" "net_smbv1_disabled" "SMBv1 protocol disabled" "not installed"
+        }
+        $llmnr = Get-ItemProperty -Path "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient" -Name EnableMulticast -ErrorAction SilentlyContinue
+        if ($llmnr -and $llmnr.EnableMulticast -eq 0) {
+          Emit-Check "PASS" "net_llmnr_disabled" "LLMNR disabled via policy" "disabled"
+        } else {
+          Emit-Check "FAIL" "net_llmnr_disabled" "LLMNR disabled via policy" "not configured"
+        }
+      register: compliance_network
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Updates Defender and auditing
+      ansible.windows.win_shell: |
+        function Emit-Check($Status, $Id, $Title, $Detail) {
+          Write-Output ("{0}|{1}|{2}|{3}" -f $Status, $Id, $Title, $Detail)
+        }
+        $wua = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+        if ($wua -and $wua.Status -eq "Running") {
+          Emit-Check "PASS" "patch_wua_service" "Windows Update service running" "running"
+        } else {
+          Emit-Check "FAIL" "patch_wua_service" "Windows Update service running" ($(if ($wua) { $wua.Status } else { "missing" }))
+        }
+        $hotfix = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 1
+        if ($hotfix -and $hotfix.InstalledOn -gt (Get-Date).AddDays(-60)) {
+          Emit-Check "PASS" "patch_recent_hotfix" "Recent update within 60 days" ($hotfix.HotFixID)
+        } else {
+          Emit-Check "FAIL" "patch_recent_hotfix" "Recent update within 60 days" ($(if ($hotfix) { $hotfix.InstalledOn } else { "none" }))
+        }
+        $defender = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($defender -and $defender.AntivirusEnabled) {
+          Emit-Check "PASS" "defender_enabled" "Windows Defender antivirus enabled" "enabled"
+        } else {
+          Emit-Check "FAIL" "defender_enabled" "Windows Defender antivirus enabled" "disabled"
+        }
+        if ($defender -and $defender.AntispywareEnabled) {
+          Emit-Check "PASS" "defender_antispyware" "Windows Defender antispyware enabled" "enabled"
+        } else {
+          Emit-Check "FAIL" "defender_antispyware" "Windows Defender antispyware enabled" "disabled"
+        }
+        $sigAge = if ($defender) { $defender.AntivirusSignatureAge } else { $null }
+        if ($null -ne $sigAge -and $sigAge -le 7) {
+          Emit-Check "PASS" "defender_signature_age" "Defender signatures age <= 7 days" $sigAge
+        } else {
+          Emit-Check "FAIL" "defender_signature_age" "Defender signatures age <= 7 days" ($(if ($null -ne $sigAge) { $sigAge } else { "unknown" }))
+        }
+        $audit = auditpol /get /category:* 2>$null | Out-String
+        if ($audit -match "Logon\s+.*Success and Failure") {
+          Emit-Check "PASS" "audit_logon" "Audit logon success and failure" "configured"
+        } else {
+          Emit-Check "FAIL" "audit_logon" "Audit logon success and failure" "not configured"
+        }
+        if ($audit -match "Account Lockout\s+.*Success and Failure") {
+          Emit-Check "PASS" "audit_lockout" "Audit account lockout" "configured"
+        } else {
+          Emit-Check "FAIL" "audit_lockout" "Audit account lockout" "not configured"
+        }
+      register: compliance_updates
+      changed_when: false
+      failed_when: false
+
+    - name: COMPLIANCE | Security options and encryption
+      ansible.windows.win_shell: |
+        function Emit-Check($Status, $Id, $Title, $Detail) {
+          Write-Output ("{0}|{1}|{2}|{3}" -f $Status, $Id, $Title, $Detail)
+        }
+        $uac = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -ErrorAction SilentlyContinue
+        if ($uac -and $uac.EnableLUA -eq 1) {
+          Emit-Check "PASS" "sec_uac_enabled" "User Account Control enabled" "enabled"
+        } else {
+          Emit-Check "FAIL" "sec_uac_enabled" "User Account Control enabled" "disabled"
+        }
+        $autoRun = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name NoDriveTypeAutoRun -ErrorAction SilentlyContinue
+        if ($autoRun -and $autoRun.NoDriveTypeAutoRun -eq 255) {
+          Emit-Check "PASS" "sec_autorun_disabled" "AutoRun disabled for all drives" "255"
+        } else {
+          Emit-Check "FAIL" "sec_autorun_disabled" "AutoRun disabled for all drives" ($(if ($autoRun) { $autoRun.NoDriveTypeAutoRun } else { "not set" }))
+        }
+        $legal = Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System" -Name legalnoticecaption -ErrorAction SilentlyContinue
+        if ($legal -and $legal.legalnoticecaption) {
+          Emit-Check "PASS" "sec_legal_notice" "Legal notice banner configured" "configured"
+        } else {
+          Emit-Check "FAIL" "sec_legal_notice" "Legal notice banner configured" "missing"
+        }
+        $bitlocker = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+        if ($bitlocker -and $bitlocker.ProtectionStatus -eq "On") {
+          Emit-Check "PASS" "sec_bitlocker_c" "BitLocker protection on system volume" "on"
+        } else {
+          Emit-Check "FAIL" "sec_bitlocker_c" "BitLocker protection on system volume" ($(if ($bitlocker) { $bitlocker.ProtectionStatus } else { "unknown" }))
+        }
+        $lmHash = Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Lsa" -Name NoLMHash -ErrorAction SilentlyContinue
+        if ($lmHash -and $lmHash.NoLMHash -eq 1) {
+          Emit-Check "PASS" "sec_no_lm_hash" "LM hash storage disabled" "enabled"
+        } else {
+          Emit-Check "FAIL" "sec_no_lm_hash" "LM hash storage disabled" "disabled"
+        }
+        $powershellLog = Get-WinEvent -LogName "Windows PowerShell" -MaxEvents 1 -ErrorAction SilentlyContinue
+        if ($powershellLog) {
+          Emit-Check "PASS" "log_powershell" "PowerShell operational logging available" "available"
+        } else {
+          Emit-Check "FAIL" "log_powershell" "PowerShell operational logging available" "missing"
+        }
+      register: compliance_security
+      changed_when: false
+      failed_when: false
+
+    - name: Compliance summary
+      ansible.builtin.debug:
+        msg:
+          target: "{{ inventory_hostname }}"
+          os: "{{ ansible_os_name | default('Windows') }}"
+          checks_accounts: "{{ compliance_accounts.stdout_lines | default([]) }}"
+          checks_password: "{{ compliance_password.stdout_lines | default([]) }}"
+          checks_network: "{{ compliance_network.stdout_lines | default([]) }}"
+          checks_updates: "{{ compliance_updates.stdout_lines | default([]) }}"
+          checks_security: "{{ compliance_security.stdout_lines | default([]) }}"
+          format: "STATUS|check_id|title|detail"

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SA">
+  <rect width="64" height="64" rx="8" fill="#151515"/>
+  <text
+    x="32"
+    y="46"
+    text-anchor="middle"
+    font-family="'Red Hat Text', 'Arial Black', Arial, sans-serif"
+    font-weight="900"
+    font-size="36"
+    fill="#ee0000"
+    letter-spacing="-2"
+  >SA</text>
+</svg>

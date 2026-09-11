@@ -1,0 +1,46 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "secaudit.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+    helm.sh/hook-weight: {{ .Values.migrate.hookWeight | quote }}
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "secaudit.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "secaudit.serviceAccountName" . }}
+      restartPolicy: Never
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "secaudit.migrateImage" . }}
+          imagePullPolicy: {{ .Values.migrate.image.pullPolicy }}
+          command: ["alembic", "upgrade", "head"]
+          {{- include "secaudit.env" . | nindent 10 }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: profiles-data
+              mountPath: /data/profiles
+      volumes:
+        - name: profiles-data
+          {{- if or .Values.profiles.persistence.enabled .Values.profiles.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ include "secaudit.profilesClaim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

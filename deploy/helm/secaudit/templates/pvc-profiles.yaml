@@ -1,0 +1,17 @@
+{{- if and .Values.profiles.persistence.enabled (not .Values.profiles.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "secaudit.profilesClaim" . }}
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.profiles.persistence.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.profiles.persistence.size }}
+  {{- if .Values.profiles.persistence.storageClass }}
+  storageClassName: {{ .Values.profiles.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

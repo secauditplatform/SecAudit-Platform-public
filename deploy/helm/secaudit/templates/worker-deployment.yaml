@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "secaudit.fullname" . }}-worker
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "secaudit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        {{- include "secaudit.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "secaudit.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: worker
+          image: {{ include "secaudit.workerImage" . }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          args:
+            - celery
+            - -A
+            - app.celery_app
+            - worker
+            - --loglevel=info
+            - -Q
+            - {{ .Values.worker.queues | quote }}
+          {{- include "secaudit.env" . | nindent 10 }}
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: secaudit-worker
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          volumeMounts:
+            - name: profiles-data
+              mountPath: /data/profiles
+      volumes:
+        - name: profiles-data
+          {{- if or .Values.profiles.persistence.enabled .Values.profiles.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ include "secaudit.profilesClaim" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

@@ -1,0 +1,4 @@
+# Shell scripts and profile playbooks must keep Unix LF for Linux targets.
+*.sh text eol=lf
+*.bash text eol=lf
+profiles/**/*.yml text eol=lf

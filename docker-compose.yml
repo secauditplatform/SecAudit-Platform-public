@@ -1,0 +1,411 @@
+# Shared Redis Sentinel settings — all app services must use the same values.
+x-redis-sentinel: &redis-sentinel
+  REDIS_URL: redis://secaudit-master/0
+  CELERY_BROKER_URL: redis://secaudit-master/0
+  CELERY_RESULT_BACKEND: redis://secaudit-master/1
+  REDIS_SENTINEL_HOSTS: redis-sentinel-1:26379,redis-sentinel-2:26379,redis-sentinel-3:26379
+  REDIS_SENTINEL_MASTER_NAME: secaudit-master
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: secaudit
+      POSTGRES_USER: secaudit
+      POSTGRES_PASSWORD: secaudit_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secaudit -d secaudit"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    profiles: ["standalone"]
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-master:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --protected-mode no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-replica:
+    image: redis:7-alpine
+    command: redis-server --replicaof redis-master 6379 --appendonly yes --protected-mode no
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  redis-sentinel-1:
+    image: redis:7-alpine
+    command: >
+      sh -c "cp /etc/redis/sentinel.conf /tmp/sentinel.conf &&
+      exec redis-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./infra/redis/sentinel/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_started
+
+  redis-sentinel-2:
+    image: redis:7-alpine
+    command: >
+      sh -c "cp /etc/redis/sentinel.conf /tmp/sentinel.conf &&
+      exec redis-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./infra/redis/sentinel/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_started
+
+  redis-sentinel-3:
+    image: redis:7-alpine
+    command: >
+      sh -c "cp /etc/redis/sentinel.conf /tmp/sentinel.conf &&
+      exec redis-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./infra/redis/sentinel/sentinel.conf:/etc/redis/sentinel.conf:ro
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_started
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: 1
+      MP_SMTP_AUTH_ALLOW_INSECURE: 1
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: 8080
+      # Public hostname for SSO redirects/issuer (LAN IP now; domain later via PUBLIC_HOST)
+      KC_HOSTNAME: ${PUBLIC_HOST:-localhost}
+      KC_HOSTNAME_PORT: 8080
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import
+
+  migrate:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      <<: *redis-sentinel
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      APP_ENV: ${APP_ENV:-development}
+      SKIP_MIGRATIONS: "0"
+    volumes:
+      - ./api:/app
+      - ./packages/secaudit_core:/packages/secaudit_core
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_started
+    command: alembic upgrade head
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "8000:8000"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      <<: *redis-sentinel
+      WATCHFILES_FORCE_POLLING: "true"
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      APP_ENV: ${APP_ENV:-development}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+      CONSOLE_ENABLED: ${CONSOLE_ENABLED:-true}
+      CONSOLE_SANDBOX_ENABLED: ${CONSOLE_SANDBOX_ENABLED:-true}
+      CONSOLE_SANDBOX_URL: ${CONSOLE_SANDBOX_URL:-http://console:8001}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8080/realms/secaudit}
+      KEYCLOAK_REALM: secaudit
+      PROFILES_STORAGE_PATH: /data/profiles
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME_API:-secaudit-api}
+      OTEL_SAMPLER_RATIO: ${OTEL_SAMPLER_RATIO:-1.0}
+      # migrate service owns schema; api only seeds once per container (see main.py startup marker).
+      SKIP_MIGRATIONS: "1"
+    volumes:
+      - ./api:/app
+      - ./packages/secaudit_core:/packages/secaudit_core
+      - ./scripts:/scripts:ro
+      - ${PROFILES_SOURCE_PATH:-./profiles}:/profiles:ro
+      - profiles_data:/data/profiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      console:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    # reload-delay debounces Windows bind-mount polling (WATCHFILES_FORCE_POLLING) so rapid
+    # file saves do not leave uvicorn stuck mid-reload with a hung API.
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-delay 5
+      --timeout-graceful-shutdown 10
+      --reload-dir /app --reload-dir /packages/secaudit_core
+      --reload-exclude '*/__pycache__/*' --reload-exclude '*.pyc'
+      --reload-exclude '*/playbook_templates.py'
+
+  console:
+    build:
+      context: .
+      dockerfile: console/Dockerfile
+    ports:
+      - "8001:8001"
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=32m
+      - /var/empty/secaudit-console:rw,noexec,nosuid,nodev,size=1m
+    env_file:
+      - .env
+    environment:
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      APP_ENV: ${APP_ENV:-development}
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+      CONSOLE_ENABLED: ${CONSOLE_ENABLED:-true}
+      CONSOLE_ALLOW_IN_PRODUCTION: ${CONSOLE_ALLOW_IN_PRODUCTION:-false}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8080/realms/secaudit}
+      KEYCLOAK_REALM: secaudit
+    volumes:
+      - ./api:/app
+      - ./packages/secaudit_core:/packages/secaudit_core
+    depends_on:
+      keycloak:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/live')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    command: uvicorn app.console_main:app --host 0.0.0.0 --port 8001 --reload --reload-dir /app
+    # Network tradeoff: shares the default Compose network so diagnostics can reach
+    # lab targets and Keycloak JWKS. It does not mount Postgres/Redis data volumes;
+    # prefer denying DB ports via external firewall/network policies in production.
+
+  worker:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    cap_add:
+      - NET_RAW
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      <<: *redis-sentinel
+      WATCHFILES_FORCE_POLLING: "true"
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      APP_ENV: ${APP_ENV:-development}
+      PROFILES_STORAGE_PATH: /data/profiles
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME_WORKER:-secaudit-worker}
+      OTEL_SAMPLER_RATIO: ${OTEL_SAMPLER_RATIO:-1.0}
+    volumes:
+      - ./workers:/app
+      - ./packages/secaudit_core:/packages/secaudit_core
+      - ${PROFILES_SOURCE_PATH:-./profiles}:/profiles:ro
+      - profiles_data:/data/profiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis-sentinel-1:
+        condition: service_started
+    command: >
+      watchmedo auto-restart
+      --directory=/app
+      --directory=/packages/secaudit_core
+      --pattern=*.py
+      --recursive
+      --
+      celery -A app.celery_app worker --loglevel=info
+      -Q compliance,remediation,inventory,maintenance
+
+  beat:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      <<: *redis-sentinel
+      WATCHFILES_FORCE_POLLING: "true"
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      OTEL_ENABLED: ${OTEL_ENABLED:-false}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://tempo:4318}
+      OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-http/protobuf}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME_BEAT:-secaudit-beat}
+      OTEL_SAMPLER_RATIO: ${OTEL_SAMPLER_RATIO:-1.0}
+    volumes:
+      - ./workers:/app
+      - ./packages/secaudit_core:/packages/secaudit_core
+    depends_on:
+      redis-sentinel-1:
+        condition: service_started
+    command: >
+      watchmedo auto-restart
+      --directory=/app
+      --pattern=*.py
+      --recursive
+      --
+      celery -A app.celery_app beat --loglevel=info
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    environment:
+      # Use Vite dev-server proxy (/api → api:8000) so the browser stays same-origin.
+      VITE_API_PROXY: http://api:8000
+      # Leave VITE_WS_URL unset: browser uses same-origin ws/wss (Vite proxies /api WS).
+      # Setting ws://… breaks HTTPS / reverse-proxy setups (mixed content).
+      VITE_AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      VITE_LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+      VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-http://localhost:8080}
+      VITE_KEYCLOAK_REALM: secaudit
+      VITE_KEYCLOAK_CLIENT_ID: secaudit-frontend
+      VITE_PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+      CHOKIDAR_USEPOLLING: "true"
+      WATCHPACK_POLLING: "true"
+    depends_on:
+      - api
+    command: npm run dev
+
+  tempo:
+    profiles: ["observability"]
+    image: grafana/tempo:2.6.0
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./infra/observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP API / query
+      - "4318:4318"   # OTLP HTTP receiver
+      - "4317:4317"   # OTLP gRPC receiver
+    depends_on:
+      - prometheus
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
+      - --enable-feature=native-histograms
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:11.3.0
+    depends_on:
+      - tempo
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor,traceqlMetrics"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/secaudit_overview.json
+    volumes:
+      - ./infra/observability/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/observability/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infra/observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      # Host port kept outside the Windows/WinNAT reserved range 2940-3039
+      # (3000/3001 fall inside it and fail to bind on Windows Docker Desktop).
+      - "3300:3000"
+
+volumes:
+  postgres_data:
+  frontend_node_modules:
+  profiles_data:
+  tempo_data:
+  grafana_data:
+  prometheus_data:
