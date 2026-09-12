@@ -14,6 +14,7 @@ from app.services.audit_log import log_audit_event
 from app.services.object_rbac import (
     apply_credential_list_scope,
     assert_can_access,
+    assert_can_mutate,
     assert_credential_visible,
     assign_owner,
 )
@@ -128,7 +129,7 @@ async def update_credential(
     user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
 ) -> CredentialRead:
     credential = await assert_credential_visible(db, user, credential_id)
-    assert_can_access(user, credential.owner_sub, detail="Credential not found")
+    assert_can_mutate(user, credential.owner_sub, detail="Credential not found")
 
     if data.name is not None and data.name != credential.name:
         existing = await db.execute(select(Credential).where(Credential.name == data.name))
@@ -177,7 +178,7 @@ async def delete_credential(
     user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
 ) -> None:
     credential = await assert_credential_visible(db, user, credential_id)
-    assert_can_access(user, credential.owner_sub, detail="Credential not found")
+    assert_can_mutate(user, credential.owner_sub, detail="Credential not found")
 
     linked_hosts = await db.execute(select(Host).where(Host.credential_id == credential_id))
     for host in linked_hosts.scalars().all():

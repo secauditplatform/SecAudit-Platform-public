@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser, authenticate_websocket
@@ -20,6 +20,18 @@ from secaudit_core.enums import UserRole
 from secaudit_core.redis_client import async_redis
 
 router = APIRouter()
+
+
+def _ws_user_can_operate(user: AuthUser) -> bool:
+    return user.has_role(UserRole.OPERATOR, UserRole.ADMIN)
+
+
+async def _reject_demo_execute_ws(websocket: WebSocket) -> bool:
+    """Return True if the socket was closed because demo mode blocks execute streams."""
+    if not settings.demo_mode:
+        return False
+    await websocket.close(code=4403, reason="Demo mode: execute streams disabled")
+    return True
 
 
 @router.get("/job-runs/{run_id}/logs", response_model=list[JobRunLogEntry])
@@ -46,6 +58,11 @@ async def job_run_logs_ws(
     user, _token = await authenticate_websocket(websocket)
     if not user:
         await websocket.close(code=4401, reason="Not authenticated")
+        return
+    if not _ws_user_can_operate(user):
+        await websocket.close(code=4403, reason="Insufficient permissions")
+        return
+    if await _reject_demo_execute_ws(websocket):
         return
 
     from app.core.database import async_session
@@ -105,6 +122,11 @@ async def remediation_run_logs_ws(
     if not user:
         await websocket.close(code=4401, reason="Not authenticated")
         return
+    if not _ws_user_can_operate(user):
+        await websocket.close(code=4403, reason="Insufficient permissions")
+        return
+    if await _reject_demo_execute_ws(websocket):
+        return
 
     from app.core.database import async_session
 
@@ -161,6 +183,11 @@ async def audit_flow_logs_ws(
     user, _token = await authenticate_websocket(websocket)
     if not user:
         await websocket.close(code=4401, reason="Not authenticated")
+        return
+    if not _ws_user_can_operate(user):
+        await websocket.close(code=4403, reason="Insufficient permissions")
+        return
+    if await _reject_demo_execute_ws(websocket):
         return
 
     from app.core.database import async_session

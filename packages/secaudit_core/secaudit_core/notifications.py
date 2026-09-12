@@ -12,6 +12,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from secaudit_core.celery_dispatch import send_task
+from secaudit_core.egress import (
+    pinned_https_url,
+    sanitize_outbound_headers,
+    validate_public_https_url,
+    validate_smtp_endpoint,
+)
 from secaudit_core.enums import JobStatus, NotificationChannelType, NotificationEventType
 from secaudit_core.models import NotificationChannel
 from secaudit_core.secrets import decrypt_secret
@@ -318,14 +324,6 @@ def deliver_per_job_webhook(db: Session, payload: dict[str, Any], settings: SecA
         return {"sent": 0, "errors": [safe_error]}
 
 
-def _resolve_webhook_url(channel: NotificationChannel, settings: SecAuditSettings) -> str | None:
-    if channel.encrypted_secret:
-        return decrypt_secret(channel.encrypted_secret, settings)
-    config = channel.config_json or {}
-    url = config.get("webhook_url")
-    return str(url) if url else None
-
-
 def _normalize_email_recipients(raw: object) -> list[str]:
     if raw is None:
         return []
@@ -349,6 +347,13 @@ def _deliver_email(channel: NotificationChannel, payload: dict[str, Any], settin
         )
 
     smtp_port = int(config.get("smtp_port") or settings.smtp_port or 587)
+    # Operator-supplied host must be public; env SMTP_HOST may be private (Mailpit).
+    allow_private = not bool((config.get("smtp_host") or "").strip())
+    smtp_host, smtp_port = validate_smtp_endpoint(
+        smtp_host,
+        smtp_port,
+        allow_private=allow_private,
+    )
     smtp_user = config.get("smtp_user") or settings.smtp_user
     smtp_password = None
     if channel.encrypted_secret:
@@ -383,11 +388,26 @@ def _deliver_email(channel: NotificationChannel, payload: dict[str, Any], settin
 
 
 def _deliver_webhook(url: str, body: dict[str, Any], headers: dict[str, str] | None = None) -> None:
-    request_headers = {"Content-Type": "application/json"}
+    safe_url, pin_headers = pinned_https_url(url)
+    request_headers = {"Content-Type": "application/json", **pin_headers}
     if headers:
-        request_headers.update(headers)
-    response = httpx.post(url, json=body, headers=request_headers, timeout=30.0)
+        request_headers.update(sanitize_outbound_headers(headers))
+    response = httpx.post(
+        safe_url,
+        json=body,
+        headers=request_headers,
+        timeout=30.0,
+        follow_redirects=False,
+    )
     response.raise_for_status()
+
+
+def _resolve_webhook_url(channel: NotificationChannel, settings: SecAuditSettings) -> str | None:
+    if channel.encrypted_secret:
+        return decrypt_secret(channel.encrypted_secret, settings)
+    config = channel.config_json or {}
+    url = config.get("webhook_url")
+    return str(url).strip() if url else None
 
 
 def _deliver_slack(channel: NotificationChannel, payload: dict[str, Any], settings: SecAuditSettings) -> None:

@@ -16,25 +16,27 @@ from secaudit_core.object_rbac import (
 )
 
 
-def test_applies_engineer_scope_is_disabled():
-    assert applies_engineer_scope([UserRole.OPERATOR.value]) is False
+def test_applies_engineer_scope_scopes_non_admins_when_enabled():
+    assert applies_engineer_scope([UserRole.OPERATOR.value]) is True
+    assert applies_engineer_scope([UserRole.AUDITOR.value]) is True
     assert applies_engineer_scope([UserRole.ADMIN.value]) is False
-    assert applies_engineer_scope([UserRole.AUDITOR.value]) is False
     assert applies_engineer_scope([UserRole.OPERATOR.value], enabled=False) is False
 
 
-def test_can_access_owned_resource_allows_all_roles():
-    for roles in (
-        [UserRole.OPERATOR.value],
-        [UserRole.ADMIN.value],
-        [UserRole.AUDITOR.value],
-    ):
-        assert can_access_owned_resource(roles, "local:alice", "local:alice") is True
-        assert can_access_owned_resource(roles, "local:alice", "local:bob") is True
-        assert can_access_owned_resource(roles, "local:alice", None) is True
+def test_can_access_owned_resource_scopes_non_admins():
+    assert can_access_owned_resource([UserRole.OPERATOR.value], "local:alice", "local:alice") is True
+    assert can_access_owned_resource([UserRole.OPERATOR.value], "local:alice", "local:bob") is False
+    assert can_access_owned_resource([UserRole.OPERATOR.value], "local:alice", None) is True
+    assert can_access_owned_resource(
+        [UserRole.OPERATOR.value], "local:alice", None, mutate=True
+    ) is False
+    assert can_access_owned_resource([UserRole.ADMIN.value], "local:alice", "local:bob") is True
+    assert can_access_owned_resource([UserRole.ADMIN.value], "local:alice", None, mutate=True) is True
+    assert can_access_owned_resource([UserRole.AUDITOR.value], "local:alice", "local:bob") is False
 
 
-def test_assign_host_target_scope_never_enforces_owner_scope():
+def test_assign_host_target_scope_enforces_for_operators(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     operator_job = Job()
     admin_job = RemediationJob()
 
@@ -47,12 +49,13 @@ def test_assign_host_target_scope_never_enforces_owner_scope():
         AuthUser(sub="local:admin", username="admin", roles=[UserRole.ADMIN.value]),
     )
 
-    assert operator_job.enforce_host_owner_scope is False
+    assert operator_job.enforce_host_owner_scope is True
     assert admin_job.enforce_host_owner_scope is False
 
 
 @pytest.mark.asyncio
-async def test_list_hosts_does_not_apply_owner_filter(monkeypatch):
+async def test_list_hosts_applies_owner_filter(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     fake_db = AsyncMock()
     captured: dict[str, str] = {}
 
@@ -69,14 +72,14 @@ async def test_list_hosts_does_not_apply_owner_filter(monkeypatch):
         active_only=False,
         search=None,
     )
-    assert "hosts.owner_sub =" not in captured["sql"]
-    assert "hosts.owner_sub==" not in captured["sql"]
+    sql = captured["sql"].replace(" ", "")
+    assert "owner_sub" in captured["sql"]
+    assert "local:op1" in captured["sql"] or "owner_sub" in sql
 
-
-from datetime import datetime, timezone
 
 @pytest.mark.asyncio
-async def test_get_host_allows_cross_owner_for_operator():
+async def test_get_host_denies_cross_owner_for_operator(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     host = Host(
         id=1,
         name="h1",
@@ -92,16 +95,18 @@ async def test_get_host_allows_cross_owner_for_operator():
         return type("R", (), {"scalar_one_or_none": lambda self: host})()
 
     fake_db.execute = _execute
-    result = await hosts.get_host(
-        host_id=1,
-        db=fake_db,
-        user=AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
-    )
-    assert result.id == 1
+    with pytest.raises(HTTPException) as exc:
+        await hosts.get_host(
+            host_id=1,
+            db=fake_db,
+            user=AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
+        )
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_list_jobs_does_not_apply_owner_filter(monkeypatch):
+async def test_list_jobs_applies_owner_filter(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     fake_db = AsyncMock()
     captured: dict[str, str] = {}
 
@@ -114,17 +119,19 @@ async def test_list_jobs_does_not_apply_owner_filter(monkeypatch):
         db=fake_db,
         user=AuthUser(sub="local:op1", username="op1", roles=[UserRole.OPERATOR.value]),
     )
-    assert "jobs.owner_sub =" not in captured["sql"]
-    assert "jobs.owner_sub==" not in captured["sql"]
+    assert "owner_sub" in captured["sql"]
 
 
 @pytest.mark.asyncio
-async def test_assert_hosts_accessible_allows_foreign_host_for_operator():
+async def test_assert_hosts_accessible_denies_foreign_host_for_operator(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     foreign = Host(id=5, name="other", hostname="1.1.1.1", port=22, is_active=True, owner_sub="local:bob")
     fake_db = AsyncMock()
     fake_db.get = AsyncMock(return_value=foreign)
-    await object_rbac_service.assert_hosts_accessible(
-        fake_db,
-        AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
-        [5],
-    )
+    with pytest.raises(HTTPException) as exc:
+        await object_rbac_service.assert_hosts_accessible(
+            fake_db,
+            AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
+            [5],
+        )
+    assert exc.value.status_code == 404

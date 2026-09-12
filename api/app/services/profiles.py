@@ -603,6 +603,24 @@ class ProfileService:
     )
     return result.scalar_one()
 
+  def _confine_import_package_path(self, package_path: str) -> Path:
+    """Allow catalog imports only under the configured profiles mount."""
+    root = Path(settings.profiles_path).resolve()
+    if not root.is_dir():
+      raise FileNotFoundError(f"Profiles catalog mount not found: {settings.profiles_path}")
+    path = Path(package_path).expanduser()
+    if not path.is_absolute():
+      path = (root / path).resolve()
+    else:
+      path = path.resolve()
+    if root not in path.parents and path != root:
+      raise ValueError(
+        f"package_path must stay under profiles catalog mount ({settings.profiles_path})"
+      )
+    if not path.exists():
+      raise FileNotFoundError(f"Profile package not found at {package_path}")
+    return path
+
   async def import_from_path(
     self,
     db: AsyncSession,
@@ -611,9 +629,7 @@ class ProfileService:
     *,
     replace_existing: bool = False,
   ) -> Profile:
-    path = Path(package_path)
-    if not path.exists():
-      raise FileNotFoundError(f"Profile package not found at {package_path}")
+    path = self._confine_import_package_path(package_path)
     return await self._import_package_dir(
       db,
       path,
@@ -861,8 +877,8 @@ class ProfileService:
     return {"imported": imported, "skipped": skipped, "errors": errors}
 
   async def preview_catalog_rules(self, package_path: str, *, limit: int = 200) -> list[dict]:
-    package_dir = Path(package_path)
-    if not package_dir.exists() or not package_dir.is_dir():
+    package_dir = self._confine_import_package_path(package_path)
+    if not package_dir.is_dir():
       raise FileNotFoundError(f"Profile package not found at {package_path}")
     return load_profile_rules_metadata(package_dir, limit=limit)
 

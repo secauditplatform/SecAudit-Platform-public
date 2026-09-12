@@ -40,7 +40,5 @@ def test_console_sandbox_off_in_production_without_allow() -> None:
 def test_sandbox_console_ws_url_maps_http_without_query_token() -> None:
     assert sandbox_console_ws_url("http://console:8001") == "ws://console:8001/api/v1/ws/console"
     assert sandbox_console_ws_url("https://console.example") == "wss://console.example/api/v1/ws/console"
-    assert (
-        sandbox_console_ws_url("http://console:8001", token="abc.def")
-        == "ws://console:8001/api/v1/ws/console?token=abc.def"
-    )
+    # Tokens must never be appended as query params (proxy/access-log leakage).
+    assert "?" not in sandbox_console_ws_url("http://console:8001")

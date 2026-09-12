@@ -351,6 +351,7 @@ def _execute_check(
     job_run_id: int,
     *,
     extra_env: dict[str, str] | None = None,
+    package_root: Path | None = None,
 ) -> str:
     creds = linked_credentials(host)
     cred = creds[0] if creds else None
@@ -436,6 +437,7 @@ def _execute_check(
                     script_path=script_path,
                     extra_env=extra_env,
                     key_passphrase=key_passphrase,
+                    package_root=package_root,
                 )
             if not password and not private_key:
                 raise ValueError("Python checks require ssh_password or ssh_key credential")
@@ -656,6 +658,7 @@ def _run_scap_profile_job(
                         audit_script.execution_type,
                         job_run_id,
                         extra_env=service_env or None,
+                        package_root=package_dir,
                     )
                     script_parsed = apply_interpreter_rules(output, rules)
                 except InterruptedError:
@@ -954,6 +957,7 @@ def _run_profile_job(
                             script.execution_type,
                             job_run_id,
                             extra_env=merged_env,
+                            package_root=package_dir,
                         )
                     except InterruptedError:
                         raise

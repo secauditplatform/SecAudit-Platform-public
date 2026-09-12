@@ -37,7 +37,18 @@ def test_validate_production_runtime_config_allows_development_defaults():
         app_env="development",
         auth_enabled=False,
         api_debug=True,
+        object_rbac_enabled=False,
     )
+
+
+def test_validate_production_runtime_config_rejects_disabled_object_rbac():
+    with pytest.raises(RuntimeError, match="OBJECT_RBAC_ENABLED=false"):
+        validate_production_runtime_config(
+            app_env="production",
+            auth_enabled=True,
+            api_debug=False,
+            object_rbac_enabled=False,
+        )
 
 
 def test_keycloak_jwt_rejects_unsupported_algorithm():
@@ -62,6 +73,17 @@ def test_resolve_script_under_package_rejects_traversal(tmp_path: Path):
 
     with pytest.raises(ValueError, match="must stay inside package"):
         resolve_script_under_package(package, "../outside.sh")
+
+
+def test_resolve_under_package_rejects_absolute_refs(tmp_path: Path):
+    from secaudit_core.package_paths import resolve_under_package
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "os.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="relative"):
+        resolve_under_package(package, "/etc/passwd")
 
 
 @pytest.fixture(autouse=True)

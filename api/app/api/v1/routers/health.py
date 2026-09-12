@@ -11,12 +11,22 @@ router = APIRouter()
 @router.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Liveness probe — quick ok without dependency checks."""
-    return HealthResponse(status="ok", app_name=settings.app_name)
+    return HealthResponse(
+        status="ok",
+        app_name=settings.app_name,
+        version=settings.app_version,
+        demo_mode=settings.demo_mode,
+    )
 
 
 @router.get("/health/live", response_model=HealthResponse)
 async def liveness_check() -> HealthResponse:
-    return HealthResponse(status="ok", app_name=settings.app_name)
+    return HealthResponse(
+        status="ok",
+        app_name=settings.app_name,
+        version=settings.app_version,
+        demo_mode=settings.demo_mode,
+    )
 
 
 @router.get("/health/ready", response_model=ReadinessResponse)

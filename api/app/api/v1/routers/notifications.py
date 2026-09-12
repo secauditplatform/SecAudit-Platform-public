@@ -18,9 +18,11 @@ from app.services.audit_log import log_audit_event
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
+    assert_can_mutate,
     assign_notification_channel_owner,
 )
 from secaudit_core.enums import NotificationChannelType
+from secaudit_core.egress import validate_channel_config_egress
 from secaudit_core.notifications import build_test_payload, deliver_to_channel
 from secaudit_core.siem_export import build_siem_test_payload
 from secaudit_core.sensitive_data import redact_sensitive
@@ -74,12 +76,21 @@ async def create_notification_channel(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Notification channel with this name already exists")
 
+    try:
+        config_json = validate_channel_config_egress(
+            channel_type=str(data.channel_type.value if hasattr(data.channel_type, "value") else data.channel_type),
+            config_json=data.config_json,
+            secret=data.secret,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     channel = NotificationChannel(
         name=data.name,
         channel_type=data.channel_type,
         is_active=data.is_active,
         events=[event.value if hasattr(event, "value") else str(event) for event in data.events],
-        config_json=data.config_json,
+        config_json=config_json,
         encrypted_secret=_encrypt_channel_secret(data.secret),
     )
     assign_notification_channel_owner(channel, user)
@@ -122,7 +133,7 @@ async def update_notification_channel(
     channel = await db.get(NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
-    assert_can_access(user, channel.owner_sub, detail="Notification channel not found")
+    assert_can_mutate(user, channel.owner_sub, detail="Notification channel not found")
 
     if data.name is not None and data.name != channel.name:
         existing = await db.execute(select(NotificationChannel).where(NotificationChannel.name == data.name))
@@ -136,8 +147,19 @@ async def update_notification_channel(
         channel.is_active = data.is_active
     if data.events is not None:
         channel.events = [event.value if hasattr(event, "value") else str(event) for event in data.events]
-    if data.config_json is not None:
-        channel.config_json = data.config_json
+    if data.config_json is not None or data.secret:
+        try:
+            channel.config_json = validate_channel_config_egress(
+                channel_type=str(
+                    (data.channel_type or channel.channel_type).value
+                    if hasattr(data.channel_type or channel.channel_type, "value")
+                    else (data.channel_type or channel.channel_type)
+                ),
+                config_json=data.config_json if data.config_json is not None else channel.config_json,
+                secret=data.secret,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if data.secret:
         channel.encrypted_secret = _encrypt_channel_secret(data.secret)
 
@@ -165,7 +187,7 @@ async def delete_notification_channel(
     channel = await db.get(NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
-    assert_can_access(user, channel.owner_sub, detail="Notification channel not found")
+    assert_can_mutate(user, channel.owner_sub, detail="Notification channel not found")
 
     channel_name = channel.name
     await db.delete(channel)
@@ -190,7 +212,7 @@ async def test_notification_channel(
     channel = await db.get(NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
-    assert_can_access(user, channel.owner_sub, detail="Notification channel not found")
+    assert_can_mutate(user, channel.owner_sub, detail="Notification channel not found")
 
     if channel.channel_type == NotificationChannelType.SIEM:
         payload = build_siem_test_payload(settings)

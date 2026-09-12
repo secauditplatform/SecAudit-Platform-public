@@ -18,9 +18,13 @@ class Settings(SecAuditSettings):
     local_auth_enabled: bool = False
     local_auth_token_ttl_seconds: int = 86400
     local_auth_refresh_token_ttl_seconds: int = 604800
+    # Re-load active flag + roles from DB on every local JWT request (disable in unit tests).
+    local_auth_revalidate_from_db: bool = True
     local_auth_rate_limit_enabled: bool = True
     local_auth_rate_limit_max_attempts: int = 10
     local_auth_rate_limit_window_seconds: int = 60
+    # Comma-separated proxy peer IPs allowed to supply X-Forwarded-For for rate limits.
+    trusted_proxy_ips: str = ""
 
     # Opt-in first local admin (created only when the users table is empty).
     bootstrap_admin_username: str | None = None

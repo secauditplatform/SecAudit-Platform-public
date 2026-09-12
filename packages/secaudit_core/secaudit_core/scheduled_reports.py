@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from secaudit_core.egress import validate_smtp_endpoint
 from secaudit_core.enums import JobStatus, ScheduledReportDelivery, ScheduledReportFormat
 from secaudit_core.models import JobRun, ScheduledReport, ScheduledReportDeliveryAttempt
 from secaudit_core.reports import (
@@ -106,6 +107,12 @@ def _send_report_email(
         )
 
     smtp_port = int(config.get("smtp_port") or settings.smtp_port or 587)
+    allow_private = not bool((config.get("smtp_host") or "").strip())
+    smtp_host, smtp_port = validate_smtp_endpoint(
+        smtp_host,
+        smtp_port,
+        allow_private=allow_private,
+    )
     smtp_user = config.get("smtp_user") or settings.smtp_user
     smtp_password = _resolve_smtp_password(schedule, settings)
     from_address = config.get("from_address") or settings.smtp_from or smtp_user
@@ -191,7 +198,8 @@ def _deliver_report_s3(
     else:
         secret_key = config.get("secret_key") or settings.s3_secret_key
 
-    endpoint_url = config.get("endpoint_url") or settings.s3_endpoint_url
+    config_endpoint = config.get("endpoint_url")
+    endpoint_url = config_endpoint or settings.s3_endpoint_url
     prefix = str(config.get("prefix") or settings.s3_prefix or "").strip("/")
     uploaded: list[str] = []
 
@@ -208,6 +216,7 @@ def _deliver_report_s3(
             access_key=access_key,
             secret_key=secret_key,
             endpoint_url=endpoint_url,
+            endpoint_from_user_config=bool(config_endpoint),
         )
         uploaded.append(location)
 

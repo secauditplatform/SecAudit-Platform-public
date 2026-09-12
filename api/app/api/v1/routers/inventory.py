@@ -17,7 +17,7 @@ from app.services.inventory_scan import (
     validate_nmap_flags,
     validate_scan_target,
 )
-from app.services.object_rbac import apply_owner_scope, assert_can_access, assign_owner
+from app.services.object_rbac import apply_owner_scope, assert_can_access, assert_can_mutate, assign_owner
 
 router = APIRouter()
 
@@ -101,7 +101,7 @@ async def stop_inventory_scan(
     scan = await db.get(InventoryScan, scan_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-    assert_can_access(user, scan.owner_sub, detail="Scan not found")
+    assert_can_mutate(user, scan.owner_sub, detail="Scan not found")
 
     if scan.status not in (JobStatus.PENDING, JobStatus.RUNNING):
         raise HTTPException(
@@ -130,7 +130,7 @@ async def delete_inventory_scan(
     scan = await db.get(InventoryScan, scan_id)
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
-    assert_can_access(user, scan.owner_sub, detail="Scan not found")
+    assert_can_mutate(user, scan.owner_sub, detail="Scan not found")
 
     if scan.status in (JobStatus.PENDING, JobStatus.RUNNING):
         request_scan_cancel(settings.redis_url, scan_id)

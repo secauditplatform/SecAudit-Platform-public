@@ -58,3 +58,75 @@ async def test_enforce_rate_limit_blocks_after_max():
         with pytest.raises(HTTPException) as exc:
             await enforce_rate_limit(request, scope="test", max_attempts=3, window_seconds=60)
         assert exc.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_enforce_rate_limit_fails_closed_on_redis_error():
+    from fastapi import HTTPException
+
+    from app.services.rate_limit import enforce_rate_limit
+
+    class _Request:
+        headers = {}
+        client = type("C", (), {"host": "1.2.3.4"})()
+
+    with patch("app.services.rate_limit.async_redis", side_effect=RuntimeError("redis down")):
+        with pytest.raises(HTTPException) as exc:
+            await enforce_rate_limit(_Request(), scope="test", max_attempts=3, window_seconds=60)
+        assert exc.value.status_code == 503
+
+
+def test_client_ip_ignores_xff_without_trusted_proxy(monkeypatch):
+    from app.core.config import settings
+    from app.services.rate_limit import _client_ip
+
+    monkeypatch.setattr(settings, "trusted_proxy_ips", "")
+
+    class _Request:
+        headers = {"x-forwarded-for": "9.9.9.9"}
+        client = type("C", (), {"host": "1.2.3.4"})()
+
+    assert _client_ip(_Request()) == "1.2.3.4"
+
+
+def test_client_ip_honors_xff_from_trusted_proxy(monkeypatch):
+    from app.core.config import settings
+    from app.services.rate_limit import _client_ip
+
+    monkeypatch.setattr(settings, "trusted_proxy_ips", "10.0.0.1")
+
+    class _Request:
+        headers = {"x-forwarded-for": "9.9.9.9, 10.0.0.1"}
+        client = type("C", (), {"host": "10.0.0.1"})()
+
+    assert _client_ip(_Request()) == "9.9.9.9"
+
+
+@pytest.mark.asyncio
+async def test_enforce_rate_limit_fails_closed_when_redis_errors():
+    from fastapi import HTTPException
+
+    from app.services.rate_limit import enforce_rate_limit
+
+    class _Request:
+        headers = {}
+        client = type("C", (), {"host": "1.2.3.4"})()
+
+    with patch("app.services.rate_limit.async_redis", side_effect=RuntimeError("redis down")):
+        with pytest.raises(HTTPException) as exc:
+            await enforce_rate_limit(_Request(), scope="test", max_attempts=3, window_seconds=60)
+        assert exc.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_enforce_rate_limit_ignores_xff_without_trusted_proxy(monkeypatch):
+    from app.core.config import settings
+    from app.services.rate_limit import _client_ip
+
+    monkeypatch.setattr(settings, "trusted_proxy_ips", "")
+
+    class _Request:
+        headers = {"x-forwarded-for": "9.9.9.9"}
+        client = type("C", (), {"host": "1.2.3.4"})()
+
+    assert _client_ip(_Request()) == "1.2.3.4"

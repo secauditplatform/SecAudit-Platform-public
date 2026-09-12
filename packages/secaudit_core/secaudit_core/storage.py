@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from secaudit_core.egress import validate_egress_url, validate_public_https_url
+
 if TYPE_CHECKING:
     from secaudit_core.settings import SecAuditSettings
 
@@ -21,6 +23,7 @@ def upload_report_object(
     access_key: str | None = None,
     secret_key: str | None = None,
     endpoint_url: str | None = None,
+    endpoint_from_user_config: bool = False,
 ) -> str:
     try:
         import boto3
@@ -37,9 +40,23 @@ def upload_report_object(
     if not resolved_access_key or not resolved_secret_key:
         raise ValueError("S3 credentials are not configured")
 
+    # Prefer explicit caller endpoint; otherwise fall back to env settings.
     resolved_endpoint = endpoint_url or settings.s3_endpoint_url
     prefix = (settings.s3_prefix or "reports").strip("/")
     object_key = f"{prefix}/{key.lstrip('/')}" if prefix else key.lstrip("/")
+
+    if resolved_endpoint:
+        if endpoint_from_user_config:
+            # Operator/schedule-supplied endpoint: strict public HTTPS.
+            resolved_endpoint = validate_public_https_url(resolved_endpoint)
+        else:
+            # Env-configured MinIO/S3 may be http on a private network.
+            resolved_endpoint = validate_egress_url(
+                resolved_endpoint,
+                allow_http=True,
+                allow_private=True,
+                resolve_dns=False,
+            )
 
     client_kwargs: dict = {
         "service_name": "s3",

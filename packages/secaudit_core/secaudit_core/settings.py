@@ -9,6 +9,10 @@ class SecAuditSettings(BaseSettings):
     app_env: str = "development"
     app_version: str = "1.0.0"
     secret_key: str = "dev-secret-key"
+    # Optional dedicated key for Fernet at-rest encryption. Falls back to secret_key.
+    secrets_fernet_key: str | None = None
+    # Optional dedicated key for local JWT HS256. Falls back to secret_key.
+    local_jwt_signing_key: str | None = None
 
     # Data-at-rest encryption backend: fernet (dev), vault (Transit), aws_kms (BYO-KMS).
     secrets_backend: str = "fernet"
@@ -131,6 +135,18 @@ class SecAuditSettings(BaseSettings):
     @property
     def secrets_backend_effective(self) -> str:
         return (self.secrets_backend or "fernet").strip().lower()
+
+    @property
+    def secrets_fernet_key_effective(self) -> str:
+        """Key material for Fernet at-rest encryption (isolated from JWT when set)."""
+        value = (self.secrets_fernet_key or "").strip()
+        return value or self.secret_key
+
+    @property
+    def local_jwt_signing_key_effective(self) -> str:
+        """HS256 key for local access/refresh tokens (isolated from Fernet when set)."""
+        value = (self.local_jwt_signing_key or "").strip()
+        return value or self.secret_key
 
     @property
     def database_url_sync(self) -> str:

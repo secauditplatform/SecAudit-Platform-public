@@ -53,6 +53,7 @@ from app.services.host_credentials import (
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
+    assert_can_mutate,
     assert_credential_attachable,
     assert_hosts_accessible,
     assign_owner,
@@ -124,7 +125,7 @@ async def _delete_host_if_allowed(host_id: int, db: AsyncSession, user: AuthUser
         return _HOST_NOT_FOUND
 
     try:
-        assert_can_access(user, host.owner_sub, detail=_HOST_NOT_FOUND)
+        assert_can_mutate(user, host.owner_sub, detail=_HOST_NOT_FOUND)
     except HTTPException:
         return _HOST_NOT_FOUND
 
@@ -339,7 +340,7 @@ async def update_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    assert_can_mutate(user, host.owner_sub, detail="Host not found")
 
     updates = data.model_dump(exclude_unset=True)
     clear_ssh = updates.pop("clear_ssh_host_key", False)
@@ -387,7 +388,7 @@ async def link_credential_to_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    assert_can_mutate(user, host.owner_sub, detail="Host not found")
     await link_host_credential(db, host, user, data.credential_id)
     await db.flush()
     host = await _load_host(db, host.id)
@@ -415,7 +416,7 @@ async def unlink_credential_from_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    assert_can_mutate(user, host.owner_sub, detail="Host not found")
     await unlink_host_credential(db, host, user, credential_id)
     await db.flush()
     host = await _load_host(db, host.id)
@@ -444,7 +445,7 @@ async def scan_host_ssh_fingerprint(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    assert_can_mutate(user, host.owner_sub, detail="Host not found")
 
     os_type = (host.os_type or "linux").strip().lower()
     if os_type != "linux":
@@ -492,7 +493,7 @@ async def delete_host(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail=_HOST_NOT_FOUND)
-    assert_can_access(user, host.owner_sub, detail=_HOST_NOT_FOUND)
+    assert_can_mutate(user, host.owner_sub, detail=_HOST_NOT_FOUND)
     try:
         error = await _delete_host_if_allowed(host_id, db, user)
     except IntegrityError as exc:
@@ -520,7 +521,7 @@ async def set_host_tags(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    assert_can_mutate(user, host.owner_sub, detail="Host not found")
 
     names = sorted(set(name.strip() for name in data.tag_names if name.strip()))
     await db.execute(delete(HostTagLink).where(HostTagLink.host_id == host_id))

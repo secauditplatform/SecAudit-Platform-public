@@ -67,10 +67,16 @@ def _safe_extract_tar(archive: tarfile.TarFile, dest: Path) -> None:
         raise ValueError("Archive contains too many files")
     dest_root = dest.resolve()
     for member in archive.getmembers():
+        if member.issym() or member.islnk() or member.isdev() or member.isfifo():
+            raise ValueError(f"Unsafe archive member type: {member.name}")
         target = (dest / member.name).resolve()
         if dest_root not in target.parents and target != dest_root:
             raise ValueError(f"Unsafe archive path: {member.name}")
-    archive.extractall(dest)
+    # Python 3.12+: data filter blocks symlink/absolute escape during extract.
+    if hasattr(tarfile, "data_filter"):
+        archive.extractall(dest, filter="data")
+    else:
+        archive.extractall(dest)
 
 
 def _resolve_package_root(extracted_dir: Path) -> Path:

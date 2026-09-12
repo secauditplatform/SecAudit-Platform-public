@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Literal
 
 import ansible_runner
+import yaml
 
+from secaudit_core.playbook_policy import validate_playbook_policy, validate_playbook_text
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.tracing import start_span
 
@@ -265,6 +267,15 @@ def _run_playbook(
 
     cancel_event = cancel_event if cancel_event is not None else get_cancel_event()
     raise_if_cancelled()
+
+    try:
+        validate_playbook_text(playbook_content)
+        loaded = yaml.safe_load(playbook_content)
+        validate_playbook_policy(loaded)
+    except ValueError as exc:
+        raise AnsiblePlaybookError(str(exc)) from exc
+    except yaml.YAMLError as exc:
+        raise AnsiblePlaybookError(f"Invalid playbook YAML: {exc}") from exc
 
     settings = SecAuditSettings()
     with tempfile.TemporaryDirectory(prefix="secaudit_ansible_") as tmp:

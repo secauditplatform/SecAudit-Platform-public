@@ -10,6 +10,7 @@ from pathlib import Path
 import yaml
 
 from app.schemas import PlaybookValidateResponse
+from secaudit_core.playbook_policy import validate_playbook_policy, validate_playbook_text
 
 
 def _ansible_env(work_dir: Path) -> dict[str, str]:
@@ -37,7 +38,7 @@ def _format_ansible_output(stdout: str, stderr: str) -> str:
 
 
 def validate_playbook_content(content: str) -> PlaybookValidateResponse:
-    """Validate playbook content: YAML parse + ansible-playbook --syntax-check."""
+    """Validate playbook content: YAML parse + policy + ansible-playbook --syntax-check."""
     stripped = (content or "").strip()
     if not stripped:
         return PlaybookValidateResponse(valid=False, message="Playbook content is empty")
@@ -54,6 +55,12 @@ def validate_playbook_content(content: str) -> PlaybookValidateResponse:
             valid=False,
             message="Playbook YAML must be a list of plays or a mapping",
         )
+
+    try:
+        validate_playbook_text(stripped)
+        validate_playbook_policy(loaded)
+    except ValueError as exc:
+        return PlaybookValidateResponse(valid=False, message=str(exc))
 
     with tempfile.TemporaryDirectory(prefix="secaudit-pb-validate-") as tmp:
         work_dir = Path(tmp)

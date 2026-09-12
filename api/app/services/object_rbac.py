@@ -11,6 +11,7 @@ from sqlalchemy.orm.attributes import InstrumentedAttribute
 
 from app.core.auth import AuthUser
 from app.core.config import settings
+from secaudit_core.enums import UserRole
 from secaudit_core.object_rbac import (
     applies_engineer_scope,
     can_access_owned_resource,
@@ -26,7 +27,8 @@ def rbac_enabled() -> bool:
 
 def apply_owner_scope(stmt: Select[tuple[T]], column: InstrumentedAttribute, user: AuthUser) -> Select[tuple[T]]:
     if applies_engineer_scope(user.roles, enabled=rbac_enabled()):
-        stmt = stmt.where(column == user.sub)
+        # Own rows + platform-shared (owner_sub IS NULL).
+        stmt = stmt.where(or_(column == user.sub, column.is_(None)))
     return stmt
 
 
@@ -45,9 +47,25 @@ def apply_credential_list_scope(stmt: Select[tuple[T]], user: AuthUser) -> Selec
     return stmt.where(or_(Credential.owner_sub == user.sub, Credential.id.in_(shared_ids)))
 
 
-def assert_can_access(user: AuthUser, owner_sub: str | None, *, detail: str = "Not found") -> None:
-    if not can_access_owned_resource(user.roles, user.sub, owner_sub, enabled=rbac_enabled()):
+def assert_can_access(
+    user: AuthUser,
+    owner_sub: str | None,
+    *,
+    detail: str = "Not found",
+    mutate: bool = False,
+) -> None:
+    if not can_access_owned_resource(
+        user.roles,
+        user.sub,
+        owner_sub,
+        enabled=rbac_enabled(),
+        mutate=mutate,
+    ):
         raise HTTPException(status_code=404, detail=detail)
+
+
+def assert_can_mutate(user: AuthUser, owner_sub: str | None, *, detail: str = "Not found") -> None:
+    assert_can_access(user, owner_sub, detail=detail, mutate=True)
 
 
 def assert_credential_attachable(user: AuthUser, owner_sub: str | None, *, detail: str = "Credential not found") -> None:
@@ -85,11 +103,15 @@ def assign_owner(obj: object, user: AuthUser) -> None:
 
 
 def assign_notification_channel_owner(channel: object, user: AuthUser) -> None:
-    """Engineers own personal channels; admin/operator channels are platform-wide (owner_sub NULL)."""
+    """Admins create platform-wide channels (owner_sub NULL); others own personal channels."""
     if not hasattr(channel, "owner_sub"):
+        return
+    if UserRole.ADMIN.value in set(user.roles):
+        channel.owner_sub = None  # type: ignore[attr-defined]
         return
     if applies_engineer_scope(user.roles, enabled=rbac_enabled()):
         channel.owner_sub = ownership_sub_for_create(user.sub)  # type: ignore[attr-defined]
+
 
 
 def assign_host_target_scope(obj: object, user: AuthUser) -> None:

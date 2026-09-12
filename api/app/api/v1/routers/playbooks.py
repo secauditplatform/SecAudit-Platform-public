@@ -25,6 +25,7 @@ from app.schemas import (
 )
 from app.services.object_rbac import (
     assert_can_access,
+    assert_can_mutate,
     assign_owner,
 )
 from app.services.playbook_templates import list_playbook_templates
@@ -39,10 +40,13 @@ router = APIRouter()
 playbook_service = PlaybookService()
 
 
-def _assert_playbook_access(user: AuthUser, playbook: Playbook) -> None:
+def _assert_playbook_access(user: AuthUser, playbook: Playbook, *, mutate: bool = False) -> None:
     if playbook.kind == PlaybookKind.COMPLIANCE_TEMPLATE:
         return
-    assert_can_access(user, playbook.owner_sub, detail="Playbook not found")
+    if mutate:
+        assert_can_mutate(user, playbook.owner_sub, detail="Playbook not found")
+    else:
+        assert_can_access(user, playbook.owner_sub, detail="Playbook not found")
 
 
 def _playbook_read(playbook: Playbook) -> PlaybookRead:
@@ -171,7 +175,7 @@ async def update_playbook_content(
     playbook = result.scalar_one_or_none()
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook)
+    _assert_playbook_access(user, playbook, mutate=True)
 
     try:
         validation = await run_blocking(
@@ -315,7 +319,7 @@ async def run_playbook(
     playbook = await db.get(Playbook, playbook_id)
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook)
+    _assert_playbook_access(user, playbook, mutate=True)
     if not playbook.is_active:
         raise HTTPException(status_code=409, detail="Playbook is inactive")
 
@@ -379,7 +383,7 @@ async def update_playbook(
     playbook = result.scalar_one_or_none()
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook)
+    _assert_playbook_access(user, playbook, mutate=True)
     updates = data.model_dump(exclude_unset=True)
     if playbook.kind == PlaybookKind.COMPLIANCE_TEMPLATE and "content" in updates:
         # Content edits for compliance templates must go through versioned endpoint.
@@ -410,7 +414,7 @@ async def delete_playbook(
     playbook = await db.get(Playbook, playbook_id)
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook)
+    _assert_playbook_access(user, playbook, mutate=True)
     try:
         await playbook_service.delete_playbook(db, playbook)
     except ValueError as exc:

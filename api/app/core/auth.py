@@ -61,7 +61,7 @@ def create_local_token(
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(seconds=ttl)).timestamp()),
         },
-        settings.secret_key,
+        settings.local_jwt_signing_key_effective,
         algorithm="HS256",
     )
 
@@ -84,7 +84,7 @@ def create_local_refresh_token(
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(seconds=ttl)).timestamp()),
         },
-        settings.secret_key,
+        settings.local_jwt_signing_key_effective,
         algorithm="HS256",
     )
 
@@ -105,7 +105,7 @@ def _decode_local_refresh_token(token: str) -> AuthUser | None:
     if not settings.local_auth_enabled:
         return None
     try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     except JWTError:
         return None
 
@@ -144,7 +144,7 @@ def _decode_local_token(token: str) -> AuthUser | None:
     if not settings.local_auth_enabled:
         return None
     try:
-        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     except JWTError:
         return None
 
@@ -161,6 +161,33 @@ def _decode_local_token(token: str) -> AuthUser | None:
         auth_mode="local",
         local_source=payload.get("local_source"),
     )
+
+
+async def _revalidate_local_user_from_db(user: AuthUser) -> AuthUser:
+    """Reject disabled users and refresh roles from the local users table."""
+    if user.auth_mode != "local" or not settings.local_auth_revalidate_from_db:
+        return user
+    if user.local_source not in (None, "database"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    from sqlalchemy import select
+
+    from app.core.database import async_session
+    from app.models import User
+
+    async with async_session() as db:
+        result = await db.execute(select(User).where(User.username == user.username))
+        db_user = result.scalar_one_or_none()
+        if not db_user or not db_user.is_active:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        role = db_user.role.value
+        return AuthUser(
+            sub=f"local:{db_user.username}",
+            username=db_user.username,
+            roles=[role],
+            auth_mode="local",
+            local_source="database",
+        )
 
 
 async def _fetch_jwks() -> dict:
@@ -235,7 +262,7 @@ async def _decode_keycloak_token(token: str) -> AuthUser:
 async def _decode_token(token: str) -> AuthUser:
     local_user = _decode_local_token(token)
     if local_user:
-        return local_user
+        return await _revalidate_local_user_from_db(local_user)
 
     try:
         return await _decode_keycloak_token(token)

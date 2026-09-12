@@ -104,6 +104,7 @@ class HealthResponse(BaseModel):
     status: str
     app_name: str
     version: str = "0.1.0"
+    demo_mode: bool = False
 
 
 class ComponentHealth(BaseModel):

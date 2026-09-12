@@ -30,6 +30,26 @@ def test_fernet_encrypt_decrypt_roundtrip():
     assert decrypt_secret(token, settings) == "ssh-password"
 
 
+def test_fernet_dedicated_key_roundtrip():
+    settings = _settings(
+        secret_key="jwt-or-other-secret-key-32chars!",
+        secrets_fernet_key="dedicated-fernet-key-material!!",
+    )
+    token = encrypt_secret("ssh-password", settings)
+    assert decrypt_secret(token, settings) == "ssh-password"
+
+
+def test_fernet_decrypt_falls_back_to_legacy_secret_key():
+    legacy_settings = _settings(secret_key="legacy-secret-key-32characters!")
+    legacy_token = encrypt_secret("old-secret", legacy_settings)
+    rotated = _settings(
+        secret_key="legacy-secret-key-32characters!",
+        secrets_fernet_key="new-dedicated-fernet-key-32ch!!",
+    )
+    # Blob was encrypted with secret_key before dedicated key existed.
+    assert decrypt_secret(legacy_token, rotated) == "old-secret"
+
+
 def test_fernet_legacy_blob_without_prefix_still_decrypts():
     settings = _settings(secret_key="unit-test-secret-key-32chars!!")
     legacy = FernetSecretsBackend("unit-test-secret-key-32chars!!")

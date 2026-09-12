@@ -30,6 +30,7 @@ from app.services.audit_log import log_audit_event
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
+    assert_can_mutate,
     assert_hosts_accessible,
     assign_host_target_scope,
     assign_owner,
@@ -163,7 +164,7 @@ async def update_job_template(
     template = await _get_template(db, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Job template not found")
-    assert_can_access(user, template.owner_sub, detail="Job template not found")
+    assert_can_mutate(user, template.owner_sub, detail="Job template not found")
 
     if data.name is not None and data.name != template.name:
         existing = await db.execute(select(JobTemplate).where(JobTemplate.name == data.name))
@@ -220,7 +221,7 @@ async def delete_job_template(
     template = await _get_template(db, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Job template not found")
-    assert_can_access(user, template.owner_sub, detail="Job template not found")
+    assert_can_mutate(user, template.owner_sub, detail="Job template not found")
 
     template_name = template.name
     await db.delete(template)
@@ -246,7 +247,7 @@ async def apply_job_template(
     template = await _get_template(db, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="Job template not found")
-    assert_can_access(user, template.owner_sub, detail="Job template not found")
+    assert_can_mutate(user, template.owner_sub, detail="Job template not found")
     if not template.is_active:
         raise HTTPException(status_code=409, detail="Job template is inactive")
 

@@ -14,7 +14,7 @@ services:
       POSTGRES_USER: secaudit
       POSTGRES_PASSWORD: secaudit_dev
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -27,7 +27,7 @@ services:
     profiles: ["standalone"]
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -92,8 +92,8 @@ services:
   mailpit:
     image: axllent/mailpit:v1.21
     ports:
-      - "8025:8025"
-      - "1025:1025"
+      - "127.0.0.1:8025:8025"
+      - "127.0.0.1:1025:1025"
     environment:
       MP_SMTP_AUTH_ACCEPT_ANY: 1
       MP_SMTP_AUTH_ALLOW_INSECURE: 1
@@ -113,7 +113,7 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./infra/keycloak:/opt/keycloak/data/import
 
@@ -145,7 +145,7 @@ services:
       context: .
       dockerfile: api/Dockerfile
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     cap_drop:
       - ALL
     cap_add:
@@ -213,7 +213,8 @@ services:
       context: .
       dockerfile: console/Dockerfile
     ports:
-      - "8001:8001"
+      # Bind to loopback only — console is reached via the API proxy, not the public host.
+      - "127.0.0.1:8001:8001"
     cap_drop:
       - ALL
     cap_add:
@@ -224,18 +225,22 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
       - /var/empty/secaudit-console:rw,noexec,nosuid,nodev,size=1m
-    env_file:
-      - .env
+    # Do not mount .env here — avoids leaking SECRET_KEY / DB / Redis into the sandbox.
     environment:
-      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      # JWT verification only (local HS256). Falls back to SECRET_KEY value at compose
+      # interpolation time without exporting SECRET_KEY into the container.
+      LOCAL_JWT_SIGNING_KEY: ${LOCAL_JWT_SIGNING_KEY:-${SECRET_KEY:-dev-secret-key}}
       APP_ENV: ${APP_ENV:-development}
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
       LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+      LOCAL_AUTH_REVALIDATE_FROM_DB: "false"
+      DEMO_MODE: ${DEMO_MODE:-false}
       CONSOLE_ENABLED: ${CONSOLE_ENABLED:-true}
       CONSOLE_ALLOW_IN_PRODUCTION: ${CONSOLE_ALLOW_IN_PRODUCTION:-false}
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8080/realms/secaudit}
       KEYCLOAK_REALM: secaudit
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-account}
     volumes:
       - ./api:/app
       - ./packages/secaudit_core:/packages/secaudit_core
@@ -249,9 +254,8 @@ services:
       retries: 10
       start_period: 5s
     command: uvicorn app.console_main:app --host 0.0.0.0 --port 8001 --reload --reload-dir /app
-    # Network tradeoff: shares the default Compose network so diagnostics can reach
-    # lab targets and Keycloak JWKS. It does not mount Postgres/Redis data volumes;
-    # prefer denying DB ports via external firewall/network policies in production.
+    # Console needs Keycloak JWKS on the Compose network; it does not receive
+    # SECRET_KEY, Postgres, or Redis credentials (no env_file).
 
   worker:
     build:
@@ -329,7 +333,7 @@ services:
       dockerfile: Dockerfile
       target: development
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
@@ -358,9 +362,9 @@ services:
       - ./infra/observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
       - tempo_data:/var/tempo
     ports:
-      - "3200:3200"   # Tempo HTTP API / query
-      - "4318:4318"   # OTLP HTTP receiver
-      - "4317:4317"   # OTLP gRPC receiver
+      - "127.0.0.1:3200:3200"   # Tempo HTTP API / query
+      - "127.0.0.1:4318:4318"   # OTLP HTTP receiver
+      - "127.0.0.1:4317:4317"   # OTLP gRPC receiver
     depends_on:
       - prometheus
 
@@ -378,7 +382,7 @@ services:
       - ./infra/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
 
   grafana:
     profiles: ["observability"]
@@ -387,9 +391,10 @@ services:
       - tempo
       - prometheus
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Lab default: require login (no anonymous Admin). Set credentials via
+      # GF_SECURITY_ADMIN_USER / GF_SECURITY_ADMIN_PASSWORD if needed.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
       GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor,traceqlMetrics"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/secaudit_overview.json
     volumes:
@@ -400,7 +405,7 @@ services:
     ports:
       # Host port kept outside the Windows/WinNAT reserved range 2940-3039
       # (3000/3001 fall inside it and fail to bind on Windows Docker Desktop).
-      - "3300:3000"
+      - "127.0.0.1:3300:3000"
 
 volumes:
   postgres_data:

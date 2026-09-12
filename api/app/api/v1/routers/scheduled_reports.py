@@ -17,12 +17,26 @@ from app.schemas import (
 )
 from app.services.audit_log import log_audit_event
 from app.services.object_rbac import apply_owner_scope, assert_job_access
+from secaudit_core.egress import validate_public_https_url
 from secaudit_core.scheduled_reports import deliver_scheduled_report
 from secaudit_core.sensitive_data import redact_sensitive
 
 router = APIRouter()
 _delivery_engine = create_engine(settings.database_url_sync, pool_pre_ping=True)
 _DeliverySession = sessionmaker(_delivery_engine, expire_on_commit=False)
+
+
+def _validated_schedule_config(config_json: dict | None) -> dict | None:
+    if not config_json:
+        return config_json
+    config = dict(config_json)
+    endpoint = config.get("endpoint_url")
+    if endpoint:
+        try:
+            config["endpoint_url"] = validate_public_https_url(str(endpoint).strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return config
 
 
 def _schedule_to_read(schedule: ScheduledReport) -> ScheduledReportRead:
@@ -92,7 +106,7 @@ async def create_scheduled_report(
         is_active=data.is_active,
         report_format=data.report_format,
         delivery_type=data.delivery_type,
-        config_json=data.config_json,
+        config_json=_validated_schedule_config(data.config_json),
         encrypted_secret=_encrypt_secret(data.secret),
     )
     db.add(schedule)
@@ -154,7 +168,7 @@ async def update_scheduled_report(
     if data.delivery_type is not None:
         schedule.delivery_type = data.delivery_type
     if data.config_json is not None:
-        schedule.config_json = data.config_json
+        schedule.config_json = _validated_schedule_config(data.config_json)
     if data.secret:
         schedule.encrypted_secret = _encrypt_secret(data.secret)
 

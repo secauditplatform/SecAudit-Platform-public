@@ -12,7 +12,7 @@ from app.core.roles import require_operate, require_remediation
 from app.core.database import get_db
 from app.models import Job, JobScope, NetworkDeviceConfig, NetworkRemediationConfig, RemediationJob, RemediationRun, UserRole
 from app.schemas import NetworkDeviceConfigRead, NetworkRemediationConfigGenerate, NetworkRemediationConfigRead
-from app.services.object_rbac import assert_can_access
+from app.services.object_rbac import assert_can_access, assert_can_mutate
 from secaudit_core.enums import NetworkVendor
 from secaudit_core.network_config import generate_remediation_config
 from secaudit_core.network_scope import infer_vendor_from_filename
@@ -50,7 +50,7 @@ async def upload_network_config(
     job = await db.get(Job, job_id)
     if not job or job.scope != JobScope.NETWORK:
         raise HTTPException(status_code=404, detail="Network job not found")
-    assert_can_access(user, job.owner_sub)
+    assert_can_mutate(user, job.owner_sub)
 
     raw = await file.read()
     if len(raw) > 5 * 1024 * 1024:
@@ -123,7 +123,7 @@ async def generate_network_remediation_config(
     job = await db.get(RemediationJob, run.remediation_job_id)
     if not job or job.scope != JobScope.NETWORK:
         raise HTTPException(status_code=400, detail="Not a network remediation run")
-    assert_can_access(user, job.owner_sub)
+    assert_can_mutate(user, job.owner_sub)
 
     content = data.content.strip()
     if not content:

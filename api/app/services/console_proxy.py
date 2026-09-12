@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-
-from urllib.parse import urlencode
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
@@ -15,7 +14,8 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger(__name__)
 
 
-def sandbox_console_ws_url(base_url: str, *, token: str | None = None) -> str:
+def sandbox_console_ws_url(base_url: str) -> str:
+    """Build sandbox WS URL without putting tokens in the query string."""
     base = base_url.rstrip("/")
     if base.startswith("http://"):
         base = "ws://" + base[len("http://") :]
@@ -23,10 +23,7 @@ def sandbox_console_ws_url(base_url: str, *, token: str | None = None) -> str:
         base = "wss://" + base[len("https://") :]
     elif not base.startswith(("ws://", "wss://")):
         base = "ws://" + base
-    url = f"{base}/api/v1/ws/console"
-    if token:
-        url = f"{url}?{urlencode({'token': token})}"
-    return url
+    return f"{base}/api/v1/ws/console"
 
 
 async def proxy_console_websocket(
@@ -35,11 +32,18 @@ async def proxy_console_websocket(
     sandbox_url: str,
     token: str | None = None,
 ) -> None:
-    """Bridge bytes/text to the sandbox service (client already authenticated)."""
-    upstream_url = sandbox_console_ws_url(sandbox_url, token=token)
+    """Bridge bytes/text to the sandbox service (client already authenticated).
+
+    Auth to the sandbox is sent as the first JSON frame ``{"type":"auth","token":...}``
+    — never as a query parameter (avoids proxy/access-log leakage).
+    """
+    upstream_url = sandbox_console_ws_url(sandbox_url)
 
     try:
         async with ws_connect(upstream_url, open_timeout=10) as upstream:
+            if token:
+                await upstream.send(json.dumps({"type": "auth", "token": token}))
+
             async def client_to_upstream() -> None:
                 try:
                     while True:

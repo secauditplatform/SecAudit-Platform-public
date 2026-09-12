@@ -46,6 +46,7 @@ from app.services.job_webhooks import apply_webhook_fields, webhook_read_fields
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
+    assert_can_mutate,
     assert_hosts_accessible,
     assign_host_target_scope,
     assign_owner,
@@ -128,13 +129,16 @@ async def create_remediation_job(
         host_ids=data.host_ids,
     )
     job = RemediationJob(**data.model_dump(exclude={"host_ids", "webhook_url", "webhook_enabled", "webhook_events"}))
-    apply_webhook_fields(
-        job,
-        settings=settings,
-        webhook_enabled=data.webhook_enabled,
-        webhook_events=data.webhook_events,
-        webhook_url=data.webhook_url,
-    )
+    try:
+        apply_webhook_fields(
+            job,
+            settings=settings,
+            webhook_enabled=data.webhook_enabled,
+            webhook_events=data.webhook_events,
+            webhook_url=data.webhook_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     assign_owner(job, user)
     assign_host_target_scope(job, user)
     db.add(job)
@@ -285,7 +289,7 @@ async def update_remediation_job(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Remediation job not found")
-    assert_can_access(user, job.owner_sub, detail="Remediation job not found")
+    assert_can_mutate(user, job.owner_sub, detail="Remediation job not found")
 
     updates = data.model_dump(exclude_unset=True)
     host_ids = updates.pop("host_ids", None)
@@ -311,14 +315,17 @@ async def update_remediation_job(
     for field, value in updates.items():
         setattr(job, field, value)
 
-    apply_webhook_fields(
-        job,
-        settings=settings,
-        webhook_enabled=webhook_enabled,
-        webhook_events=webhook_events,
-        webhook_url=webhook_url,
-        clear_webhook_url=clear_webhook_url,
-    )
+    try:
+        apply_webhook_fields(
+            job,
+            settings=settings,
+            webhook_enabled=webhook_enabled,
+            webhook_events=webhook_events,
+            webhook_url=webhook_url,
+            clear_webhook_url=clear_webhook_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if host_ids is not None:
         await assert_hosts_accessible(db, user, host_ids)
@@ -377,7 +384,7 @@ async def run_remediation_job(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Remediation job not found")
-    assert_can_access(user, job.owner_sub, detail="Remediation job not found")
+    assert_can_mutate(user, job.owner_sub, detail="Remediation job not found")
 
     remediation_run = RemediationRun(
         remediation_job_id=job.id,
@@ -475,7 +482,7 @@ async def stop_remediation_run(
         raise HTTPException(status_code=404, detail="Remediation run not found")
 
     job = await db.get(RemediationJob, remediation_run.remediation_job_id)
-    assert_can_access(user, job.owner_sub if job else None, detail="Remediation run not found")
+    assert_can_mutate(user, job.owner_sub if job else None, detail="Remediation run not found")
 
     if remediation_run.status not in (JobStatus.PENDING, JobStatus.RUNNING):
         raise HTTPException(
@@ -520,7 +527,7 @@ async def delete_remediation_run(
         raise HTTPException(status_code=404, detail="Remediation run not found")
 
     job = await db.get(RemediationJob, remediation_run.remediation_job_id)
-    assert_can_access(user, job.owner_sub if job else None, detail="Remediation run not found")
+    assert_can_mutate(user, job.owner_sub if job else None, detail="Remediation run not found")
 
     if remediation_run.status in (JobStatus.PENDING, JobStatus.RUNNING):
         if remediation_run.celery_task_id:
@@ -550,7 +557,7 @@ async def delete_remediation_job(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Remediation job not found")
-    assert_can_access(user, job.owner_sub, detail="Remediation job not found")
+    assert_can_mutate(user, job.owner_sub, detail="Remediation job not found")
 
     for remediation_run in list(job.runs):
         if remediation_run.status in (JobStatus.PENDING, JobStatus.RUNNING):

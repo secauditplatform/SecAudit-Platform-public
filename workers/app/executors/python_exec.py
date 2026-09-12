@@ -55,6 +55,7 @@ def run_script_locally_with_resource_env(
     cancel_event: threading.Event | None = None,
     extra_env: dict[str, str] | None = None,
     key_passphrase: str | None = None,
+    package_root: Path | None = None,
 ) -> str:
     """Run a package Python check on the worker (Netmiko/Paramiko reach the device).
 
@@ -69,7 +70,11 @@ def run_script_locally_with_resource_env(
     cancel_event = cancel_event if cancel_event is not None else get_cancel_event()
     raise_if_cancelled()
 
-    package_dir = script_path.resolve().parent
+    resolved_script = script_path.resolve()
+    package_dir = (package_root or resolved_script.parent).resolve()
+    if package_dir not in resolved_script.parents and resolved_script != package_dir:
+        raise ValueError(f"Python script escapes package directory: {script_path}")
+
     env = os.environ.copy()
     env["resource_ip"] = hostname.strip()
     env["resource_user"] = username

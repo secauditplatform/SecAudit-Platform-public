@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 
 from secaudit_core.enums import CategoryType
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.settings import SecAuditSettings
+
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def decrypt_credential_service_secret(cred, settings: SecAuditSettings | None = None) -> str | None:
@@ -83,7 +86,11 @@ def service_script_cli_suffix(env: dict[str, str] | None) -> str:
 def shell_export_prefix(env: dict[str, str] | None) -> str:
     if not env:
         return ""
-    exports = [f"export {key}={shlex.quote(value)}" for key, value in env.items()]
+    exports: list[str] = []
+    for key, value in env.items():
+        if not _ENV_KEY_RE.fullmatch(key):
+            raise ValueError(f"Invalid environment variable name: {key!r}")
+        exports.append(f"export {key}={shlex.quote(value)}")
     return "; ".join(exports) + "; "
 
 
@@ -92,6 +99,8 @@ def powershell_env_prefix(env: dict[str, str] | None) -> str:
         return ""
     lines: list[str] = []
     for key, value in env.items():
+        if not _ENV_KEY_RE.fullmatch(key):
+            raise ValueError(f"Invalid environment variable name: {key!r}")
         safe = value.replace("'", "''")
         lines.append(f"$env:{key} = '{safe}'")
     return "\n".join(lines) + "\n"

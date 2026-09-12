@@ -133,7 +133,7 @@ def test_local_login_uses_database_user_role(
     token = body["access_token"]
     assert body["refresh_token"]
     assert body["expires_in"] == settings.local_auth_token_ttl_seconds
-    payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+    payload = jwt.decode(token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     assert payload["typ"] == LOCAL_TOKEN_TYPE
     assert payload["realm_access"]["roles"] == [UserRole.OPERATOR.value]
     assert payload["local_source"] == "database"
@@ -157,7 +157,7 @@ def test_local_token_rejects_expired_token(client: TestClient):
             "iat": int((now - timedelta(hours=2)).timestamp()),
             "exp": int((now - timedelta(hours=1)).timestamp()),
         },
-        settings.secret_key,
+        settings.local_jwt_signing_key_effective,
         algorithm="HS256",
     )
 
@@ -242,11 +242,11 @@ def test_local_refresh_token_issues_new_access_token(
     body = refreshed.json()
     assert body["access_token"]
     assert body["refresh_token"]
-    payload = jwt.decode(body["access_token"], settings.secret_key, algorithms=["HS256"])
+    payload = jwt.decode(body["access_token"], settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     assert payload["typ"] == LOCAL_TOKEN_TYPE
     assert UserRole.OPERATOR.value in payload["realm_access"]["roles"]
 
-    refresh_payload = jwt.decode(body["refresh_token"], settings.secret_key, algorithms=["HS256"])
+    refresh_payload = jwt.decode(body["refresh_token"], settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     assert refresh_payload["typ"] == LOCAL_REFRESH_TOKEN_TYPE
 
 
@@ -293,7 +293,7 @@ def test_local_login_rate_limited(client: TestClient, monkeypatch: pytest.Monkey
 def test_create_local_token_pair_roundtrip():
     pair = create_local_token_pair("alice", [UserRole.OPERATOR.value], local_source="database")
     refreshed = refresh_local_tokens(pair.refresh_token, [UserRole.OPERATOR.value])
-    access = jwt.decode(refreshed.access_token, settings.secret_key, algorithms=["HS256"])
+    access = jwt.decode(refreshed.access_token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     assert access["preferred_username"] == "alice"
 
 
@@ -362,13 +362,13 @@ async def test_database_refresh_uses_current_downgraded_role():
     assert token_user is not None
     current_user, source = await auth_router._resolve_refresh_user(_refresh_db(db_user), token_user)
     refreshed = refresh_local_tokens(pair.refresh_token, current_user.roles, local_source=source)
-    access = jwt.decode(refreshed.access_token, settings.secret_key, algorithms=["HS256"])
+    access = jwt.decode(refreshed.access_token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     assert access["realm_access"]["roles"] == [UserRole.OPERATOR.value]
 
 
 def test_local_token_decodes_without_keycloak_aud_iss_checks():
     token = create_local_token("alice", [UserRole.OPERATOR.value], local_source="database")
-    payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+    payload = jwt.decode(token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
     assert payload["typ"] == LOCAL_TOKEN_TYPE
     assert UserRole.OPERATOR.value in payload["realm_access"]["roles"]
 

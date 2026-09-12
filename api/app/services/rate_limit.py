@@ -13,11 +13,21 @@ logger = logging.getLogger(__name__)
 
 
 def _client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
+    """Return client IP; honor X-Forwarded-For only behind a configured trusted proxy."""
+    peer = request.client.host if request.client else None
+    trusted = {
+        item.strip()
+        for item in (settings.trusted_proxy_ips or "").split(",")
+        if item.strip()
+    }
+    if peer and peer in trusted:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            candidate = forwarded.split(",")[0].strip()
+            if candidate:
+                return candidate
+    if peer:
+        return peer
     return "unknown"
 
 
@@ -50,4 +60,12 @@ async def enforce_rate_limit(
     except HTTPException:
         raise
     except Exception:
-        logger.warning("Rate limit check failed for scope %s; allowing request", scope, exc_info=True)
+        logger.warning(
+            "Rate limit check failed for scope %s; rejecting request (fail-closed)",
+            scope,
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiter unavailable. Try again later.",
+        ) from None

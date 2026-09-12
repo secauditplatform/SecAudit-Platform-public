@@ -113,6 +113,7 @@ def _execute_remediation(
                 private_key=private_key,
                 script_path=script_path,
                 key_passphrase=key_passphrase,
+                package_root=package_dir,
             )
         return run_python_over_ssh(
             hostname=host.hostname,

@@ -16,14 +16,31 @@ PACKAGE_COPY_IGNORE = shutil.ignore_patterns(
 )
 
 
-def resolve_script_under_package(package_dir: Path, script_file: str) -> Path:
-    """Resolve script_file to an absolute path confined to package_dir."""
-    if not script_file or not str(script_file).strip():
-        raise ValueError("script_file is empty")
+def resolve_under_package(
+    package_dir: Path,
+    relative: str,
+    *,
+    must_exist: bool = True,
+    must_be_file: bool = True,
+) -> Path:
+    """Resolve a relative package path confined to ``package_dir``.
 
-    normalized = script_file.replace("\\", "/").lstrip("/")
+    Rejects empty refs, ``..`` segments, and absolute paths (including the
+    POSIX quirk where ``Path('/pkg') / '/etc/passwd'`` becomes ``/etc/passwd``).
+    """
+    if not relative or not str(relative).strip():
+        raise ValueError("package path reference is empty")
+
+    raw = str(relative).strip().replace("\\", "/")
+    # Absolute refs must never be joined — on POSIX they replace the package root.
+    if raw.startswith("/") or raw.startswith("~") or Path(raw).is_absolute():
+        raise ValueError(f"package path must be relative: {relative!r}")
+
+    normalized = raw.lstrip("/")
+    if not normalized or normalized in {".", ".."}:
+        raise ValueError(f"package path is invalid: {relative!r}")
     if ".." in Path(normalized).parts:
-        raise ValueError(f"script_file must stay inside package: {script_file!r}")
+        raise ValueError(f"package path must stay inside package: {relative!r}")
 
     package_root = package_dir.resolve()
     if not package_root.is_dir():
@@ -31,12 +48,32 @@ def resolve_script_under_package(package_dir: Path, script_file: str) -> Path:
 
     resolved = (package_root / normalized).resolve()
     if package_root not in resolved.parents and resolved != package_root:
-        raise ValueError(f"script_file escapes package directory: {script_file!r}")
+        raise ValueError(f"package path escapes package directory: {relative!r}")
 
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Script not found in package: {script_file!r}")
+    if must_exist:
+        if must_be_file:
+            if not resolved.is_file():
+                raise FileNotFoundError(f"File not found in package: {relative!r}")
+        elif not resolved.exists():
+            raise FileNotFoundError(f"Path not found in package: {relative!r}")
 
     return resolved
+
+
+def resolve_script_under_package(package_dir: Path, script_file: str) -> Path:
+    """Resolve script_file to an absolute path confined to package_dir."""
+    try:
+        return resolve_under_package(
+            package_dir,
+            script_file,
+            must_exist=True,
+            must_be_file=True,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        if "package path" in message:
+            message = message.replace("package path", "script_file", 1)
+        raise ValueError(message) from exc
 
 
 def normalize_text_newlines(text: str) -> str:

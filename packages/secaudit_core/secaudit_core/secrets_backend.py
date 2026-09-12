@@ -136,7 +136,7 @@ def resolve_vault_token(settings: SecAuditSettings) -> str | None:
 def create_secrets_backend(settings: SecAuditSettings) -> SecretsBackend:
     kind = settings.secrets_backend_effective
     if kind == SecretsBackendKind.FERNET:
-        return FernetSecretsBackend(settings.secret_key)
+        return FernetSecretsBackend(settings.secrets_fernet_key_effective)
     if kind == SecretsBackendKind.VAULT:
         token = resolve_vault_token(settings)
         if not settings.vault_addr or not token:
@@ -157,7 +157,11 @@ def create_secrets_backend(settings: SecAuditSettings) -> SecretsBackend:
 
 
 def decrypt_with_fallback(token: str, settings: SecAuditSettings) -> str:
-    """Decrypt using envelope prefix; legacy Fernet blobs without prefix stay supported."""
+    """Decrypt using envelope prefix; legacy Fernet blobs without prefix stay supported.
+
+    Tries ``secrets_fernet_key_effective`` first, then ``secret_key`` when they differ
+    so rotating to a dedicated Fernet key still unlocks older ciphertext.
+    """
     if token.startswith(VAULT_PREFIX):
         backend = VaultTransitSecretsBackend(
             addr=settings.vault_addr or "",
@@ -172,4 +176,12 @@ def decrypt_with_fallback(token: str, settings: SecAuditSettings) -> str:
             region=settings.aws_kms_region_effective,
         )
         return backend.decrypt(token)
-    return FernetSecretsBackend(settings.secret_key).decrypt(token)
+
+    primary = settings.secrets_fernet_key_effective
+    try:
+        return FernetSecretsBackend(primary).decrypt(token)
+    except ValueError:
+        legacy = settings.secret_key
+        if legacy and legacy != primary:
+            return FernetSecretsBackend(legacy).decrypt(token)
+        raise

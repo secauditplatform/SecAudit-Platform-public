@@ -20,7 +20,6 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "ping",
         "route",
         "ss",
-        "tcpdump",
         "traceroute",
         "tracert",
         "whois",
@@ -40,7 +39,6 @@ _BLOCKED_OPTIONS = {
     "ping": {"-f", "-l"},
     "route": {"add", "del", "delete", "flush"},
     "ss": {"-K", "--kill", "-F", "--filter"},
-    "tcpdump": {"-w", "-W", "-C", "-G", "-z", "--print-sampling"},
     "traceroute": {"--sport"},
     "whois": {"--config"},
 }

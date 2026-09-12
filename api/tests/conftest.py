@@ -50,9 +50,12 @@ def _enable_local_auth_for_api_tokens():
     original = {
         "auth_enabled": settings.auth_enabled,
         "local_auth_enabled": settings.local_auth_enabled,
+        "local_auth_revalidate_from_db": settings.local_auth_revalidate_from_db,
     }
     settings.auth_enabled = True
     settings.local_auth_enabled = True
+    # Unit tests mint JWTs without a User row; skip DB revalidation here.
+    settings.local_auth_revalidate_from_db = False
     yield
     for key, value in original.items():
         setattr(settings, key, value)

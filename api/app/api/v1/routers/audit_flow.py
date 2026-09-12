@@ -33,7 +33,7 @@ from app.services.audit_flow import (
 from app.services.audit_log import log_audit_event
 from app.services.dispatch import commit_and_try_dispatch, enqueue_run_dispatch
 from app.services.task_outbox import try_dispatch_outbox_immediate
-from app.services.object_rbac import apply_owner_scope, assert_can_access, assign_owner
+from app.services.object_rbac import apply_owner_scope, assert_can_access, assert_can_mutate, assign_owner
 from secaudit_core.audit_flow_state import (
     append_audit_flow_log,
     get_audit_flow_progress,
@@ -182,7 +182,7 @@ async def cancel_audit_flow_run(
     run = await load_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="AuditFlow run not found")
-    assert_can_access(user, run.owner_sub)
+    assert_can_mutate(user, run.owner_sub)
     if run.status in {AuditFlowStatus.PENDING, AuditFlowStatus.SCANNING, AuditFlowStatus.RUNNING}:
         run.status = AuditFlowStatus.CANCELLED
         run.finished_at = datetime.now(UTC)
@@ -203,7 +203,7 @@ async def patch_audit_flow_hosts(
     run = await load_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="AuditFlow run not found")
-    assert_can_access(user, run.owner_sub)
+    assert_can_mutate(user, run.owner_sub)
     if run.status not in EDITABLE_STATUSES:
         raise HTTPException(status_code=409, detail="Hosts can only be edited after the scan finishes")
     by_id = {h.id: h for h in run.hosts}
@@ -270,7 +270,7 @@ async def add_audit_flow_credential(
     run = await load_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="AuditFlow run not found")
-    assert_can_access(user, run.owner_sub)
+    assert_can_mutate(user, run.owner_sub)
     if run.status not in EDITABLE_STATUSES:
         raise HTTPException(status_code=409, detail="Credentials can only be added after the scan finishes")
     if len(run.credentials) >= 20:
@@ -322,7 +322,7 @@ async def execute_audit_flow(
     run = await load_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="AuditFlow run not found")
-    assert_can_access(user, run.owner_sub)
+    assert_can_mutate(user, run.owner_sub)
     try:
         run, outbox_ids = await execute_run(db, user, run)
     except ValueError as exc:
@@ -361,7 +361,7 @@ async def delete_audit_flow_run(
     run = await load_run(db, run_id)
     if not run:
         raise HTTPException(status_code=404, detail="AuditFlow run not found")
-    assert_can_access(user, run.owner_sub)
+    assert_can_mutate(user, run.owner_sub)
     await delete_run_artifacts(db, run)
     await db.delete(run)
     await db.commit()

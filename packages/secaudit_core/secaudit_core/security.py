@@ -136,6 +136,7 @@ def validate_production_runtime_config(
     app_env: str,
     auth_enabled: bool,
     api_debug: bool,
+    object_rbac_enabled: bool = True,
 ) -> None:
     """Refuse unsafe auth/debug settings in production."""
     if app_env.strip().lower() != "production":
@@ -149,6 +150,12 @@ def validate_production_runtime_config(
     if api_debug:
         raise RuntimeError(
             "API_DEBUG=true is forbidden in production. Set API_DEBUG=false."
+        )
+
+    if not object_rbac_enabled:
+        raise RuntimeError(
+            "OBJECT_RBAC_ENABLED=false is forbidden in production "
+            "(disables object ownership scoping)."
         )
 
 

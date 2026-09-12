@@ -76,7 +76,7 @@ def test_deliver_siem_json_posts_structured_body(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def _fake_post(url, json=None, content=None, headers=None, timeout=30.0):
+    def _fake_post(url, json=None, content=None, headers=None, timeout=30.0, follow_redirects=False):
         captured["url"] = url
         captured["json"] = json
         captured["content"] = content
@@ -87,6 +87,10 @@ def test_deliver_siem_json_posts_structured_body(monkeypatch):
     monkeypatch.setattr(
         "secaudit_core.siem_export.decrypt_secret",
         lambda _token, _key: "https://siem.example.com/ingest",
+    )
+    monkeypatch.setattr(
+        "secaudit_core.egress._resolve_host_ips",
+        lambda _host: [__import__("ipaddress").ip_address("1.2.3.4")],
     )
 
     channel = NotificationChannel(
@@ -114,7 +118,7 @@ def test_deliver_siem_cef_posts_plaintext(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def _fake_post(url, json=None, content=None, headers=None, timeout=30.0):
+    def _fake_post(url, json=None, content=None, headers=None, timeout=30.0, follow_redirects=False):
         captured["url"] = url
         captured["json"] = json
         captured["content"] = content
@@ -125,6 +129,10 @@ def test_deliver_siem_cef_posts_plaintext(monkeypatch):
     monkeypatch.setattr(
         "secaudit_core.siem_export.decrypt_secret",
         lambda _token, _key: "https://siem.example.com/cef",
+    )
+    monkeypatch.setattr(
+        "secaudit_core.egress._resolve_host_ips",
+        lambda _host: [__import__("ipaddress").ip_address("1.2.3.4")],
     )
 
     channel = NotificationChannel(

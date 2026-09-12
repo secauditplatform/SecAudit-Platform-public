@@ -1030,7 +1030,7 @@ export interface SearchResponse {
 }
 
 export const api = {
-  health: () => request<{ status: string; app_name: string }>("/health"),
+  health: () => request<{ status: string; app_name: string; demo_mode?: boolean }>("/health"),
   categories: () => request<Category[]>("/categories"),
   search: (params: { q: string; limit?: number; per_type?: number }) =>
     request<SearchResponse>(`/search${buildQuery(params)}`),

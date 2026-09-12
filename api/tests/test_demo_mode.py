@@ -1,5 +1,6 @@
 """Tests for demo-mode API guard."""
 
+import pytest
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -36,3 +37,13 @@ def test_demo_mode_allows_auth_login() -> None:
 def test_demo_mode_off_allows_writes() -> None:
     client = TestClient(_app(False))
     assert client.post("/api/v1/jobs").status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_health_exposes_demo_mode(monkeypatch) -> None:
+    from app.api.v1.routers import health as health_router
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "demo_mode", True)
+    response = await health_router.health_check()
+    assert response.demo_mode is True

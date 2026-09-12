@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -127,8 +128,8 @@ def _run_alembic_upgrade() -> None:
             command.upgrade(cfg, "head")
 
 
-# Survives uvicorn --reload within one container (/tmp is tmpfs in Compose).
-_STARTUP_MARKER = Path("/tmp/.secaudit_api_startup_done")
+# Survives uvicorn --reload within one container (Compose mounts /tmp as tmpfs).
+_STARTUP_MARKER = Path(tempfile.gettempdir()) / ".secaudit_api_startup_done"
 
 
 async def _run_startup_bootstrap() -> None:
@@ -150,6 +151,7 @@ async def lifespan(app: FastAPI):
         app_env=settings.app_env,
         auth_enabled=settings.auth_enabled,
         api_debug=settings.api_debug,
+        object_rbac_enabled=settings.object_rbac_enabled,
     )
     validate_production_secrets_backend(
         app_env=settings.app_env,

@@ -13,7 +13,7 @@ from app.schemas import (
     ComplianceWaiverUpdate,
 )
 from app.services.audit_log import log_audit_event
-from app.services.object_rbac import assert_can_access
+from app.services.object_rbac import assert_can_access, assert_can_mutate
 from app.services.waivers import (
     actor_name,
     assert_job_scope,
@@ -30,7 +30,7 @@ router = APIRouter()
 
 _READ_ROLES = (UserRole.ADMIN, UserRole.OPERATOR)
 _WRITE_ROLES = (UserRole.ADMIN, UserRole.OPERATOR)
-_APPROVE_ROLES = (UserRole.ADMIN, UserRole.OPERATOR)
+_APPROVE_ROLES = (UserRole.ADMIN,)
 
 
 def _to_read(waiver: ComplianceWaiver) -> ComplianceWaiverRead:
@@ -136,7 +136,7 @@ async def update_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_WRITE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
+    assert_can_mutate(user, waiver.owner_sub, detail="Waiver not found")
     if waiver.status not in (WaiverStatus.PENDING, WaiverStatus.APPROVED) or not waiver.is_active:
         raise HTTPException(status_code=400, detail="Only pending or approved waivers can be updated")
 
@@ -168,6 +168,7 @@ async def approve_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
+    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
     transition_approve(waiver, user)
     await db.flush()
     await db.refresh(waiver)
@@ -193,6 +194,7 @@ async def reject_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
+    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
     transition_reject(waiver, user, data.reason)
     await db.flush()
     await db.refresh(waiver)
@@ -215,9 +217,10 @@ async def revoke_compliance_waiver(
     waiver_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
+    user: AuthUser = Depends(require_roles(*_WRITE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
+    assert_can_mutate(user, waiver.owner_sub, detail="Waiver not found")
     transition_revoke(waiver, user)
     await db.flush()
     await db.refresh(waiver)
@@ -242,7 +245,7 @@ async def delete_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_WRITE_ROLES)),
 ) -> None:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
+    assert_can_mutate(user, waiver.owner_sub, detail="Waiver not found")
     rule_name = waiver.rule_tech_name
     await log_audit_event(
         db,

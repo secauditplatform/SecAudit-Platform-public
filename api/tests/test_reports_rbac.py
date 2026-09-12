@@ -20,7 +20,8 @@ class _FakeRedis:
 
 
 @pytest.mark.asyncio
-async def test_assert_job_run_access_allows_cross_owner_for_operator():
+async def test_assert_job_run_access_denies_cross_owner_for_operator(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     run = JobRun(id=5, job_id=10, status=JobStatus.COMPLETED)
     job = Job(id=10, name="j1", owner_sub="local:bob")
     fake_db = AsyncMock()
@@ -33,16 +34,18 @@ async def test_assert_job_run_access_allows_cross_owner_for_operator():
         return None
 
     fake_db.get = _get
-    result = await object_rbac_service.assert_job_run_access(
-        fake_db,
-        AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
-        5,
-    )
-    assert result.id == 5
+    with pytest.raises(HTTPException) as exc:
+        await object_rbac_service.assert_job_run_access(
+            fake_db,
+            AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
+            5,
+        )
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_assert_remediation_run_access_allows_cross_owner_for_operator():
+async def test_assert_remediation_run_access_denies_cross_owner_for_operator(monkeypatch):
+    monkeypatch.setattr(object_rbac_service.settings, "object_rbac_enabled", True)
     run = RemediationRun(id=5, remediation_job_id=10, status=JobStatus.COMPLETED)
     job = RemediationJob(id=10, name="rj1", owner_sub="local:bob")
     fake_db = AsyncMock()
@@ -55,12 +58,13 @@ async def test_assert_remediation_run_access_allows_cross_owner_for_operator():
         return None
 
     fake_db.get = _get
-    result = await object_rbac_service.assert_remediation_run_access(
-        fake_db,
-        AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
-        5,
-    )
-    assert result.id == 5
+    with pytest.raises(HTTPException) as exc:
+        await object_rbac_service.assert_remediation_run_access(
+            fake_db,
+            AuthUser(sub="local:alice", username="alice", roles=[UserRole.OPERATOR.value]),
+            5,
+        )
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio

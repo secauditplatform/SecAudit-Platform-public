@@ -6,7 +6,7 @@ import { LoginLoading, LoginPage } from "./LoginPage";
 
 const authEnabled = import.meta.env.VITE_AUTH_ENABLED === "true";
 const localAuthEnabled = import.meta.env.VITE_LOCAL_AUTH_ENABLED === "true";
-const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
+const viteDemoMode = import.meta.env.VITE_DEMO_MODE === "true";
 const ssoEnabled = import.meta.env.VITE_SSO_ENABLED !== "false";
 const showSsoButton = import.meta.env.VITE_SHOW_SSO_BUTTON !== "false";
 const LOCAL_TOKEN_KEY = "secaudit_local_token";
@@ -125,6 +125,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [roles, setRoles] = useState<string[]>(authEnabled ? [] : [ADMIN_ROLE]);
   const [authMode, setAuthMode] = useState<AuthMode>(authEnabled ? "none" : "none");
+  // Prefer API DEMO_MODE over VITE_DEMO_MODE so UI cannot enable execute while API is locked.
+  const [demoMode, setDemoMode] = useState(viteDemoMode);
 
   const keycloak = useMemo(() => {
     if (!authEnabled || !ssoEnabled) return null;
@@ -207,6 +209,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [keycloak, syncKeycloakAuth, clearKeycloakAuth]);
 
   const initStartedRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .health()
+      .then((health) => {
+        if (!cancelled && typeof health.demo_mode === "boolean") {
+          setDemoMode(health.demo_mode);
+        }
+      })
+      .catch(() => {
+        /* keep VITE_DEMO_MODE until API is reachable */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!authEnabled) return;

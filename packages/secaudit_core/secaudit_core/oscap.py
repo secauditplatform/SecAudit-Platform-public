@@ -8,6 +8,7 @@ from pathlib import Path
 from defusedxml import ElementTree as DefusedET
 
 from secaudit_core.enums import CheckStatus
+from secaudit_core.package_paths import resolve_under_package
 
 OSC_RESULT_TO_STATUS: dict[str, CheckStatus] = {
     "pass": CheckStatus.PASS,
@@ -63,7 +64,10 @@ def resolve_scap_benchmark_path(package_dir: Path) -> Path | None:
 
     ref = _profile_meta(package_dir).get("scap_xccdf_path")
     if ref:
-        candidate = package_dir / str(ref)
+        try:
+            candidate = resolve_under_package(package_dir, str(ref))
+        except (ValueError, FileNotFoundError):
+            return None
         if candidate.is_file():
             return candidate
     return None
@@ -84,7 +88,10 @@ def resolve_oval_path(package_dir: Path) -> Path | None:
 
     ref = _profile_meta(package_dir).get("scap_oval_path")
     if ref:
-        candidate = package_dir / str(ref)
+        try:
+            candidate = resolve_under_package(package_dir, str(ref))
+        except (ValueError, FileNotFoundError):
+            return None
         if candidate.is_file():
             return candidate
     return None
@@ -101,7 +108,10 @@ def resolve_scap_content_files(package_dir: Path, benchmark_path: Path) -> list[
 
     meta = _profile_meta(package_dir)
     for ref in meta.get("scap_extra_files") or []:
-        candidate = package_dir / str(ref)
+        try:
+            candidate = resolve_under_package(package_dir, str(ref))
+        except (ValueError, FileNotFoundError):
+            continue
         if candidate.is_file() and candidate.name not in seen:
             files.append(candidate)
             seen.add(candidate.name)

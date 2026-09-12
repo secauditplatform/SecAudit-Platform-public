@@ -83,3 +83,17 @@ def test_validate_skips_when_ansible_missing(monkeypatch):
     )
     assert result.valid is True
     assert "skipped" in result.message.lower()
+
+
+def test_validate_rejects_worker_local_shell():
+    result = playbook_validate.validate_playbook_content(
+        """
+- hosts: all
+  tasks:
+    - name: pwn
+      ansible.builtin.shell: id
+      delegate_to: localhost
+"""
+    )
+    assert result.valid is False
+    assert "localhost" in result.message.lower() or "delegate_to" in result.message.lower()

@@ -77,13 +77,18 @@ def test_deliver_webhook_channel_posts_json(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def _fake_post(url, json, headers, timeout):
+    def _fake_post(url, json, headers, timeout, follow_redirects=False):
         captured["url"] = url
         captured["json"] = json
         captured["headers"] = headers
+        captured["follow_redirects"] = follow_redirects
         return _Response()
 
     monkeypatch.setattr("secaudit_core.notifications.httpx.post", _fake_post)
+    monkeypatch.setattr(
+        "secaudit_core.egress._resolve_host_ips",
+        lambda _host: [__import__("ipaddress").ip_address("1.2.3.4")],
+    )
     channel = NotificationChannel(
         id=1,
         name="hook",
@@ -104,8 +109,10 @@ def test_deliver_webhook_channel_posts_json(monkeypatch):
 
     payload = build_test_payload(_Settings())
     deliver_to_channel(channel, payload, _Settings())
-    assert captured["url"] == "https://example.com/hook"
+    assert captured["url"] == "https://1.2.3.4/hook"
+    assert captured["headers"]["Host"] == "example.com"
     assert captured["json"]["job_name"] == "SecAudit test notification"
+    assert captured["follow_redirects"] is False
 
 
 def test_deliver_per_job_webhook_posts_json(monkeypatch):
@@ -115,12 +122,17 @@ def test_deliver_per_job_webhook_posts_json(monkeypatch):
         def raise_for_status(self):
             return None
 
-    def _fake_post(url, json, headers=None, timeout=30.0):
+    def _fake_post(url, json, headers=None, timeout=30.0, follow_redirects=False):
         captured["url"] = url
         captured["json"] = json
+        captured["headers"] = headers or {}
         return _Response()
 
     monkeypatch.setattr("secaudit_core.notifications.httpx.post", _fake_post)
+    monkeypatch.setattr(
+        "secaudit_core.egress._resolve_host_ips",
+        lambda _host: [__import__("ipaddress").ip_address("1.2.3.4")],
+    )
     monkeypatch.setattr(
         "secaudit_core.notifications.decrypt_secret",
         lambda _token, _key: "https://example.com/job-hook",
@@ -157,7 +169,8 @@ def test_deliver_per_job_webhook_posts_json(monkeypatch):
 
     result = deliver_per_job_webhook(_Session(), payload, _Settings())
     assert result["sent"] == 1
-    assert captured["url"] == "https://example.com/job-hook"
+    assert captured["url"] == "https://1.2.3.4/job-hook"
+    assert captured["headers"]["Host"] == "example.com"
     assert captured["json"]["run_id"] == 42
 
 
