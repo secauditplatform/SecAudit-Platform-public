@@ -22,6 +22,6 @@ We aim to acknowledge reports within **7 days** and to share a remediation or mi
 
 ## Lab vs production
 
-The root `docker-compose.yml` and `infra/keycloak/secaudit-realm.json` are **lab/demo only** (weak default passwords, Keycloak `start-dev`, open redirect URIs). Do not expose them to the internet or reuse those credentials in production.
+The root `docker-compose.yml` and `infra/keycloak/secaudit-realm.json` are **lab only** (weak default passwords, Keycloak `start-dev`, open redirect URIs). Do not expose them to the internet or reuse those credentials in production.
 
 For production hardening, see [docs/production-guide.md](docs/production-guide.md) and [docs/secrets-howto.md](docs/secrets-howto.md).

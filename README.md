@@ -1,52 +1,74 @@
 ﻿# SecAudit Platform
 
-On-prem platform for infrastructure **compliance audit and remediation**.
+<p align="center">
+  <strong>On-prem compliance audit and remediation for Linux, Windows, and network devices</strong>
+</p>
 
-SecAudit helps security and infrastructure teams run the full cycle:
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue.svg" alt="License"></a>
+  <a href="SECURITY.md"><img src="https://img.shields.io/badge/security-policy-green.svg" alt="Security policy"></a>
+  <a href="docs/en/getting-started.md"><img src="https://img.shields.io/badge/docs-getting%20started-informational.svg" alt="Getting started"></a>
+</p>
 
-**Import profiles → discover hosts (AuditFlow) → run checks → report → remediate → re-audit**
+**SecAudit Platform** is an on-premises product for infrastructure compliance: import check packages, discover hosts, run audits, report findings, remediate, and re-check — in one cycle.
 
-Linux, Windows, and network devices are supported over SSH, WinRM, Ansible, Python, OpenSCAP, and Netmiko.
+It is built for security and infrastructure teams that need a controlled, auditable workflow instead of ad-hoc scripts. Targets are reached over SSH, WinRM, Ansible, Python, OpenSCAP, and Netmiko.
 
-## Features
+# Main features
 
-- **Compliance jobs** — scheduled or on-demand checks with live logs
-- **AuditFlow** — nmap discovery, OS fingerprinting, profile match, selected checks
-- **Profiles** — custom packages (`description.json` + `profile_rules.json`) and SCAP/XCCDF/OVAL import
-- **Remediation** — profile scripts and network CLI/config download
-- **Reports** — HTML / PDF / CSV, drift, diff, compare, waivers, trends
-- **Playbooks** — Ansible for Linux / Windows / Network
-- **Security** — Keycloak OIDC or local users, RBAC, encrypted credentials, audit log, SIEM export
+- **End-to-end compliance cycle** — profiles → discovery (AuditFlow) → jobs → reports → remediation → re-audit.
+- **Multi-platform checks** — Linux, Windows, and network devices from a single control plane.
+- **Profile packages** — custom catalogs (`description.json` + `profile_rules.json`) and SCAP / XCCDF / OVAL import.
+- **AuditFlow** — nmap discovery, OS fingerprinting, profile match, and selective launch.
+- **Remediation** — packaged fix scripts and network CLI / config download.
+- **Reporting** — HTML / PDF / CSV, drift, diff, compare, waivers, and trends.
+- **Playbooks** — Ansible for Linux, Windows, and network scopes.
+- **Enterprise auth & RBAC** — Keycloak OIDC or local users, object-level ownership, encrypted credentials, audit log, SIEM export.
+- **Deploy your way** — lab Docker Compose for development; production Compose or Helm for real environments.
 
-## Stack
+# Architecture
 
-FastAPI · Celery · PostgreSQL 16 · Redis · React · Keycloak · Docker Compose / Helm
+SecAudit follows a classic API + worker split on top of PostgreSQL and Redis:
 
-## Repository layout
+| Layer | Components |
+|-------|------------|
+| UI | React SPA |
+| Control plane | FastAPI (REST / WebSocket), Alembic migrations |
+| Execution | Celery workers (compliance, remediation, inventory, maintenance) + beat |
+| Data | PostgreSQL 16, Redis (broker / cache / locks) |
+| Identity | Keycloak (OIDC) and/or local DB users |
+| Shared library | `packages/secaudit_core` used by API and workers |
+
+```text
+┌────────────┐     ┌────────────┐     ┌─────────────────────────┐
+│  Frontend  │────▶│    API     │────▶│  PostgreSQL · Redis     │
+└────────────┘     └─────┬──────┘     └─────────────────────────┘
+                         │ enqueue
+                         ▼
+                  ┌────────────┐     ┌─────────────────────────┐
+                  │   Worker   │────▶│  SSH / WinRM / Ansible  │
+                  │  (+ beat)  │     │  OpenSCAP / Netmiko     │
+                  └────────────┘     └─────────────────────────┘
+```
+
+# Repository layout
 
 | Path | Role |
 |------|------|
 | `api/` | FastAPI application and Alembic migrations |
-| `workers/` | Celery workers (compliance, remediation, inventory, …) |
+| `workers/` | Celery workers |
 | `frontend/` | React web UI |
 | `packages/secaudit_core/` | Shared Python library |
 | `deploy/` | Production Compose and Helm chart |
 | `infra/` | Lab Keycloak realm, Redis Sentinel, observability |
 | `docs/` | Operations and production guides |
-| `profiles/` | Catalog mount point (packages not shipped here) |
+| `profiles/` | Catalog mount point (packages are not shipped here) |
 
-## Requirements
+# Getting started
 
-- Docker Engine 24+ with Compose v2 (or Kubernetes + Helm 3 for the chart)
-- ~4 GB RAM for the lab stack
+Requirements: Docker Engine 24+ with Compose v2, about 4 GB RAM for the lab stack.
 
-## Profiles directory
-
-Compliance packages are **not** shipped in this repository. Keep the `profiles/` folder (see [profiles/README.md](profiles/README.md)) and place profile packages there, or point `PROFILES_SOURCE_PATH` at your catalog.
-
-## Quick start (lab Docker Compose)
-
-Development / demo topology from the repository root (includes Keycloak `start-dev`, hot-reload frontend, Redis Sentinel):
+Compliance packages are **not** included in this repository. Keep the `profiles/` folder (see [profiles/README.md](profiles/README.md)) and place packages there, or set `PROFILES_SOURCE_PATH`.
 
 ```bash
 git clone https://github.com/secauditplatform/SecAudit-Platform.git
@@ -61,9 +83,9 @@ docker compose up --build
 | http://localhost:8000/docs | API (Swagger) |
 | http://localhost:8080 | Keycloak Admin |
 
-Default Keycloak SSO users in the **lab** realm (`infra/keycloak/secaudit-realm.json`): `admin` / `admin` and `dev` / `dev`. That realm uses open redirect URIs and is **not** for production or public exposure.
+Lab Keycloak users (`infra/keycloak/secaudit-realm.json`): `admin` / `admin` and `dev` / `dev`. That realm uses open redirect URIs and is **not** for production.
 
-Optional first **local** admin (DB users), when `LOCAL_AUTH_ENABLED=true`:
+Optional first local admin when `LOCAL_AUTH_ENABLED=true`:
 
 ```env
 LOCAL_AUTH_ENABLED=true
@@ -73,11 +95,15 @@ BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password
 
 Remove `BOOTSTRAP_ADMIN_*` after the first login. Full variable list: [.env.example](.env.example).
 
-> Lab Compose is for demos and development. For production use the paths below.
+Step-by-step walkthrough: [docs/en/getting-started.md](docs/en/getting-started.md).
 
-## Production Docker Compose
+> The root Compose file is for local development only. For production use the paths below.
 
-Standalone production stack under [`deploy/compose`](deploy/compose) (do **not** mix with the root lab `docker-compose.yml`):
+# Production
+
+## Docker Compose
+
+Standalone stack under [`deploy/compose`](deploy/compose) — do **not** mix with the root lab `docker-compose.yml`:
 
 ```bash
 cd deploy/compose
@@ -117,28 +143,25 @@ helm upgrade --install secaudit deploy/helm/secaudit \
 
 Full chart options: [deploy/helm/secaudit/README.md](deploy/helm/secaudit/README.md) · [docs/production-guide.md](docs/production-guide.md)
 
-## Documentation
-
-All operator guides are in English.
+# Documentation
 
 | Document | Description |
 |----------|-------------|
-| [profiles/README.md](profiles/README.md) | Profile package layout, rules, playbooks |
-| [docs/en/getting-started.md](docs/en/getting-started.md) | Getting started |
-| [docs/production-guide.md](docs/production-guide.md) | Lab vs production, smoke checks |
-| [docs/demo-stand-deploy.md](docs/demo-stand-deploy.md) | Locked-down public demo stand |
-| [deploy/compose/README.md](deploy/compose/README.md) | Production Compose |
-| [deploy/helm/secaudit/README.md](deploy/helm/secaudit/README.md) | Helm install and secrets |
-| [docs/ops-runbook.md](docs/ops-runbook.md) | Operations |
+| [docs/en/getting-started.md](docs/en/getting-started.md) | First lab bring-up |
+| [docs/production-guide.md](docs/production-guide.md) | Production checklist (Compose / Helm) |
+| [docs/ops-runbook.md](docs/ops-runbook.md) | Day-2 operations |
 | [docs/secrets-howto.md](docs/secrets-howto.md) | Secrets and bootstrap |
 | [docs/backup-restore-runbook.md](docs/backup-restore-runbook.md) | Backup and restore |
+| [profiles/README.md](profiles/README.md) | Profile package layout |
+| [deploy/compose/README.md](deploy/compose/README.md) | Production Compose |
+| [deploy/helm/secaudit/README.md](deploy/helm/secaudit/README.md) | Helm install and secrets |
 | [SECURITY.md](SECURITY.md) | Vulnerability reporting |
 
-## Security
+# Security
 
-To report a vulnerability, see [SECURITY.md](SECURITY.md). Do not file public issues for security bugs.
+To report a vulnerability, see [SECURITY.md](SECURITY.md). Do not open public issues for security bugs.
 
-## License
+# License
 
 Copyright 2026 secauditplatform@proton.me.
 

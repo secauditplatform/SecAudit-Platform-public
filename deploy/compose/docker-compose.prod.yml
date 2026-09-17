@@ -30,7 +30,7 @@ x-app-env: &app-env
   DEMO_MODE: ${DEMO_MODE:-false}
   CONSOLE_ENABLED: "false"
   CONSOLE_ALLOW_IN_PRODUCTION: "false"
-# Also make Keycloak optional when LOCAL_AUTH-only demo uses placeholders.
+# Keycloak can be omitted when LOCAL_AUTH_ENABLED=true (placeholders satisfy env substitution).
   KEYCLOAK_URL: ${KEYCLOAK_URL:-http://127.0.0.1:9}
   KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://127.0.0.1:9/realms/secaudit}
   KEYCLOAK_REALM: ${KEYCLOAK_REALM:-secaudit}
