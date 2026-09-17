@@ -16,53 +16,42 @@ It is built for security and infrastructure teams that need a controlled, audita
 
 # Main features
 
-- **End-to-end compliance cycle** — profiles → discovery (AuditFlow) → jobs → reports → remediation → re-audit.
-- **Multi-platform checks** — Linux, Windows, and network devices from a single control plane.
-- **Profile packages** — custom catalogs (`description.json` + `profile_rules.json`) and SCAP / XCCDF / OVAL import.
-- **AuditFlow** — nmap discovery, OS fingerprinting, profile match, and selective launch.
-- **Remediation** — packaged fix scripts and network CLI / config download.
-- **Reporting** — HTML / PDF / CSV, drift, diff, compare, waivers, and trends.
-- **Playbooks** — Ansible for Linux, Windows, and network scopes.
-- **Enterprise auth & RBAC** — Keycloak OIDC or local users, object-level ownership, encrypted credentials, audit log, SIEM export.
-- **Deploy your way** — lab Docker Compose for development; production Compose or Helm for real environments.
+- **Full compliance lifecycle** — discover assets, run checks, report findings, remediate, and verify again in one controlled workflow.
+- **One control plane, many targets** — audit Linux, Windows, and network devices over SSH, WinRM, Ansible, OpenSCAP, and Netmiko.
+- **Portable profile packages** — ship custom rule packs or import SCAP / XCCDF / OVAL content into a versioned catalog.
+- **Guided discovery with AuditFlow** — map the network, fingerprint OS, match profiles, and launch only the checks you select.
+- **Actionable remediation** — apply packaged fix scripts on hosts, or export network CLI / config for operator-driven change.
+- **Evidence-ready reporting** — HTML, PDF, and CSV plus drift, diff, compare, waivers, and trend views for audits and reviews.
+- **Automation with playbooks** — run Ansible playbooks across Linux, Windows, and network scopes from the same jobs model.
+- **Security built in** — Keycloak OIDC or local users, object-level RBAC, encrypted credentials, audit trail, and SIEM export.
+- **Production-ready packaging** — develop on lab Compose; deploy with hardened Compose or Helm on your infrastructure.
 
 # Architecture
 
-SecAudit follows a classic API + worker split on top of PostgreSQL and Redis:
+SecAudit separates the **control plane** (API, UI, identity) from **execution** (Celery workers). The API accepts work, persists state, and enqueues tasks; workers reach managed hosts and write results back. Shared domain logic lives in `secaudit_core` so API and workers stay consistent.
 
-| Layer | Components |
-|-------|------------|
-| UI | React SPA |
-| Control plane | FastAPI (REST / WebSocket), Alembic migrations |
-| Execution | Celery workers (compliance, remediation, inventory, maintenance) + beat |
-| Data | PostgreSQL 16, Redis (broker / cache / locks) |
-| Identity | Keycloak (OIDC) and/or local DB users |
-| Shared library | `packages/secaudit_core` used by API and workers |
 
-```text
-┌────────────┐     ┌────────────┐     ┌─────────────────────────┐
-│  Frontend  │────▶│    API     │────▶│  PostgreSQL · Redis     │
-└────────────┘     └─────┬──────┘     └─────────────────────────┘
-                         │ enqueue
-                         ▼
-                  ┌────────────┐     ┌─────────────────────────┐
-                  │   Worker   │────▶│  SSH / WinRM / Ansible  │
-                  │  (+ beat)  │     │  OpenSCAP / Netmiko     │
-                  └────────────┘     └─────────────────────────┘
-```
+| Layer | Responsibility |
+|-------|----------------|
+| **Frontend** | Operator UI for jobs, hosts, profiles, reports, and settings |
+| **API** | AuthZ, REST / WebSocket, scheduling hooks, migrations (Alembic) |
+| **Workers** | Compliance, remediation, inventory, and maintenance queues; beat for periodic tasks |
+| **Data store** | PostgreSQL for durable state; Redis for broker, locks, and short-lived keys |
+| **Identity** | Keycloak OIDC and/or local DB users |
+| **Shared core** | `packages/secaudit_core` — policies, executors helpers, notifications, egress controls |
 
 # Repository layout
 
-| Path | Role |
-|------|------|
-| `api/` | FastAPI application and Alembic migrations |
-| `workers/` | Celery workers |
-| `frontend/` | React web UI |
-| `packages/secaudit_core/` | Shared Python library |
-| `deploy/` | Production Compose and Helm chart |
-| `infra/` | Lab Keycloak realm, Redis Sentinel, observability |
-| `docs/` | Operations and production guides |
-| `profiles/` | Catalog mount point (packages are not shipped here) |
+| Path | What you will find |
+|------|--------------------|
+| `api/` | FastAPI app, routers, and Alembic migrations |
+| `workers/` | Celery app, task entrypoints, and host executors |
+| `frontend/` | React SPA |
+| `packages/secaudit_core/` | Shared library used by API and workers |
+| `deploy/` | Production Docker Compose and Helm chart |
+| `infra/` | Lab Keycloak realm, Redis Sentinel, observability configs |
+| `docs/` | Getting started, production, ops, secrets, backup |
+| `profiles/` | Mount point for your compliance catalog (packages are not shipped in-repo) |
 
 # Getting started
 
