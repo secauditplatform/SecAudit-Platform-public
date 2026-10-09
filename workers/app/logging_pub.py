@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import redis
 from secaudit_core.redis_client import sync_redis
+from secaudit_core.sensitive_data import redact_sensitive
 from secaudit_core.settings import SecAuditSettings
 
 logger = logging.getLogger(__name__)
@@ -14,12 +15,17 @@ def _redis_client() -> redis.Redis:
     return sync_redis(_settings.redis_url, settings=_settings, decode_responses=True)
 
 
+def _safe_message(message: str) -> str:
+    redacted = redact_sensitive(message)
+    return redacted if isinstance(redacted, str) else str(redacted)
+
+
 def publish_job_log(job_run_id: int, message: str, level: str = "info") -> None:
     payload = json.dumps(
         {
             "job_run_id": job_run_id,
             "level": level,
-            "message": message,
+            "message": _safe_message(message),
             "timestamp": datetime.now(UTC).isoformat(),
         }
     )
@@ -37,7 +43,7 @@ def publish_audit_flow_log(run_id: int, message: str, level: str = "info") -> No
         {
             "audit_flow_run_id": run_id,
             "level": level,
-            "message": message,
+            "message": _safe_message(message),
             "timestamp": datetime.now(UTC).isoformat(),
         }
     )
@@ -55,7 +61,7 @@ def publish_remediation_log(remediation_run_id: int, message: str, level: str = 
         {
             "remediation_run_id": remediation_run_id,
             "level": level,
-            "message": message,
+            "message": _safe_message(message),
             "timestamp": datetime.now(UTC).isoformat(),
         }
     )

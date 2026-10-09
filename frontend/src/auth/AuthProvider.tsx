@@ -3,15 +3,28 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import { api, setAuthRefreshHandler, setAuthToken } from "../api/client";
 import { clearAuthArtifacts } from "./clearAuthArtifacts";
 import { LoginLoading, LoginPage } from "./LoginPage";
+import { MfaRequiredError } from "./mfaErrors";
 
-const authEnabled = import.meta.env.VITE_AUTH_ENABLED === "true";
+// Fail-closed: auth is on unless explicitly disabled with VITE_AUTH_ENABLED=false.
+const authEnabled = import.meta.env.VITE_AUTH_ENABLED !== "false";
 const localAuthEnabled = import.meta.env.VITE_LOCAL_AUTH_ENABLED === "true";
-const viteDemoMode = import.meta.env.VITE_DEMO_MODE === "true";
+const demoMode = import.meta.env.VITE_DEMO_MODE === "true";
 const ssoEnabled = import.meta.env.VITE_SSO_ENABLED !== "false";
 const showSsoButton = import.meta.env.VITE_SHOW_SSO_BUTTON !== "false";
+const authIdleTimeoutSeconds = (() => {
+  const raw = Number(import.meta.env.VITE_AUTH_IDLE_TIMEOUT_SECONDS ?? "14400");
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+})();
+/** Platform (non-demo) UI idle logout: 4h by default. */
+const platformIdleEnabled = authEnabled && !demoMode && authIdleTimeoutSeconds > 0;
+const demoOperatorUsernames = (import.meta.env.VITE_DEMO_OPERATOR_USERNAMES || "")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
 const LOCAL_TOKEN_KEY = "secaudit_local_token";
 const LOCAL_REFRESH_TOKEN_KEY = "secaudit_local_refresh_token";
 const LOCAL_USER_KEY = "secaudit_local_user";
+const LOCAL_LAST_ACTIVITY_KEY = "secaudit_last_activity";
 const ADMIN_ROLE = "admin";
 const OPERATOR_ROLE = "operator";
 const AUDITOR_ROLE = "auditor";
@@ -44,30 +57,34 @@ type AuthContextValue = {
   authMode: AuthMode;
   loginKeycloak: () => void;
   loginLocal: (username: string, password: string) => Promise<void>;
+  verifyMfa: (mfaToken: string, code: string) => Promise<void>;
+  loginDemo: () => Promise<void>;
   logout: () => void;
 };
 
 const AuthContext = createContext<AuthContextValue>({
-  ready: true,
-  authenticated: true,
-  username: "anonymous",
+  ready: false,
+  authenticated: false,
+  username: "",
   token: null,
-  roles: [ADMIN_ROLE],
-  primaryRole: "admin",
-  isAdmin: true,
-  canOperate: true,
-  canExecute: true,
-  canAccessRemediation: true,
-  canViewScripts: true,
-  canManageUsers: true,
-  canViewReports: true,
-  canSeeObjectOwners: true,
-  canViewAuditLogs: true,
+  roles: [],
+  primaryRole: null,
+  isAdmin: false,
+  canOperate: false,
+  canExecute: false,
+  canAccessRemediation: false,
+  canViewScripts: false,
+  canManageUsers: false,
+  canViewReports: false,
+  canSeeObjectOwners: false,
+  canViewAuditLogs: false,
   isAuditorPortal: false,
   isDemoMode: false,
   authMode: "none",
   loginKeycloak: () => {},
   loginLocal: async () => {},
+  verifyMfa: async () => {},
+  loginDemo: async () => {},
   logout: () => {},
 });
 
@@ -107,6 +124,22 @@ function readStoredLocalAuth(): { token: string; refreshToken: string | null; us
   return { token, refreshToken, username };
 }
 
+function readLastActivity(): number {
+  const raw = sessionStorage.getItem(LOCAL_LAST_ACTIVITY_KEY);
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function writeLastActivity(ts = Date.now()) {
+  sessionStorage.setItem(LOCAL_LAST_ACTIVITY_KEY, String(ts));
+  return ts;
+}
+
+function isPlatformIdle(now = Date.now()): boolean {
+  if (!platformIdleEnabled) return false;
+  return now - readLastActivity() >= authIdleTimeoutSeconds * 1000;
+}
+
 function accessTokenExpiresSoon(token: string, thresholdSeconds = 300): boolean {
   try {
     const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
@@ -125,8 +158,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [roles, setRoles] = useState<string[]>(authEnabled ? [] : [ADMIN_ROLE]);
   const [authMode, setAuthMode] = useState<AuthMode>(authEnabled ? "none" : "none");
-  // Prefer API DEMO_MODE over VITE_DEMO_MODE so UI cannot enable execute while API is locked.
-  const [demoMode, setDemoMode] = useState(viteDemoMode);
 
   const keycloak = useMemo(() => {
     if (!authEnabled || !ssoEnabled) return null;
@@ -137,11 +168,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
-  const applyLocalAuth = useCallback((accessToken: string, localUsername: string, refreshToken?: string | null) => {
+  const applyLocalAuth = useCallback((
+    accessToken: string,
+    localUsername: string,
+    refreshToken?: string | null,
+    options?: { touchActivity?: boolean },
+  ) => {
     sessionStorage.setItem(LOCAL_TOKEN_KEY, accessToken);
     sessionStorage.setItem(LOCAL_USER_KEY, localUsername);
     if (refreshToken) {
       sessionStorage.setItem(LOCAL_REFRESH_TOKEN_KEY, refreshToken);
+    }
+    if (options?.touchActivity) {
+      writeLastActivity();
+    } else if (!sessionStorage.getItem(LOCAL_LAST_ACTIVITY_KEY)) {
+      writeLastActivity();
     }
     setAuthToken(accessToken);
     setToken(accessToken);
@@ -155,9 +196,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     sessionStorage.removeItem(LOCAL_TOKEN_KEY);
     sessionStorage.removeItem(LOCAL_REFRESH_TOKEN_KEY);
     sessionStorage.removeItem(LOCAL_USER_KEY);
+    sessionStorage.removeItem(LOCAL_LAST_ACTIVITY_KEY);
   }, []);
 
   const refreshLocalAuth = useCallback(async () => {
+    if (isPlatformIdle()) {
+      clearLocalAuth();
+      clearAuthArtifacts();
+      setAuthenticated(false);
+      setToken(null);
+      setRoles([]);
+      setUsername("");
+      setAuthMode("none");
+      return false;
+    }
     const refreshToken = sessionStorage.getItem(LOCAL_REFRESH_TOKEN_KEY);
     if (!refreshToken) return false;
     try {
@@ -177,8 +229,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [applyLocalAuth, clearLocalAuth]);
 
-  const syncKeycloakAuth = useCallback((kc: Keycloak) => {
+  const syncKeycloakAuth = useCallback((kc: Keycloak, options?: { touchActivity?: boolean }) => {
     if (!kc.token) return;
+    if (options?.touchActivity) {
+      writeLastActivity();
+    } else if (!sessionStorage.getItem(LOCAL_LAST_ACTIVITY_KEY)) {
+      writeLastActivity();
+    }
     setAuthToken(kc.token);
     setAuthenticated(true);
     setUsername(kc.tokenParsed?.preferred_username || "user");
@@ -189,6 +246,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const clearKeycloakAuth = useCallback(() => {
     clearAuthArtifacts();
+    sessionStorage.removeItem(LOCAL_LAST_ACTIVITY_KEY);
     setAuthenticated(false);
     setToken(null);
     setRoles([]);
@@ -198,6 +256,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const refreshKeycloakToken = useCallback(async (minValidity = 70) => {
     if (!keycloak?.token) return false;
+    if (isPlatformIdle()) {
+      clearKeycloakAuth();
+      keycloak.logout({ redirectUri: window.location.origin });
+      return false;
+    }
     try {
       await keycloak.updateToken(minValidity);
       syncKeycloakAuth(keycloak);
@@ -209,23 +272,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [keycloak, syncKeycloakAuth, clearKeycloakAuth]);
 
   const initStartedRef = useRef(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    void api
-      .health()
-      .then((health) => {
-        if (!cancelled && typeof health.demo_mode === "boolean") {
-          setDemoMode(health.demo_mode);
-        }
-      })
-      .catch(() => {
-        /* keep VITE_DEMO_MODE until API is reachable */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const logoutRef = useRef<() => void>(() => {});
 
   useEffect(() => {
     if (!authEnabled) return;
@@ -234,6 +281,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const stored = readStoredLocalAuth();
     if (stored) {
+      if (isPlatformIdle()) {
+        sessionStorage.removeItem(LOCAL_TOKEN_KEY);
+        sessionStorage.removeItem(LOCAL_REFRESH_TOKEN_KEY);
+        sessionStorage.removeItem(LOCAL_USER_KEY);
+        sessionStorage.removeItem(LOCAL_LAST_ACTIVITY_KEY);
+        setReady(true);
+        return;
+      }
       applyLocalAuth(stored.token, stored.username, stored.refreshToken);
       setReady(true);
       return;
@@ -308,10 +363,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const loginLocal = async (localUsername: string, password: string) => {
     const result = await api.localLogin(localUsername, password);
-    applyLocalAuth(result.access_token, result.username, result.refresh_token);
+    if (result.mfa_required && result.mfa_token) {
+      throw new MfaRequiredError(result.mfa_token, result.username);
+    }
+    if (!result.access_token || !result.refresh_token) {
+      throw new Error("Sign-in failed");
+    }
+    applyLocalAuth(result.access_token, result.username, result.refresh_token, { touchActivity: true });
+  };
+
+  const verifyMfa = async (mfaToken: string, code: string) => {
+    const result = await api.verifyMfa(mfaToken, code);
+    if (!result.access_token || !result.refresh_token) {
+      throw new Error("MFA verification failed");
+    }
+    applyLocalAuth(result.access_token, result.username, result.refresh_token, { touchActivity: true });
+  };
+
+  const loginDemo = async () => {
+    const result = await api.demoLogin();
+    applyLocalAuth(result.access_token, result.username, result.refresh_token, { touchActivity: true });
   };
 
   const logout = () => {
+    if (authMode === "local" && token) {
+      void api.logout().catch(() => undefined);
+    }
     clearLocalAuth();
     clearAuthArtifacts();
     setAuthenticated(false);
@@ -323,11 +400,52 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       keycloak.logout({ redirectUri: window.location.origin });
     }
   };
+  logoutRef.current = logout;
+
+  useEffect(() => {
+    if (!platformIdleEnabled || !authenticated) return;
+
+    writeLastActivity(readLastActivity());
+    let lastMoveMark = 0;
+    const markActivity = () => {
+      writeLastActivity();
+    };
+    const onMouseMove = () => {
+      const now = Date.now();
+      if (now - lastMoveMark < 15_000) return;
+      lastMoveMark = now;
+      markActivity();
+    };
+    const events: Array<[keyof WindowEventMap, EventListener]> = [
+      ["mousedown", markActivity],
+      ["keydown", markActivity],
+      ["touchstart", markActivity],
+      ["scroll", markActivity],
+      ["mousemove", onMouseMove],
+    ];
+    for (const [name, handler] of events) {
+      window.addEventListener(name, handler, { passive: true });
+    }
+    const intervalId = window.setInterval(() => {
+      if (isPlatformIdle()) {
+        logoutRef.current();
+      }
+    }, 30_000);
+    return () => {
+      for (const [name, handler] of events) {
+        window.removeEventListener(name, handler);
+      }
+      window.clearInterval(intervalId);
+    };
+  }, [authenticated]);
 
   const primaryRole = !authEnabled ? "admin" : resolvePrimaryRole(roles);
   const isAdmin = !authEnabled || roles.includes(ADMIN_ROLE);
   const canOperate = !authEnabled || roles.includes(ADMIN_ROLE) || roles.includes(OPERATOR_ROLE);
-  const canExecute = !demoMode && canOperate;
+  const isDemoOperator =
+    demoMode && demoOperatorUsernames.includes((username || "").trim().toLowerCase());
+  const guestDemoMode = demoMode && !isDemoOperator;
+  const canExecute = (!demoMode || isDemoOperator) && canOperate;
   const canAccessRemediation = !authEnabled || roles.includes(ADMIN_ROLE);
   const canViewScripts = !authEnabled || roles.includes(ADMIN_ROLE);
   const canManageUsers = !authEnabled || roles.includes(ADMIN_ROLE);
@@ -357,10 +475,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     canSeeObjectOwners,
     canViewAuditLogs,
     isAuditorPortal,
-    isDemoMode: demoMode,
+    isDemoMode: guestDemoMode,
     authMode,
     loginKeycloak,
     loginLocal,
+    verifyMfa,
+    loginDemo,
     logout,
   };
 
@@ -374,9 +494,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         showKeycloak={showSsoButton && (Boolean(keycloak) || !ssoEnabled)}
         keycloakDisabled={!ssoEnabled || !keycloak}
         showLocal={localAuthEnabled}
+        localDisabled={demoMode}
         demoStand={demoMode}
         onKeycloakLogin={loginKeycloak}
         onLocalLogin={loginLocal}
+        onMfaVerify={verifyMfa}
+        onDemoLogin={demoMode ? loginDemo : undefined}
       />
     );
   }

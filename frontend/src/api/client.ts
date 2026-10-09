@@ -344,6 +344,7 @@ export interface Credential {
   credential_type: string;
   username?: string;
   service_username?: string | null;
+  snmp_priv_protocol?: string | null;
   has_service_secret?: boolean;
   description?: string;
   created_at: string;
@@ -358,10 +359,30 @@ export interface PlatformUser {
   full_name?: string | null;
   role: UserRole;
   is_active: boolean;
+  mfa_enabled?: boolean;
   created_at: string;
 }
 
-export type NotificationChannelType = "email" | "webhook" | "slack" | "teams" | "siem";
+export type ApiKeyScope = "jobs:run" | "reports:read" | "inventory:scan";
+
+export interface ApiKey {
+  id: number;
+  name: string;
+  key_prefix: string;
+  scopes: string[];
+  created_by?: string | null;
+  created_at: string;
+  last_used_at?: string | null;
+  expires_at?: string | null;
+  revoked_at?: string | null;
+  is_active: boolean;
+}
+
+export interface ApiKeyCreated extends ApiKey {
+  secret: string;
+}
+
+export type NotificationChannelType = "email" | "webhook" | "slack" | "teams" | "telegram" | "siem";
 export type NotificationEventType =
   | "run_failed"
   | "run_completed"
@@ -460,12 +481,26 @@ export interface HostLinkedCredential {
   username?: string | null;
 }
 
+export type HostCriticality = "low" | "medium" | "high" | "critical";
+
+export interface HostCsvImportResult {
+  apply: boolean;
+  created: number;
+  updated: number;
+  unchanged: number;
+  truncated: boolean;
+  rejected: { row: number; reason: string }[];
+}
+
 export interface Host {
   id: number;
   name: string;
   hostname: string;
   port: number;
   os_type?: string;
+  site?: string | null;
+  environment?: string | null;
+  criticality?: HostCriticality | null;
   credential_id?: number | null;
   credential_ids?: number[];
   linked_credentials?: HostLinkedCredential[];
@@ -522,6 +557,12 @@ export interface AuditFlowHost {
   ephemeral_host_id?: number | null;
   inventory_reused?: boolean;
   ssh_host_key_fingerprint?: string | null;
+  match_hints?: Array<{
+    code: string;
+    detail: string;
+    profile_id?: number;
+    confidence?: number;
+  }>;
 }
 
 export interface AuditFlowRun {
@@ -530,6 +571,8 @@ export interface AuditFlowRun {
   targets: string[];
   error_message?: string | null;
   hosts_found: number;
+  save_to_inventory?: boolean;
+  template_id?: number | null;
   started_at?: string | null;
   finished_at?: string | null;
   created_at: string;
@@ -542,10 +585,73 @@ export interface AuditFlowRun {
   } | null;
 }
 
+export interface AuditFlowTemplateCredential {
+  label: string;
+  credential_type: "ssh_password" | "ssh_key" | "winrm";
+  username: string;
+  service_username?: string | null;
+  has_secret?: boolean;
+  has_service_secret?: boolean;
+}
+
+export interface AuditFlowTemplate {
+  id: number;
+  name: string;
+  description?: string | null;
+  targets: string[];
+  credentials: AuditFlowTemplateCredential[];
+  save_to_inventory: boolean;
+  cron_expression?: string | null;
+  is_scheduled: boolean;
+  last_scheduled_at?: string | null;
+  is_active: boolean;
+  owner_sub?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type AuditFlowInventoryChange = "appeared" | "disappeared" | "unchanged" | "changed";
+
+export interface AuditFlowInventoryDriftHost {
+  change: AuditFlowInventoryChange;
+  ip_address: string;
+  hostname?: string | null;
+  ssh_host_key_fingerprint?: string | null;
+  os_guess?: string | null;
+  profile_id?: number | null;
+  profile_name?: string | null;
+  left_run_id?: number | null;
+  right_run_id?: number | null;
+  left_os_guess?: string | null;
+  right_os_guess?: string | null;
+  left_profile_name?: string | null;
+  right_profile_name?: string | null;
+}
+
+export interface AuditFlowInventoryDriftSummary {
+  left_run_id: number;
+  right_run_id: number;
+  left_hosts: number;
+  right_hosts: number;
+  appeared: number;
+  disappeared: number;
+  unchanged: number;
+  changed: number;
+}
+
+export interface AuditFlowInventoryDriftReport {
+  summary: AuditFlowInventoryDriftSummary;
+  items: AuditFlowInventoryDriftHost[];
+}
+
 export interface DynamicHostFilter {
   tags: string[];
   active_only: boolean;
   search?: string | null;
+  os_type?: string | null;
+  site?: string | null;
+  environment?: string | null;
+  criticality?: HostCriticality | null;
 }
 
 export interface InventoryScan {
@@ -558,6 +664,8 @@ export interface InventoryScan {
   hosts_found: number;
   hosts_created: number;
   nmap_flags?: string | null;
+  method?: string;
+  snmp_port?: number | null;
   created_at: string;
 }
 
@@ -568,12 +676,59 @@ export interface InventoryScanResult {
   host_id?: number;
   open_ports: number[];
   ports_scanned?: boolean;
+  platform_hint?: string | null;
   is_active: boolean;
   created_at: string;
 }
 
 export interface InventoryScanDetail extends InventoryScan {
   results: InventoryScanResult[];
+}
+
+export interface DirectorySource {
+  id: number;
+  name: string;
+  server: string;
+  port: number;
+  use_ssl: boolean;
+  start_tls: boolean;
+  verify_tls: boolean;
+  base_dn: string;
+  bind_dn: string;
+  enabled_only: boolean;
+  map_ou_to_site: boolean;
+  is_active: boolean;
+  has_bind_password: boolean;
+  created_at: string;
+}
+
+export interface DirectorySourceInput {
+  name: string;
+  server: string;
+  port: number;
+  use_ssl: boolean;
+  start_tls: boolean;
+  verify_tls: boolean;
+  base_dn: string;
+  bind_dn: string;
+  bind_password?: string;
+  enabled_only: boolean;
+  map_ou_to_site: boolean;
+  is_active: boolean;
+}
+
+export interface DirectorySync {
+  id: number;
+  source_id: number;
+  status: string;
+  hosts_found: number;
+  hosts_created: number;
+  hosts_updated: number;
+  hosts_matched: number;
+  error_message?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  created_at: string;
 }
 
 export type WebhookEventKey = "run_completed" | "run_failed" | "run_stale" | "dispatch_failed";
@@ -638,6 +793,7 @@ export interface JobRun {
   started_at?: string;
   finished_at?: string;
   error_message?: string;
+  check_mode?: boolean;
 }
 
 export interface CheckResult {
@@ -661,6 +817,7 @@ export interface ComplianceWaiver {
   host_id?: number | null;
   job_id?: number | null;
   reason: string;
+  change_ticket?: string | null;
   status: WaiverStatus;
   requested_by: string;
   approved_by?: string | null;
@@ -673,6 +830,11 @@ export interface ComplianceWaiver {
   owner_sub?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface WaiversBulkActionResult {
+  succeeded: number[];
+  failed: Array<{ waiver_id: number; message: string; code?: string | null }>;
 }
 
 export type PlaybookConnectionMode = "auto" | "ssh" | "paramiko" | "winrm";
@@ -698,6 +860,7 @@ export interface PlaybookRun {
   created_at: string;
   host_count: number;
   host_ids?: number[];
+  check_mode?: boolean;
 }
 
 export interface JobRunDetail extends JobRun {
@@ -753,6 +916,9 @@ export interface DriftSummary {
   baseline_compliance_percent: number;
   current_compliance_percent: number;
   compliance_delta: number;
+  baseline_failed?: number;
+  closed_failed?: number;
+  closed_fail_percent?: number | null;
 }
 
 export interface DriftReport {
@@ -782,6 +948,9 @@ export interface DiffSummary {
   left_compliance_percent: number;
   right_compliance_percent: number;
   compliance_delta: number;
+  baseline_failed?: number;
+  closed_failed?: number;
+  closed_fail_percent?: number | null;
 }
 
 export interface DiffReport {
@@ -1030,7 +1199,7 @@ export interface SearchResponse {
 }
 
 export const api = {
-  health: () => request<{ status: string; app_name: string; demo_mode?: boolean }>("/health"),
+  health: () => request<{ status: string; app_name: string }>("/health"),
   categories: () => request<Category[]>("/categories"),
   search: (params: { q: string; limit?: number; per_type?: number }) =>
     request<SearchResponse>(`/search${buildQuery(params)}`),
@@ -1217,6 +1386,7 @@ export const api = {
     key_passphrase?: string;
     service_username?: string;
     service_secret?: string;
+    snmp_priv_protocol?: string | null;
     description?: string;
   }) => request<Credential>("/credentials", { method: "POST", body: JSON.stringify(data) }),
   deleteCredential: (id: number) => request<void>(`/credentials/${id}`, { method: "DELETE" }),
@@ -1230,6 +1400,7 @@ export const api = {
       key_passphrase?: string;
       service_username?: string;
       service_secret?: string;
+      snmp_priv_protocol?: string | null;
       description?: string;
     }
   ) => request<Credential>(`/credentials/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
@@ -1253,6 +1424,26 @@ export const api = {
     }
   ) => request<PlatformUser>(`/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   deleteUser: (id: number) => request<void>(`/users/${id}`, { method: "DELETE" }),
+  apiKeys: () => request<ApiKey[]>("/api-keys"),
+  createApiKey: (data: {
+    name: string;
+    scopes: ApiKeyScope[];
+    expires_at?: string | null;
+  }) => request<ApiKeyCreated>("/api-keys", { method: "POST", body: JSON.stringify(data) }),
+  updateApiKey: (
+    id: number,
+    data: {
+      name?: string;
+      scopes?: ApiKeyScope[];
+      expires_at?: string | null;
+      is_active?: boolean;
+    }
+  ) => request<ApiKey>(`/api-keys/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+  rotateApiKey: (id: number) =>
+    request<ApiKeyCreated>(`/api-keys/${id}/rotate`, { method: "POST" }),
+  revokeApiKey: (id: number) =>
+    request<ApiKey>(`/api-keys/${id}/revoke`, { method: "POST" }),
+  deleteApiKey: (id: number) => request<void>(`/api-keys/${id}`, { method: "DELETE" }),
   notificationChannels: () => request<NotificationChannel[]>("/notifications"),
   createNotificationChannel: (data: {
     name: string;
@@ -1308,15 +1499,59 @@ export const api = {
     ),
   localLogin: (username: string, password: string) =>
     request<{
+      access_token?: string | null;
+      refresh_token?: string | null;
+      token_type: string;
+      username: string;
+      expires_in?: number | null;
+      mfa_required?: boolean;
+      mfa_token?: string | null;
+    }>("/auth/local", {
+      method: "POST",
+      body: JSON.stringify({ username, password }),
+    }),
+  verifyMfa: (mfaToken: string, code: string) =>
+    request<{
       access_token: string;
       refresh_token: string;
       token_type: string;
       username: string;
       expires_in: number;
-    }>("/auth/local", {
+      mfa_required?: boolean;
+    }>("/auth/mfa/verify", {
       method: "POST",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ mfa_token: mfaToken, code }),
     }),
+  mfaStatus: () =>
+    request<{ enabled: boolean; recovery_codes_remaining: number }>("/auth/mfa/status"),
+  mfaSetup: () => request<{ secret: string; otpauth_uri: string }>("/auth/mfa/setup", { method: "POST" }),
+  mfaConfirm: (code: string) =>
+    request<{ enabled: boolean; recovery_codes: string[] }>("/auth/mfa/confirm", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    }),
+  mfaDisable: (password: string, code: string) =>
+    request<void>("/auth/mfa/disable", {
+      method: "POST",
+      body: JSON.stringify({ password, code }),
+    }),
+  resetUserMfa: (id: number) =>
+    request<PlatformUser>(`/users/${id}/mfa/reset`, { method: "POST" }),
+  scanLimits: () =>
+    request<{ max_cidr_prefix_len: number; max_targets: number }>("/inventory/scan-limits"),
+  demoLogin: () =>
+    request<{
+      access_token: string;
+      refresh_token: string;
+      token_type: string;
+      username: string;
+      expires_in: number;
+    }>("/auth/demo", {
+      method: "POST",
+      body: "{}",
+    }),
+  demoLogout: () => request<void>("/auth/demo/logout", { method: "POST" }),
+  logout: () => request<void>("/auth/logout", { method: "POST" }),
   refreshLocalToken: (refresh_token: string) =>
     request<{
       access_token: string;
@@ -1348,10 +1583,19 @@ export const api = {
         platform: params?.platform,
       })}`
     ),
-  runPlaybook: (playbookId: number, hostIds: number[], connectionMode: PlaybookConnectionMode = "auto") =>
+  runPlaybook: (
+    playbookId: number,
+    hostIds: number[],
+    connectionMode: PlaybookConnectionMode = "auto",
+    checkMode = false
+  ) =>
     request<PlaybookRun>(`/playbooks/${playbookId}/run`, {
       method: "POST",
-      body: JSON.stringify({ host_ids: hostIds, connection_mode: connectionMode }),
+      body: JSON.stringify({
+        host_ids: hostIds,
+        connection_mode: connectionMode,
+        check_mode: checkMode,
+      }),
     }),
   createPlaybook: (data: {
     name: string;
@@ -1387,6 +1631,14 @@ export const api = {
   hostTags: () => request<{ id: number; name: string; created_at: string }[]>("/hosts/tags"),
   setHostTags: (hostId: number, tagNames: string[]) =>
     request<Host>(`/hosts/${hostId}/tags`, { method: "PUT", body: JSON.stringify({ tag_names: tagNames }) }),
+  importHostsCsv: (file: File, apply = false) => {
+    const body = new FormData();
+    body.append("file", file);
+    return request<HostCsvImportResult>(
+      `/hosts/import/csv${buildQuery({ apply: apply ? "true" : undefined })}`,
+      { method: "POST", body }
+    );
+  },
   createHost: (data: Omit<Host, "id">) =>
     request<Host>("/hosts", { method: "POST", body: JSON.stringify(data) }),
   updateHost: (id: number, data: Partial<Omit<Host, "id">>) =>
@@ -1409,13 +1661,45 @@ export const api = {
       { method: "POST", body: JSON.stringify({ host_ids: hostIds }) }
     ),
   inventoryScans: () => request<InventoryScan[]>("/inventory/scans"),
-  startInventoryScan: (data: { target: string; nmap_flags?: string }) =>
+  startInventoryScan: (data: {
+    target: string;
+    method?: "nmap" | "snmp";
+    nmap_flags?: string;
+    credential_id?: number;
+    snmp_port?: number;
+  }) =>
     request<InventoryScan>("/inventory/scans", { method: "POST", body: JSON.stringify(data) }),
   getInventoryScan: (scanId: number) => request<InventoryScanDetail>(`/inventory/scans/${scanId}`),
   deleteInventoryScan: (scanId: number) =>
     request<void>(`/inventory/scans/${scanId}`, { method: "DELETE" }),
   stopInventoryScan: (scanId: number) =>
     request<InventoryScan>(`/inventory/scans/${scanId}/stop`, { method: "POST" }),
+  directorySources: () => request<DirectorySource[]>("/directory/sources"),
+  createDirectorySource: (data: DirectorySourceInput) =>
+    request<DirectorySource>("/directory/sources", { method: "POST", body: JSON.stringify(data) }),
+  updateDirectorySource: (id: number, data: Partial<DirectorySourceInput>) =>
+    request<DirectorySource>(`/directory/sources/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+  deleteDirectorySource: (id: number) =>
+    request<void>(`/directory/sources/${id}`, { method: "DELETE" }),
+  testDirectorySource: (data: {
+    server: string;
+    port: number;
+    use_ssl: boolean;
+    start_tls: boolean;
+    verify_tls: boolean;
+    base_dn: string;
+    bind_dn: string;
+    bind_password?: string;
+    enabled_only: boolean;
+    source_id?: number;
+  }) =>
+    request<{ computers: number; sample: string[]; truncated: boolean }>("/directory/sources/test", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  directorySyncs: () => request<DirectorySync[]>("/directory/syncs"),
+  startDirectorySync: (sourceId: number) =>
+    request<DirectorySync>(`/directory/sources/${sourceId}/sync`, { method: "POST" }),
   jobs: (scope?: OperationsScope) =>
     request<Job[]>(`/jobs${scope ? buildQuery({ scope }) : ""}`),
   createJob: (data: {
@@ -1578,6 +1862,12 @@ export const api = {
       `/reports/runs/${runId}/report.csv${buildQuery(filters)}`,
       `report-${runId}.csv`
     ),
+  downloadReportPack: (runId: number, locale = "en") =>
+    downloadFile(
+      `/reports/runs/${runId}/report.pack.zip?locale=${encodeURIComponent(locale)}`,
+      `report-${runId}-pack.zip`,
+      locale
+    ),
   downloadRunsCompareCsv: (runIds: number[]) =>
     downloadFile(
       `/reports/compare.csv${buildQuery({ run_ids: runIds.join(",") })}`,
@@ -1608,15 +1898,35 @@ export const api = {
     host_id?: number | null;
     job_id?: number | null;
     reason: string;
+    change_ticket?: string | null;
     expires_at?: string | null;
     auto_approve?: boolean;
   }) => request<ComplianceWaiver>("/waivers", { method: "POST", body: JSON.stringify(data) }),
-  approveWaiver: (id: number) =>
-    request<ComplianceWaiver>(`/waivers/${id}/approve`, { method: "POST" }),
+  approveWaiver: (id: number, changeTicket?: string | null) =>
+    request<ComplianceWaiver>(`/waivers/${id}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ change_ticket: changeTicket?.trim() || null }),
+    }),
   rejectWaiver: (id: number, reason?: string) =>
     request<ComplianceWaiver>(`/waivers/${id}/reject`, {
       method: "POST",
       body: JSON.stringify({ reason: reason ?? null }),
+    }),
+  bulkApproveWaivers: (waiverIds: number[], changeTicket?: string | null) =>
+    request<WaiversBulkActionResult>("/waivers/bulk/approve", {
+      method: "POST",
+      body: JSON.stringify({
+        waiver_ids: waiverIds,
+        change_ticket: changeTicket?.trim() || null,
+      }),
+    }),
+  bulkRejectWaivers: (waiverIds: number[], reason?: string | null) =>
+    request<WaiversBulkActionResult>("/waivers/bulk/reject", {
+      method: "POST",
+      body: JSON.stringify({
+        waiver_ids: waiverIds,
+        reason: reason?.trim() || null,
+      }),
     }),
   revokeWaiver: (id: number) =>
     request<ComplianceWaiver>(`/waivers/${id}/revoke`, { method: "POST" }),
@@ -1730,7 +2040,55 @@ export const api = {
     }>;
     save_to_inventory?: boolean;
   }) => request<AuditFlowRun>("/audit-flow/runs", { method: "POST", body: JSON.stringify(data) }),
+  listAuditFlowTemplates: () => request<AuditFlowTemplate[]>("/audit-flow/templates"),
+  createAuditFlowTemplate: (data: {
+    name: string;
+    description?: string;
+    targets: string[];
+    credentials: Array<{
+      label?: string;
+      credential_type: "ssh_password" | "ssh_key" | "winrm";
+      username: string;
+      secret: string;
+      key_passphrase?: string;
+      service_username?: string;
+      service_secret?: string;
+    }>;
+    save_to_inventory?: boolean;
+    cron_expression?: string;
+    is_scheduled?: boolean;
+    is_active?: boolean;
+  }) => request<AuditFlowTemplate>("/audit-flow/templates", { method: "POST", body: JSON.stringify(data) }),
+  updateAuditFlowTemplate: (
+    id: number,
+    data: {
+      name?: string;
+      description?: string;
+      targets?: string[];
+      credentials?: Array<{
+        label?: string;
+        credential_type: "ssh_password" | "ssh_key" | "winrm";
+        username: string;
+        secret: string;
+        key_passphrase?: string;
+        service_username?: string;
+        service_secret?: string;
+      }>;
+      save_to_inventory?: boolean;
+      cron_expression?: string | null;
+      is_scheduled?: boolean;
+      is_active?: boolean;
+    }
+  ) => request<AuditFlowTemplate>(`/audit-flow/templates/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+  deleteAuditFlowTemplate: (id: number) =>
+    request<void>(`/audit-flow/templates/${id}`, { method: "DELETE" }),
+  runAuditFlowTemplate: (id: number) =>
+    request<AuditFlowRun>(`/audit-flow/templates/${id}/run`, { method: "POST" }),
   getAuditFlowRun: (id: number) => request<AuditFlowRun>(`/audit-flow/runs/${id}`),
+  compareAuditFlowRuns: (leftRunId: number, rightRunId: number) =>
+    request<AuditFlowInventoryDriftReport>(
+      `/audit-flow/runs/compare?left_run_id=${leftRunId}&right_run_id=${rightRunId}`
+    ),
   getAuditFlowLogs: (id: number) => request<AuditFlowLogEntry[]>(`/audit-flow/runs/${id}/logs`),
   cancelAuditFlowRun: (id: number) =>
     request<AuditFlowRun>(`/audit-flow/runs/${id}/cancel`, { method: "POST" }),
@@ -1739,8 +2097,8 @@ export const api = {
     hosts: Array<{
       id: number;
       selected?: boolean;
-      profile_id?: number;
-      credential_id?: number;
+      profile_id?: number | null;
+      credential_id?: number | null;
       extra_profiles?: Array<{ profile_id: number; selected: boolean }>;
     }>
   ) =>

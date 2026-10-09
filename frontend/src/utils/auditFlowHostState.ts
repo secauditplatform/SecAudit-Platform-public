@@ -50,9 +50,9 @@ export function applyAuditFlowHostPatch(
   payload: {
     id: number;
     selected?: boolean;
-    profile_id?: number;
-    credential_id?: number;
-    profile_name?: string;
+    profile_id?: number | null;
+    credential_id?: number | null;
+    profile_name?: string | null;
   }
 ): AuditFlowRun {
   return {
@@ -76,17 +76,33 @@ export function applyAuditFlowHostPatch(
       }
 
       if (payload.profile_id !== undefined) {
-        next.profile_id = payload.profile_id;
-        next.profile_name = payload.profile_name ?? host.profile_name;
-        next.confidence = 100;
-        next.selected = true;
-        next = clearRetryableSkip(next);
+        if (payload.profile_id === null) {
+          next.profile_id = null;
+          next.profile_name = null;
+          next.confidence = 0;
+          if (!host.job_run_id) {
+            next.selected = false;
+            next.skip_reason = "skipped_by_user";
+            next.skip_detail = "Not selected for compliance";
+          }
+        } else {
+          next.profile_id = payload.profile_id;
+          next.profile_name = payload.profile_name ?? host.profile_name;
+          next.confidence = 100;
+          next.selected = true;
+          next = clearRetryableSkip(next);
+        }
       }
 
       if (payload.credential_id !== undefined) {
-        next.credential_id = payload.credential_id;
-        next.selected = true;
-        next = clearRetryableSkip(next);
+        if (payload.credential_id === null) {
+          next.credential_id = null;
+          next.credential_label = null;
+        } else {
+          next.credential_id = payload.credential_id;
+          next.selected = true;
+          next = clearRetryableSkip(next);
+        }
       }
 
       return next;

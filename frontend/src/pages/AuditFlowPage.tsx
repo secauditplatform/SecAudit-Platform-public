@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { api, type AuditFlowHost, type AuditFlowRun, type Profile } from "../api/client";
+import { api, type AuditFlowHost, type AuditFlowInventoryChange, type AuditFlowRun, type Profile } from "../api/client";
 import { AuditFlowLogs } from "../components/AuditFlowLogs";
+import { AuditFlowInventoryImport } from "../components/AuditFlowInventoryImport";
+import { AuditFlowTemplatesPanel } from "../components/AuditFlowTemplatesPanel";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { useConfirm } from "../components/ui/ConfirmDialog";
@@ -10,6 +12,7 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { IconCredentials, IconHosts, IconNetwork, IconReports, IconTrash } from "../components/ui/Icons";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Panel } from "../components/ui/Panel";
+import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
 import { useTranslation } from "../i18n/I18nProvider";
 import { useAuth } from "../auth/AuthProvider";
@@ -184,9 +187,52 @@ function getTargetTypeLabel(type: ReturnType<typeof detectTargetType>, t: (key: 
   }
 }
 
+function DriftTransition({ from, to, fallback }: { from?: string | null; to?: string | null; fallback?: string | null }) {
+  const left = (from ?? "").trim();
+  const right = (to ?? "").trim();
+  // Only show a transition when both sides have real values and differ.
+  if (left && right && left !== right) {
+    return (
+      <div className="pf-af-drift__transition">
+        <span className="pf-af-drift__chip pf-af-drift__chip--was" title={left}>
+          {left}
+        </span>
+        <span className="pf-af-drift__transition-arrow" aria-hidden>
+          →
+        </span>
+        <span className="pf-af-drift__chip pf-af-drift__chip--now" title={right}>
+          {right}
+        </span>
+      </div>
+    );
+  }
+  const value = right || left || (fallback ?? "").trim() || "—";
+  return (
+    <span className={`pf-af-drift__value${value === "—" ? " is-empty" : ""}`} title={value === "—" ? undefined : value}>
+      {value}
+    </span>
+  );
+}
+
+const INVENTORY_DRIFT_METRICS: AuditFlowInventoryChange[] = [
+  "appeared",
+  "disappeared",
+  "changed",
+  "unchanged",
+];
+
 export function AuditFlowPage() {
   const { t } = useTranslation();
   const { canExecute } = useAuth();
+  const scanLimits = useQuery({
+    queryKey: ["scan-limits"],
+    queryFn: () => api.scanLimits(),
+    staleTime: 60_000,
+  });
+  const targetsHint = t("auditFlow.targetsHint", {
+    maxPrefix: scanLimits.data?.max_cidr_prefix_len ?? 20,
+    maxTargets: scanLimits.data?.max_targets ?? 16,
+  });
   const toast = useToast();
   const { confirm } = useConfirm();
   const queryClient = useQueryClient();
@@ -196,6 +242,10 @@ export function AuditFlowPage() {
   const [saveToInventory, setSaveToInventory] = useState(false);
   const [viewedStep, setViewedStep] = useState<"setup" | "scan" | null>(null);
   const [activeId, setActiveId] = useState<number | null>(null);
+  const [compareBaselineId, setCompareBaselineId] = useState<number | null>(null);
+  const [inventoryChangeFilter, setInventoryChangeFilter] = useState<AuditFlowInventoryChange | "changes">(
+    "changes"
+  );
   const [addingCredHostId, setAddingCredHostId] = useState<number | null>(null);
   const [hostCred, setHostCred] = useState<CredDraft>(emptyCred);
 
@@ -222,6 +272,56 @@ export function AuditFlowPage() {
   });
 
   const run = runQuery.data;
+  const compareCandidates = useMemo(() => {
+    const items = runsQuery.data ?? [];
+    if (activeId == null) return [];
+    const current = items.find((item) => item.id === activeId);
+    return items.filter((item) => {
+      if (item.id === activeId) return false;
+      if (!["ready", "completed", "failed", "cancelled"].includes(item.status)) return false;
+      if (current?.template_id != null && item.template_id === current.template_id) return true;
+      return true;
+    });
+  }, [runsQuery.data, activeId]);
+
+  useEffect(() => {
+    if (activeId == null) {
+      setCompareBaselineId(null);
+      return;
+    }
+    const preferred =
+      compareCandidates.find((item) => {
+        const current = (runsQuery.data ?? []).find((row) => row.id === activeId);
+        return current?.template_id != null && item.template_id === current.template_id;
+      }) ?? compareCandidates[0] ?? null;
+    setCompareBaselineId((prev) => {
+      if (prev != null && compareCandidates.some((item) => item.id === prev)) return prev;
+      return preferred?.id ?? null;
+    });
+  }, [activeId, compareCandidates, runsQuery.data]);
+
+  const inventoryDriftQuery = useQuery({
+    queryKey: ["audit-flow-compare", compareBaselineId, activeId],
+    queryFn: () => api.compareAuditFlowRuns(compareBaselineId!, activeId!),
+    enabled:
+      activeId != null &&
+      compareBaselineId != null &&
+      activeId !== compareBaselineId &&
+      ["ready", "completed", "failed", "cancelled"].includes(run?.status ?? ""),
+  });
+
+  useEffect(() => {
+    setInventoryChangeFilter("changes");
+  }, [activeId, compareBaselineId]);
+
+  const inventoryDriftRows = useMemo(() => {
+    const items = inventoryDriftQuery.data?.items ?? [];
+    if (inventoryChangeFilter === "changes") {
+      return items.filter((item) => item.change !== "unchanged");
+    }
+    return items.filter((item) => item.change === inventoryChangeFilter);
+  }, [inventoryDriftQuery.data, inventoryChangeFilter]);
+
   useEffect(() => {
     setViewedStep(null);
   }, [activeId, run?.status]);
@@ -282,8 +382,8 @@ export function AuditFlowPage() {
     mutationFn: (payload: {
       id: number;
       selected?: boolean;
-      profile_id?: number;
-      credential_id?: number;
+      profile_id?: number | null;
+      credential_id?: number | null;
       extra_profiles?: Array<{ profile_id: number; selected: boolean }>;
     }) => api.patchAuditFlowHosts(activeId!, [payload]),
     onMutate: async (payload) => {
@@ -291,12 +391,20 @@ export function AuditFlowPage() {
       await queryClient.cancelQueries({ queryKey: ["audit-flow-run", activeId] });
       const previous = queryClient.getQueryData<AuditFlowRun>(["audit-flow-run", activeId]);
       if (previous) {
-        const patch = { ...payload };
+        const patch: {
+          id: number;
+          selected?: boolean;
+          profile_id?: number | null;
+          credential_id?: number | null;
+          profile_name?: string | null;
+        } = { ...payload };
         if (payload.profile_id) {
           const profile = profilesQuery.data?.find((item) => item.id === payload.profile_id);
           if (profile) {
             patch.profile_name = profile.profile_name;
           }
+        } else if (payload.profile_id === null) {
+          patch.profile_name = null;
         }
         queryClient.setQueryData(["audit-flow-run", activeId], applyAuditFlowHostPatch(previous, patch));
       }
@@ -683,7 +791,7 @@ export function AuditFlowPage() {
                         })}
                       </span>
                     </div>
-                    <p className="pf-audit-flow-block__hint">{t("auditFlow.targetsHint")}</p>
+                    <p className="pf-audit-flow-block__hint">{targetsHint}</p>
                   </div>
                   <div className="pf-audit-flow-targets-toolbar">
                     <div className="pf-audit-flow-targets-toolbar__modes" role="group">
@@ -844,6 +952,31 @@ export function AuditFlowPage() {
                     </span>
                   </button>
                 </div>
+
+                <AuditFlowInventoryImport
+                  currentTargets={targets}
+                  onImport={(nextTargets, summary) => {
+                    setTargets(nextTargets);
+                    setTargetMode("list");
+                    if (summary.added === 0 && summary.skipped === 0) {
+                      toast.error(t("auditFlow.importNothing"));
+                      return;
+                    }
+                    if (summary.added > 0) {
+                      toast.success(
+                        t("auditFlow.importDone", {
+                          added: summary.added,
+                          skipped: summary.skipped,
+                        })
+                      );
+                    } else {
+                      toast.error(t("auditFlow.importAllSkipped", { skipped: summary.skipped }));
+                    }
+                    if (summary.truncated) {
+                      toast.error(t("auditFlow.importTruncated"));
+                    }
+                  }}
+                />
               </section>
 
               <section className="pf-audit-flow-block">
@@ -1093,7 +1226,7 @@ export function AuditFlowPage() {
                   </span>
                   <div className="pf-audit-flow-block__copy">
                     <h3 className="pf-audit-flow-block__title">{t("auditFlow.scanTargets")}</h3>
-                    <p className="pf-audit-flow-block__hint">{t("auditFlow.targetsHint")}</p>
+                    <p className="pf-audit-flow-block__hint">{targetsHint}</p>
                   </div>
                 </header>
                 <ul className="pf-audit-flow-targets">
@@ -1364,8 +1497,13 @@ export function AuditFlowPage() {
                                     className="pf-select"
                                     value={host.profile_id ?? ""}
                                     onChange={(e) => {
-                                      const profileId = Number(e.target.value);
-                                      if (!profileId) return;
+                                      const raw = e.target.value;
+                                      if (!raw) {
+                                        patchMutation.mutate({ id: host.id, profile_id: null });
+                                        return;
+                                      }
+                                      const profileId = Number(raw);
+                                      if (!Number.isFinite(profileId) || profileId <= 0) return;
                                       patchMutation.mutate({ id: host.id, profile_id: profileId });
                                     }}
                                   >
@@ -1429,6 +1567,38 @@ export function AuditFlowPage() {
                                     {t("auditFlow.matchValue", { percent: host.confidence })}
                                   </span>
                                 ) : null}
+                                {(host.match_hints?.length ?? 0) > 0 ? (
+                                  <details className="pf-audit-flow-hints">
+                                    <summary>{t("auditFlow.matchWhy")}</summary>
+                                    <ul className="pf-audit-flow-hints__list">
+                                      {host.match_hints!.map((hint, index) => (
+                                        <li key={`${hint.code}-${hint.detail}-${index}`}>
+                                          {hint.code === "family_rejected"
+                                            ? t("auditFlow.hintFamilyRejected", { family: hint.detail })
+                                            : hint.code === "detected_family"
+                                              ? t("auditFlow.hintDetectedFamily", { family: hint.detail })
+                                              : hint.code === "detected_version"
+                                                ? t("auditFlow.hintDetectedVersion", { version: hint.detail })
+                                                : hint.code === "detected_os"
+                                                  ? t("auditFlow.hintDetectedOs", { os: hint.detail })
+                                                  : hint.code === "fingerprint_source"
+                                                    ? t("auditFlow.hintSource", { source: hint.detail })
+                                                    : hint.code === "selected"
+                                                      ? t("auditFlow.hintSelected", {
+                                                          name: hint.detail,
+                                                          percent: hint.confidence ?? host.confidence ?? 0,
+                                                        })
+                                                      : hint.code === "alternative"
+                                                        ? t("auditFlow.hintAlternative", {
+                                                            name: hint.detail,
+                                                            percent: hint.confidence ?? 0,
+                                                          })
+                                                        : hint.detail}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </details>
+                                ) : null}
                               </div>
                             </td>
                             <td>
@@ -1441,8 +1611,13 @@ export function AuditFlowPage() {
                                         value={host.credential_id ?? ""}
                                         disabled={runCredentials.length === 0}
                                         onChange={(e) => {
-                                          const credentialId = Number(e.target.value);
-                                          if (!credentialId) return;
+                                          const raw = e.target.value;
+                                          if (!raw) {
+                                            patchMutation.mutate({ id: host.id, credential_id: null });
+                                            return;
+                                          }
+                                          const credentialId = Number(raw);
+                                          if (!Number.isFinite(credentialId) || credentialId <= 0) return;
                                           patchMutation.mutate({ id: host.id, credential_id: credentialId });
                                         }}
                                       >
@@ -1695,6 +1870,29 @@ export function AuditFlowPage() {
         </Panel>
       )}
 
+      <Panel title={t("auditFlow.templates")}>
+        <AuditFlowTemplatesPanel
+          canManage={canExecute}
+          draftTargets={targets}
+          draftCredentials={creds
+            .filter((c) => c.username.trim() && c.secret.trim())
+            .map((c) => ({
+              label: c.label.trim() || undefined,
+              credential_type: c.credential_type,
+              username: c.username.trim(),
+              secret: c.secret,
+              ...(c.key_passphrase.trim() ? { key_passphrase: c.key_passphrase.trim() } : {}),
+              ...(c.service_username.trim() ? { service_username: c.service_username.trim() } : {}),
+              ...(c.service_secret.trim() ? { service_secret: c.service_secret.trim() } : {}),
+            }))}
+          saveToInventory={saveToInventory}
+          onRunStarted={(created) => {
+            setViewedStep(null);
+            setActiveId(created.id);
+          }}
+        />
+      </Panel>
+
       <Panel title={t("auditFlow.recent")} className="pf-panel--muted">
         {(runsQuery.data ?? []).length === 0 ? (
           <p className="pf-form__hint">{t("auditFlow.noRuns")}</p>
@@ -1734,6 +1932,152 @@ export function AuditFlowPage() {
           </ul>
         )}
       </Panel>
+
+      {activeId != null && compareCandidates.length > 0 ? (
+        <Panel title={t("auditFlow.inventoryDriftTitle")} className="pf-panel--muted pf-af-drift-panel">
+          {inventoryDriftQuery.isLoading ? (
+            <div className="pf-af-drift__loading">
+              <Spinner />
+              <span>{t("common.loading")}</span>
+            </div>
+          ) : null}
+          {inventoryDriftQuery.isError ? (
+            <div className="pf-alert pf-alert--error">{t("auditFlow.inventoryDriftError")}</div>
+          ) : null}
+          {!inventoryDriftQuery.isLoading && !inventoryDriftQuery.isError ? (
+            <div className="pf-af-drift">
+              <div className="pf-af-drift__toolbar">
+                <div className="pf-af-drift__compare">
+                  <label className="pf-af-drift__field" htmlFor="audit-flow-compare-baseline">
+                    <span className="pf-af-drift__field-label">{t("auditFlow.inventoryBaseline")}</span>
+                    <select
+                      id="audit-flow-compare-baseline"
+                      className="pf-select pf-af-drift__select"
+                      value={compareBaselineId ?? ""}
+                      onChange={(event) => {
+                        const value = Number(event.target.value);
+                        setCompareBaselineId(Number.isFinite(value) ? value : null);
+                      }}
+                    >
+                      {compareCandidates.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          #{item.id} · {runStatusLabel(item.status)} ·{" "}
+                          {t("auditFlow.hostsFoundCount", { count: item.hosts_found })}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <span className="pf-af-drift__vs" aria-hidden>
+                    →
+                  </span>
+                  <div className="pf-af-drift__current">
+                    <span className="pf-af-drift__field-label">{t("auditFlow.inventoryCurrent")}</span>
+                    <span className="pf-af-drift__current-id">#{activeId}</span>
+                  </div>
+                </div>
+                {inventoryDriftQuery.data ? (
+                  <span className="pf-af-drift__summary-text">
+                    {t("auditFlow.inventoryHostCounts", {
+                      left: inventoryDriftQuery.data.summary.left_hosts,
+                      right: inventoryDriftQuery.data.summary.right_hosts,
+                    })}
+                  </span>
+                ) : null}
+              </div>
+
+              {inventoryDriftQuery.data ? (
+                <div className="pf-af-drift__frame">
+                  <div
+                    className="pf-af-drift__seg"
+                    role="group"
+                    aria-label={t("auditFlow.inventoryDriftTitle")}
+                  >
+                    {INVENTORY_DRIFT_METRICS.map((change) => {
+                      const count = inventoryDriftQuery.data.summary[change];
+                      return (
+                        <button
+                          key={change}
+                          type="button"
+                          className={`pf-af-drift__seg-btn pf-af-drift__seg-btn--${change}${
+                            inventoryChangeFilter === change ? " is-active" : ""
+                          }${count === 0 ? " is-empty" : ""}`}
+                          onClick={() =>
+                            setInventoryChangeFilter((prev) => (prev === change ? "changes" : change))
+                          }
+                          aria-pressed={inventoryChangeFilter === change}
+                        >
+                          <strong className="pf-af-drift__seg-count">{count}</strong>
+                          <span className="pf-af-drift__seg-label">{t(`auditFlow.inventory.${change}`)}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {inventoryDriftRows.length > 0 ? (
+                    <div className="pf-af-drift__table-wrap">
+                      <table className="pf-table pf-af-drift__table">
+                        <thead>
+                          <tr>
+                            <th className="pf-af-drift__col-change">{t("auditFlow.inventoryChange")}</th>
+                            <th className="pf-af-drift__col-ip">{t("auditFlow.ip")}</th>
+                            <th>{t("auditFlow.os")}</th>
+                            <th>{t("auditFlow.profile")}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {inventoryDriftRows.map((item) => (
+                            <tr
+                              key={`${item.change}-${item.ip_address}-${item.ssh_host_key_fingerprint ?? ""}`}
+                            >
+                              <td>
+                                <span className={`pf-af-drift__badge pf-af-drift__badge--${item.change}`}>
+                                  {t(`auditFlow.inventory.${item.change}`)}
+                                </span>
+                              </td>
+                              <td>
+                                <div className="pf-af-drift__host">
+                                  <code className="pf-af-drift__ip">{item.ip_address}</code>
+                                  {item.hostname ? (
+                                    <span className="pf-af-drift__hostname">{item.hostname}</span>
+                                  ) : null}
+                                </div>
+                              </td>
+                              <td>
+                                {item.change === "changed" ? (
+                                  <DriftTransition
+                                    from={item.left_os_guess}
+                                    to={item.right_os_guess}
+                                    fallback={item.os_guess}
+                                  />
+                                ) : (
+                                  <span className="pf-af-drift__value">{item.os_guess || "—"}</span>
+                                )}
+                              </td>
+                              <td>
+                                {item.change === "changed" ? (
+                                  <DriftTransition
+                                    from={item.left_profile_name}
+                                    to={item.right_profile_name}
+                                    fallback={item.profile_name}
+                                  />
+                                ) : (
+                                  <span className="pf-af-drift__value">{item.profile_name || "—"}</span>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <div className="pf-af-drift__empty">{t("auditFlow.inventoryDriftEmpty")}</div>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </Panel>
+      ) : null}
     </div>
   );
 }

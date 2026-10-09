@@ -16,19 +16,26 @@ import { Spinner } from "./ui/Spinner";
 import { useToast } from "./ui/Toast";
 import { useTranslation } from "../i18n/I18nProvider";
 
+type UiChannelType = "email" | "slack" | "telegram";
+
 type ChannelForm = {
   name: string;
-  channel_type: "email" | "slack";
+  channel_type: UiChannelType;
   is_active: boolean;
   events: NotificationEventType[];
   to_addresses: string;
   smtp_host: string;
   smtp_port: string;
   from_address: string;
+  chat_id: string;
   secret: string;
 };
 
-const CHANNEL_TYPES: Array<"email" | "slack"> = ["email", "slack"];
+const CHANNEL_TYPES: UiChannelType[] = ["email", "slack", "telegram"];
+const TELEGRAM_CHAT_ID = /^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$/;
+const TELEGRAM_BOT_TOKEN = /^\d{6,16}:[A-Za-z0-9_-]{30,64}$/;
+const TELEGRAM_BOT_URL =
+  /^https:\/\/api\.telegram\.org\/bot\d{6,16}:[A-Za-z0-9_-]{30,64}(?:\/sendMessage)?\/?$/;
 
 const RUN_EVENTS: NotificationEventType[] = [
   "run_failed",
@@ -48,11 +55,18 @@ const emptyForm = (): ChannelForm => ({
   smtp_host: "",
   smtp_port: "",
   from_address: "",
+  chat_id: "",
   secret: "",
 });
 
-function asUiChannelType(type: NotificationChannelType): "email" | "slack" {
-  return type === "slack" ? "slack" : "email";
+function asUiChannelType(type: NotificationChannelType): UiChannelType {
+  if (type === "slack" || type === "telegram") return type;
+  return "email";
+}
+
+function isTelegramBotToken(value: string): boolean {
+  const text = value.trim();
+  return TELEGRAM_BOT_TOKEN.test(text) || TELEGRAM_BOT_URL.test(text);
 }
 
 function formFromChannel(channel: NotificationChannel): ChannelForm {
@@ -67,6 +81,7 @@ function formFromChannel(channel: NotificationChannel): ChannelForm {
     smtp_host: String(config.smtp_host ?? ""),
     smtp_port: config.smtp_port != null && config.smtp_port !== "" ? String(config.smtp_port) : "",
     from_address: String(config.from_address ?? ""),
+    chat_id: String(config.chat_id ?? ""),
     secret: "",
   };
 }
@@ -81,6 +96,9 @@ function buildPayload(form: ChannelForm) {
     if (form.smtp_host.trim()) config_json.smtp_host = form.smtp_host.trim();
     if (form.smtp_port.trim()) config_json.smtp_port = Number(form.smtp_port.trim());
     if (form.from_address.trim()) config_json.from_address = form.from_address.trim();
+  }
+  if (form.channel_type === "telegram") {
+    config_json.chat_id = form.chat_id.trim();
   }
   return {
     name: form.name.trim(),
@@ -111,7 +129,8 @@ export function NotificationsSettings() {
       ({
         email: t("notifications.typeEmail"),
         slack: t("notifications.typeSlack"),
-      }) satisfies Record<"email" | "slack", string>,
+        telegram: t("notifications.typeTelegram"),
+      }) satisfies Record<UiChannelType, string>,
     [t]
   );
 
@@ -171,12 +190,11 @@ export function NotificationsSettings() {
   });
 
   const isEditing = editingId !== null;
-  const needsWebhookSecret = form.channel_type === "slack";
   const hasChannels = Boolean(channels.data?.length);
   const isSaving = createMutation.isPending || updateMutation.isPending;
   const selectedEventsCount = form.events.length;
 
-  const selectChannelType = (type: "email" | "slack") => {
+  const selectChannelType = (type: UiChannelType) => {
     setForm({
       ...form,
       channel_type: type,
@@ -224,13 +242,33 @@ export function NotificationsSettings() {
       toast.error(t("notifications.eventsRequired"));
       return;
     }
-    if (needsWebhookSecret && !payload.secret && !isEditing) {
+    if (form.channel_type === "slack" && !payload.secret && !isEditing) {
       toast.error(t("notifications.secretRequired"));
       return;
     }
     if (form.channel_type === "email" && !form.to_addresses.trim()) {
       toast.error(t("notifications.recipientsRequired"));
       return;
+    }
+    if (form.channel_type === "telegram") {
+      const chatId = form.chat_id.trim();
+      if (!chatId) {
+        toast.error(t("notifications.chatIdRequired"));
+        return;
+      }
+      if (!TELEGRAM_CHAT_ID.test(chatId)) {
+        toast.error(t("notifications.chatIdInvalid"));
+        return;
+      }
+      if (!form.secret.trim()) {
+        if (!isEditing) {
+          toast.error(t("notifications.botTokenRequired"));
+          return;
+        }
+      } else if (!isTelegramBotToken(form.secret)) {
+        toast.error(t("notifications.botTokenInvalid"));
+        return;
+      }
     }
     if (isEditing && editingId != null) {
       updateMutation.mutate({ id: editingId, data: payload });
@@ -240,8 +278,7 @@ export function NotificationsSettings() {
   };
 
   const typeLabel = (type: NotificationChannelType) => {
-    if (type === "email") return channelTypeLabels.email;
-    if (type === "slack") return channelTypeLabels.slack;
+    if (type === "email" || type === "slack" || type === "telegram") return channelTypeLabels[type];
     return type;
   };
 
@@ -286,7 +323,13 @@ export function NotificationsSettings() {
                     className="pf-input"
                     value={form.name}
                     onChange={(e) => setForm({ ...form, name: e.target.value })}
-                    placeholder={form.channel_type === "slack" ? "ops-slack" : "ops-email"}
+                    placeholder={
+                      form.channel_type === "slack"
+                        ? "ops-slack"
+                        : form.channel_type === "telegram"
+                          ? "ops-telegram"
+                          : "ops-email"
+                    }
                     disabled={isSaving}
                   />
                 </div>
@@ -323,11 +366,7 @@ export function NotificationsSettings() {
 
               <section className="pf-notify-block pf-notify-block--delivery">
               <div className="pf-notify-block__head">
-                <h5 className="pf-notify-block__title">
-                  {form.channel_type === "email"
-                    ? t("notifications.typeEmail")
-                    : t("notifications.typeSlack")}
-                </h5>
+                <h5 className="pf-notify-block__title">{channelTypeLabels[form.channel_type]}</h5>
                 {form.channel_type === "email" ? (
                   <p className="pf-notify-block__desc">{t("notifications.smtpHint")}</p>
                 ) : null}
@@ -406,6 +445,32 @@ export function NotificationsSettings() {
                       </div>
                     </div>
                   ) : null}
+                </>
+              ) : form.channel_type === "telegram" ? (
+                <>
+                  <div className="pf-form__group">
+                    <label htmlFor="settings-channel-chat-id">{t("notifications.chatId")}</label>
+                    <input
+                      id="settings-channel-chat-id"
+                      className="pf-input"
+                      value={form.chat_id}
+                      onChange={(e) => setForm({ ...form, chat_id: e.target.value })}
+                      placeholder="-1001234567890"
+                      disabled={isSaving}
+                    />
+                    <p className="pf-form__hint">{t("notifications.chatIdHint")}</p>
+                  </div>
+                  <div className="pf-form__group">
+                    <label htmlFor="settings-channel-secret">{t("notifications.botToken")}</label>
+                    <PasswordInput
+                      id="settings-channel-secret"
+                      value={form.secret}
+                      onChange={(e) => setForm({ ...form, secret: e.target.value })}
+                      placeholder={isEditing ? t("notifications.keepSecretEmpty") : "123456789:AAH..."}
+                      disabled={isSaving}
+                    />
+                    <p className="pf-form__hint">{t("notifications.telegramHint")}</p>
+                  </div>
                 </>
               ) : (
                 <div className="pf-form__group">

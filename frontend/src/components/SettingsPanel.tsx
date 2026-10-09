@@ -4,6 +4,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { useTranslation } from "../i18n/I18nProvider";
 import { useTheme, type ThemePreference } from "../theme/ThemeProvider";
 import { LanguagePicker } from "./LanguagePicker";
+import { MfaSettings } from "./MfaSettings";
 import { NotificationsSettings } from "./NotificationsSettings";
 import {
   IconBell,
@@ -216,6 +217,8 @@ export function SettingsPanel() {
                           })}
                         </div>
                       </section>
+
+                      <MfaSettings />
                     </div>
                   </div>
 

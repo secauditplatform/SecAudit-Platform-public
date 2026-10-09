@@ -23,7 +23,7 @@ function isActiveRunStatus(status: string | null | undefined): boolean {
 export function JobRunLogs({ runId, runStatus }: JobRunLogsProps) {
   const { t } = useTranslation();
   const { token, ready, authenticated } = useAuth();
-  const authEnabled = import.meta.env.VITE_AUTH_ENABLED === "true";
+  const authEnabled = import.meta.env.VITE_AUTH_ENABLED !== "false";
   const canLoad = Boolean(runId && ready && (!authEnabled || (authenticated && token)));
 
   const [liveEntries, setLiveEntries] = useState<JobRunLogEntry[]>([]);

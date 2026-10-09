@@ -1,0 +1,164 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "secaudit.fullname" . }}-default-deny
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "secaudit.fullname" . }}-frontend
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "secaudit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: frontend
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.frontend.service.port }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "secaudit.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.port }}
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "secaudit.fullname" . }}-api
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "secaudit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "secaudit.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: frontend
+      ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.port }}
+    {{- if .Values.ingress.enabled }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.api.service.port }}
+    {{- end }}
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.externalDatabase.port }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.externalRedis.port }}
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "secaudit.fullname" . }}-worker
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "secaudit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.externalDatabase.port }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.externalRedis.port }}
+    # Target hosts, webhooks, package registries, and IdP.
+    - ports:
+        - protocol: TCP
+          port: 22
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 5985
+        - protocol: TCP
+          port: 5986
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "secaudit.fullname" . }}-beat
+  labels:
+    {{- include "secaudit.labels" . | nindent 4 }}
+    app.kubernetes.io/component: beat
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "secaudit.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: beat
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.externalDatabase.port }}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.externalRedis.port }}
+{{- end }}

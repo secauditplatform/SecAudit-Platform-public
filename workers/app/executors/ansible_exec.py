@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Literal
 
 import ansible_runner
-import yaml
 
-from secaudit_core.playbook_policy import validate_playbook_policy, validate_playbook_text
+from secaudit_core.playbook_security import assert_playbook_local_execution_policy
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.tracing import start_span
 
@@ -151,7 +150,7 @@ def _extract_event_message(event: dict) -> tuple[str, str, str]:
     return host, task, str(msg).strip()
 
 
-def _collect_runner_output(runner: ansible_runner.Runner) -> tuple[str, list[str]]:
+def _collect_runner_output(runner: ansible_runner.Runner, *, check_mode: bool = False) -> tuple[str, list[str]]:
     lines: list[str] = []
     errors: list[str] = []
 
@@ -161,11 +160,14 @@ def _collect_runner_output(runner: ansible_runner.Runner) -> tuple[str, list[str
             continue
         host, task, msg = _extract_event_message(event)
         prefix = f"[{host}] {task}"
+        res = (event.get("event_data") or {}).get("res") or {}
+        changed = bool(res.get("changed"))
         if event_type == "runner_on_ok":
+            label = "WOULD CHANGE" if check_mode and changed else "OK"
             if msg:
-                lines.append(f"OK {prefix}: {msg}")
+                lines.append(f"{label} {prefix}: {msg}")
             else:
-                lines.append(f"OK {prefix}")
+                lines.append(f"{label} {prefix}")
             continue
         if event_type == "runner_on_skipped":
             detail = f": {msg}" if msg else ""
@@ -214,13 +216,45 @@ def _ansible_collections_envvars() -> dict[str, str]:
 
 def _ansible_local_envvars(work_dir: Path) -> dict[str, str]:
     """Overrides for ansible-runner when the process HOME is /nonexistent (Docker worker user)."""
+    ssh_dir = work_dir / ".ssh"
+    ssh_dir.mkdir(parents=True, exist_ok=True)
     local_tmp = work_dir / "ansible-local"
     local_tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        ssh_dir.chmod(0o700)
+    except OSError:
+        pass
     return {
         "HOME": str(work_dir),
         "ANSIBLE_LOCAL_TMP": str(local_tmp),
         **_ansible_collections_envvars(),
     }
+
+
+def normalize_private_key(raw: str) -> str:
+    """Normalize PEM/OpenSSH key text so OpenSSL can load the temp file."""
+    text = str(raw).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def ssh_client_args(*, known_hosts_file: Path, strict: bool) -> str:
+    """Force OpenSSH off /etc/passwd HOME=/nonexistent (worker image)."""
+    checking = "yes" if strict else "no"
+    return (
+        f"-o StrictHostKeyChecking={checking} "
+        "-o GlobalKnownHostsFile=/dev/null "
+        "-o ControlMaster=no "
+        "-o ControlPath=none "
+        "-o IdentitiesOnly=yes "
+        f"-o UserKnownHostsFile={known_hosts_file}"
+    )
+
+
+def _apply_ssh_client_args(host_vars: dict, ssh_args: str) -> None:
+    existing = str(host_vars.get("ansible_ssh_common_args") or "").strip()
+    host_vars["ansible_ssh_common_args"] = f"{existing} {ssh_args}".strip() if existing else ssh_args
 
 
 def run_playbook(
@@ -231,16 +265,19 @@ def run_playbook(
     connection_mode: ConnectionMode = "auto",
     cancel_event=None,
     sidecar_files: dict[str, str | bytes] | None = None,
+    check_mode: bool = False,
 ) -> str:
     """Run Ansible playbook via ansible-runner. Returns combined stdout events.
 
     sidecar_files: optional files written next to playbook.yml (e.g. script module sources).
+    check_mode: pass ansible-playbook --check --diff (report changes, do not apply).
     """
     span_attrs = {
         "secaudit.executor": "ansible",
         "secaudit.hosts": len(inventory_hosts),
         "secaudit.connection_mode": connection_mode,
         "secaudit.sidecar_files": len(sidecar_files or {}),
+        "secaudit.check_mode": check_mode,
     }
     with start_span("executor.ansible", attributes=span_attrs, kind="client"):
         return _run_playbook(
@@ -251,6 +288,7 @@ def run_playbook(
             connection_mode,
             cancel_event=cancel_event,
             sidecar_files=sidecar_files,
+            check_mode=check_mode,
         )
 
 
@@ -262,20 +300,16 @@ def _run_playbook(
     connection_mode: ConnectionMode,
     cancel_event=None,
     sidecar_files: dict[str, str | bytes] | None = None,
+    *,
+    check_mode: bool = False,
 ) -> str:
     from app.cancel_context import get_cancel_event, raise_if_cancelled
 
     cancel_event = cancel_event if cancel_event is not None else get_cancel_event()
     raise_if_cancelled()
 
-    try:
-        validate_playbook_text(playbook_content)
-        loaded = yaml.safe_load(playbook_content)
-        validate_playbook_policy(loaded)
-    except ValueError as exc:
-        raise AnsiblePlaybookError(str(exc)) from exc
-    except yaml.YAMLError as exc:
-        raise AnsiblePlaybookError(f"Invalid playbook YAML: {exc}") from exc
+    # Defense in depth: same local-execution policy as API validate.
+    assert_playbook_local_execution_policy(playbook_content)
 
     settings = SecAuditSettings()
     with tempfile.TemporaryDirectory(prefix="secaudit_ansible_") as tmp:
@@ -301,12 +335,22 @@ def _run_playbook(
         key_file: Path | None = None
         if credentials and credentials.get("private_key"):
             key_file = tmp_path / "id_rsa"
-            key_file.write_text(credentials["private_key"], encoding="utf-8")
+            key_file.write_text(normalize_private_key(str(credentials["private_key"])), encoding="utf-8")
             key_file.chmod(0o600)
 
         inventory = {"all": {"hosts": {}}}
         resolved_modes: list[str] = []
         known_host_entries: list[str] = []
+        known_hosts_file = tmp_path / "known_hosts"
+        known_hosts_file.write_text("", encoding="utf-8")
+        try:
+            known_hosts_file.chmod(0o600)
+        except OSError:
+            pass
+        ssh_args = ssh_client_args(
+            known_hosts_file=known_hosts_file,
+            strict=settings.ssh_strict_host_key_checking_effective,
+        )
         configured_known_hosts = (
             Path(settings.ssh_known_hosts_path)
             if settings.ssh_known_hosts_path
@@ -347,49 +391,73 @@ def _run_playbook(
                     f"Host '{name}' has no stored SSH host key; scan its fingerprint before execution"
                 )
             _apply_connection_settings(host_vars, credentials, mode, key_file)
+            if mode == "ssh":
+                _apply_ssh_client_args(host_vars, ssh_args)
             inventory["all"]["hosts"][name] = host_vars
 
+        try:
+            tmp_path.chmod(0o700)
+        except OSError:
+            pass
         inv_file = tmp_path / "inventory.json"
         inv_file.write_text(json.dumps(inventory), encoding="utf-8")
+        try:
+            inv_file.chmod(0o600)
+        except OSError:
+            pass
 
         envvars: dict[str, str] = {
             **_ansible_local_envvars(tmp_path),
             "ANSIBLE_RETRY_FILES_ENABLED": "False",
             "ANSIBLE_REMOTE_TMP": "/tmp/.ansible/tmp",
         }
+        # Prefer sshpass env so inventory JSON is not the only secret carrier.
+        if credentials and credentials.get("password") and sshpass_available():
+            envvars["SSHPASS"] = str(credentials["password"])
         if settings.ssh_strict_host_key_checking_effective:
-            known_hosts_file = tmp_path / "known_hosts"
             known_hosts_file.write_text(
                 "\n".join(dict.fromkeys(known_host_entries)) + "\n",
                 encoding="utf-8",
             )
-            known_hosts_file.chmod(0o600)
             envvars["ANSIBLE_HOST_KEY_CHECKING"] = "True"
-            envvars["ANSIBLE_SSH_ARGS"] = (
-                f"-o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts_file}"
-            )
         else:
             # Explicitly available only when the effective non-production policy disables trust checks.
             envvars["ANSIBLE_HOST_KEY_CHECKING"] = "False"
+        # Always pin UserKnownHostsFile: OpenSSH uses passwd HOME (/nonexistent), not $HOME.
+        envvars["ANSIBLE_SSH_ARGS"] = ssh_args
         if credentials and credentials.get("username"):
             envvars["ANSIBLE_REMOTE_USER"] = credentials["username"]
 
-        runner = ansible_runner.run(
-            playbook=str(playbook_file),
-            inventory=str(inv_file),
-            extravars=extravars or {},
-            envvars=envvars,
-            quiet=False,
-            ignore_logging=True,
-            cancel_callback=(lambda: bool(cancel_event and cancel_event.is_set()))
-            if cancel_event is not None
-            else None,
-        )
+        try:
+            run_kwargs: dict = {
+                "playbook": str(playbook_file),
+                "inventory": str(inv_file),
+                "extravars": extravars or {},
+                "envvars": envvars,
+                "quiet": False,
+                "ignore_logging": True,
+                "cancel_callback": (
+                    (lambda: bool(cancel_event and cancel_event.is_set()))
+                    if cancel_event is not None
+                    else None
+                ),
+            }
+            if check_mode:
+                run_kwargs["cmdline"] = "--check --diff"
+            runner = ansible_runner.run(**run_kwargs)
+        finally:
+            # Best-effort shred of secrets written for the run.
+            try:
+                if inv_file.exists():
+                    inv_file.write_text("{}\n", encoding="utf-8")
+            except OSError:
+                pass
+            envvars.pop("SSHPASS", None)
 
         if cancel_event and cancel_event.is_set():
             raise InterruptedError("Job run cancelled")
 
-        output, errors = _collect_runner_output(runner)
+        output, errors = _collect_runner_output(runner, check_mode=check_mode)
 
         if runner.status == "failed" or runner.rc not in (None, 0):
             modes = ", ".join(resolved_modes)
@@ -399,5 +467,6 @@ def _run_playbook(
                 output=output,
             )
 
-        header = f"Playbook completed (connection: {', '.join(resolved_modes)})"
+        mode_note = "check mode, no changes applied; " if check_mode else ""
+        header = f"Playbook completed ({mode_note}connection: {', '.join(resolved_modes)})"
         return f"{header}\n{output}".strip() if output else header

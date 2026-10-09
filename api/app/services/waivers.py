@@ -46,7 +46,19 @@ def actor_name(user: AuthUser) -> str:
     return user.username or user.sub or "unknown"
 
 
-def transition_approve(waiver: ComplianceWaiver, user: AuthUser) -> None:
+def _normalize_change_ticket(value: str | None) -> str | None:
+    if value is None:
+        return None
+    ticket = value.strip()
+    return ticket or None
+
+
+def transition_approve(
+    waiver: ComplianceWaiver,
+    user: AuthUser,
+    *,
+    change_ticket: str | None = None,
+) -> None:
     if waiver.status != WaiverStatus.PENDING or not waiver.is_active:
         raise HTTPException(status_code=400, detail="Only pending waivers can be approved")
     if waiver.requested_by == actor_name(user) and not user.has_role(UserRole.ADMIN):
@@ -59,6 +71,9 @@ def transition_approve(waiver: ComplianceWaiver, user: AuthUser) -> None:
     waiver.rejected_at = None
     waiver.rejection_reason = None
     waiver.is_active = True
+    ticket = _normalize_change_ticket(change_ticket)
+    if ticket is not None:
+        waiver.change_ticket = ticket
 
 
 def transition_reject(waiver: ComplianceWaiver, user: AuthUser, reason: str | None) -> None:
@@ -77,6 +92,43 @@ def transition_revoke(waiver: ComplianceWaiver, _user: AuthUser) -> None:
         raise HTTPException(status_code=400, detail="Only approved active waivers can be revoked")
     waiver.status = WaiverStatus.REVOKED
     waiver.is_active = False
+
+
+async def bulk_transition(
+    db: AsyncSession,
+    user: AuthUser,
+    waiver_ids: list[int],
+    *,
+    action: str,
+    change_ticket: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    succeeded: list[int] = []
+    failed: list[dict] = []
+    seen: set[int] = set()
+    for waiver_id in waiver_ids:
+        if waiver_id in seen:
+            continue
+        seen.add(waiver_id)
+        try:
+            waiver = await get_waiver_or_404(db, waiver_id)
+            if action == "approve":
+                transition_approve(waiver, user, change_ticket=change_ticket)
+            elif action == "reject":
+                transition_reject(waiver, user, reason)
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported bulk action: {action}")
+            succeeded.append(waiver_id)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            failed.append(
+                {
+                    "waiver_id": waiver_id,
+                    "message": detail,
+                    "code": str(exc.status_code),
+                }
+            )
+    return {"succeeded": succeeded, "failed": failed}
 
 
 async def list_waivers(

@@ -41,6 +41,7 @@ class PlaybookService:
         playbook: Playbook,
         host_ids: list[int],
         connection_mode: str = "auto",
+        check_mode: bool = False,
     ) -> JobRun:
         if not host_ids:
             raise ValueError("At least one host must be selected")
@@ -56,8 +57,9 @@ class PlaybookService:
             hosts.append(host)
 
         stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
+        mode_tag = " [check]" if check_mode else ""
         job = Job(
-            name=f"{playbook.name} ({stamp})",
+            name=f"{playbook.name}{mode_tag} ({stamp})",
             playbook_id=playbook.id,
             is_active=False,
             is_scheduled=False,
@@ -70,7 +72,7 @@ class PlaybookService:
         for host in hosts:
             db.add(JobHost(job_id=job.id, host_id=host.id))
 
-        job_run = JobRun(job_id=job.id, status=JobStatus.PENDING)
+        job_run = JobRun(job_id=job.id, status=JobStatus.PENDING, check_mode=check_mode)
         db.add(job_run)
         await db.flush()
 
@@ -81,7 +83,7 @@ class PlaybookService:
             queue="compliance",
             callback_kind="job_run",
             callback_ref_id=job_run.id,
-            kwargs={"connection_mode": connection_mode},
+            kwargs={"connection_mode": connection_mode, "check_mode": check_mode},
             correlation={"run_kind": "job", "run_id": job_run.id},
         )
         await commit_and_try_dispatch(db, outbox_id=outbox.id, pending_entity=job_run)
@@ -145,6 +147,7 @@ class PlaybookService:
                     "created_at": run.created_at,
                     "host_count": len(job.job_hosts) if job else 0,
                     "host_ids": [jh.host_id for jh in job.job_hosts] if job else [],
+                    "check_mode": bool(run.check_mode),
                 }
             )
         return payload
@@ -178,6 +181,7 @@ class PlaybookService:
             "created_at": run.created_at,
             "host_count": len(run.job.job_hosts),
             "host_ids": [jh.host_id for jh in run.job.job_hosts],
+            "check_mode": bool(run.check_mode),
         }
 
     async def delete_playbook(self, db: AsyncSession, playbook: Playbook) -> None:

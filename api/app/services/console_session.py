@@ -9,6 +9,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.core.auth import AuthUser
 from app.core.config import settings
+from app.core.demo_operators import is_demo_operator_username
 from app.services.console_command_policy import (
     COMMAND_DENIED_MESSAGE,
     validate_console_command,
@@ -122,7 +123,10 @@ async def _start_allowed_command(
         await _send_prompt(websocket)
         return None, None
 
-    allowed, error = validate_console_command(stripped, demo_mode=settings.demo_mode)
+    allowed, error = validate_console_command(
+        stripped,
+        demo_mode=settings.demo_mode and not is_demo_operator_username(user.username if user else None),
+    )
     if not allowed:
         await websocket.send_text(f"\r\n\x1b[31m{error}\x1b[0m")
         await _send_prompt(websocket)
@@ -304,7 +308,11 @@ async def run_console_session(websocket: WebSocket, *, user: AuthUser | None = N
     command_complete = asyncio.Event()
     command_complete.set()
 
-    await websocket.send_text(WELCOME_DEMO if settings.demo_mode else WELCOME)
+    await websocket.send_text(
+        WELCOME
+        if (not settings.demo_mode or is_demo_operator_username(user.username if user else None))
+        else WELCOME_DEMO
+    )
     await _send_prompt(websocket)
 
     try:

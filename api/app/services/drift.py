@@ -84,6 +84,14 @@ def compare_check_results(
         current_summary.compliance_percent - baseline_summary.compliance_percent, 2
     )
 
+    baseline_failed = sum(
+        1 for check in baseline_checks if _is_fail_or_error(check.status)
+    )
+    closed_failed = counts["improved"]
+    closed_fail_percent = (
+        round((closed_failed / baseline_failed) * 100, 1) if baseline_failed else None
+    )
+
     summary = DriftSummary(
         current_run_id=current_run_id,
         baseline_run_id=baseline_run_id,
@@ -95,6 +103,9 @@ def compare_check_results(
         baseline_compliance_percent=baseline_summary.compliance_percent,
         current_compliance_percent=current_summary.compliance_percent,
         compliance_delta=compliance_delta,
+        baseline_failed=baseline_failed,
+        closed_failed=closed_failed,
+        closed_fail_percent=closed_fail_percent,
     )
     return DriftReport(summary=summary, items=items)
 
@@ -112,6 +123,9 @@ def drift_report_to_diff(drift: DriftReport) -> DiffReport:
         left_compliance_percent=drift.summary.baseline_compliance_percent,
         right_compliance_percent=drift.summary.current_compliance_percent,
         compliance_delta=drift.summary.compliance_delta,
+        baseline_failed=drift.summary.baseline_failed,
+        closed_failed=drift.summary.closed_failed,
+        closed_fail_percent=drift.summary.closed_fail_percent,
     )
     items = [
         DiffRow(

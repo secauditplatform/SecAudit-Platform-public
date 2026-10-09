@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from secaudit_core.egress import validate_public_https_url
 from secaudit_core.enums import NotificationEventType
 from secaudit_core.secrets import encrypt_secret
 
@@ -34,8 +33,7 @@ def apply_webhook_fields(
         job.webhook_events = normalize_webhook_events(webhook_events)
 
     if webhook_url:
-        safe_url = validate_public_https_url(webhook_url.strip(), resolve_dns=True)
-        job.encrypted_webhook_url = encrypt_secret(safe_url, settings)
+        job.encrypted_webhook_url = encrypt_secret(webhook_url.strip(), settings)
     elif clear_webhook_url:
         job.encrypted_webhook_url = None
 

@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
 import { HostSelectionToolbar } from "./HostSelectionToolbar";
 import { Badge } from "./ui/Badge";
-import type { Host } from "../api/client";
+import type { Host, HostCriticality } from "../api/client";
 import { useTranslation } from "../i18n/I18nProvider";
+import { hostCriticalityVariant } from "../utils/statusVariant";
 
 type HostPickerProps = {
   hosts: Host[];
@@ -13,7 +14,21 @@ type HostPickerProps = {
   hint?: string;
 };
 
-function filterHosts(hosts: Host[], filters: { search: string; tags: string }): Host[] {
+type PickerFilters = {
+  search: string;
+  tags: string;
+  site: string;
+  environment: string;
+  criticality: HostCriticality | "all";
+};
+
+function uniqueSorted(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.map((value) => value?.trim()).filter(Boolean) as string[])].sort((a, b) =>
+    a.localeCompare(b)
+  );
+}
+
+function filterHosts(hosts: Host[], filters: PickerFilters): Host[] {
   const search = filters.search.trim().toLowerCase();
   const tagList = filters.tags
     .split(",")
@@ -21,10 +36,24 @@ function filterHosts(hosts: Host[], filters: { search: string; tags: string }): 
     .filter(Boolean);
 
   return hosts.filter((host) => {
+    if (filters.site !== "all" && (host.site ?? "") !== filters.site) return false;
+    if (filters.environment !== "all" && (host.environment ?? "") !== filters.environment) {
+      return false;
+    }
+    if (filters.criticality !== "all" && (host.criticality ?? "") !== filters.criticality) {
+      return false;
+    }
     if (search) {
-      const name = host.name.toLowerCase();
-      const hostname = host.hostname.toLowerCase();
-      if (!name.includes(search) && !hostname.includes(search)) return false;
+      const haystack = [
+        host.name,
+        host.hostname,
+        host.site ?? "",
+        host.environment ?? "",
+        host.criticality ?? "",
+      ]
+        .join(" ")
+        .toLowerCase();
+      if (!haystack.includes(search)) return false;
     }
     if (tagList.length > 0) {
       const hostTags = (host.tags ?? []).map((tag) => tag.toLowerCase());
@@ -45,13 +74,27 @@ export function HostPicker({
   const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [tags, setTags] = useState("");
+  const [site, setSite] = useState("all");
+  const [environment, setEnvironment] = useState("all");
+  const [criticality, setCriticality] = useState<HostCriticality | "all">("all");
 
-  const filteredHosts = useMemo(
-    () => filterHosts(hosts, { search, tags }),
-    [hosts, search, tags]
+  const siteOptions = useMemo(() => uniqueSorted(hosts.map((host) => host.site)), [hosts]);
+  const environmentOptions = useMemo(
+    () => uniqueSorted(hosts.map((host) => host.environment)),
+    [hosts]
   );
 
-  const hasFilters = search.trim() !== "" || tags.trim() !== "";
+  const filteredHosts = useMemo(
+    () => filterHosts(hosts, { search, tags, site, environment, criticality }),
+    [hosts, search, tags, site, environment, criticality]
+  );
+
+  const hasFilters =
+    search.trim() !== "" ||
+    tags.trim() !== "" ||
+    site !== "all" ||
+    environment !== "all" ||
+    criticality !== "all";
 
   if (hosts.length === 0) {
     return <p className="pf-host-picker__empty">{t("jobs.noHosts")}</p>;
@@ -79,6 +122,53 @@ export function HostPicker({
             onChange={(e) => setTags(e.target.value)}
             placeholder={t("jobs.dynamicTags")}
           />
+        </div>
+        <div className="pf-form__group">
+          <label htmlFor="host-picker-site">{t("hosts.site")}</label>
+          <select
+            id="host-picker-site"
+            className="pf-select"
+            value={site}
+            onChange={(e) => setSite(e.target.value)}
+          >
+            <option value="all">{t("hosts.listSiteAll")}</option>
+            {siteOptions.map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="pf-form__group">
+          <label htmlFor="host-picker-environment">{t("hosts.environment")}</label>
+          <select
+            id="host-picker-environment"
+            className="pf-select"
+            value={environment}
+            onChange={(e) => setEnvironment(e.target.value)}
+          >
+            <option value="all">{t("hosts.listEnvironmentAll")}</option>
+            {environmentOptions.map((value) => (
+              <option key={value} value={value}>
+                {value}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="pf-form__group">
+          <label htmlFor="host-picker-criticality">{t("hosts.criticality")}</label>
+          <select
+            id="host-picker-criticality"
+            className="pf-select"
+            value={criticality}
+            onChange={(e) => setCriticality(e.target.value as HostCriticality | "all")}
+          >
+            <option value="all">{t("hosts.listCriticalityAll")}</option>
+            <option value="low">{t("hosts.criticalityLow")}</option>
+            <option value="medium">{t("hosts.criticalityMedium")}</option>
+            <option value="high">{t("hosts.criticalityHigh")}</option>
+            <option value="critical">{t("hosts.criticalityCritical")}</option>
+          </select>
         </div>
       </div>
 
@@ -120,10 +210,31 @@ export function HostPicker({
                     {host.hostname}:{host.port}
                   </span>
                   <span className="pf-host-picker__tags">
-                    {host.os_type && <Badge variant="info">{host.os_type}</Badge>}
-                    <Badge variant={host.is_active ? "success" : "neutral"}>
-                      {host.is_active ? t("common.active") : t("common.inactive")}
-                    </Badge>
+                    <span className="pf-host-picker__tags-row">
+                      {host.os_type ? <Badge variant="info">{host.os_type}</Badge> : null}
+                      <Badge variant={host.is_active ? "success" : "neutral"}>
+                        {host.is_active ? t("common.active") : t("common.inactive")}
+                      </Badge>
+                    </span>
+                    {host.site || host.environment || host.criticality ? (
+                      <span className="pf-host-picker__tags-row">
+                        {host.site ? (
+                          <Badge variant="info" literal>
+                            {host.site}
+                          </Badge>
+                        ) : null}
+                        {host.environment ? (
+                          <Badge variant="info" literal>
+                            {host.environment}
+                          </Badge>
+                        ) : null}
+                        {host.criticality ? (
+                          <Badge variant={hostCriticalityVariant(host.criticality)} literal>
+                            {t(`hosts.criticalityLabel.${host.criticality}`)}
+                          </Badge>
+                        ) : null}
+                      </span>
+                    ) : null}
                   </span>
                 </span>
               </label>

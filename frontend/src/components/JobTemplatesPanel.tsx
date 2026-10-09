@@ -166,7 +166,7 @@ export function JobTemplatesPanel({ canManage, onUseTemplate, onJobCreated }: Jo
 
   const profileLabelById = useMemo(() => {
     const map = new Map<number, string>();
-    profiles.data?.forEach((item) => map.set(item.id, item.label));
+    profiles.data?.forEach((item) => map.set(item.id, item.profile_name));
     return map;
   }, [profiles.data]);
 

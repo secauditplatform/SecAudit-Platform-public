@@ -18,12 +18,10 @@ from app.services.audit_log import log_audit_event
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
-    assert_can_mutate,
     assign_notification_channel_owner,
 )
 from secaudit_core.enums import NotificationChannelType
-from secaudit_core.egress import validate_channel_config_egress
-from secaudit_core.notifications import build_test_payload, deliver_to_channel
+from secaudit_core.notifications import build_test_payload, deliver_to_channel, prepare_telegram_channel
 from secaudit_core.siem_export import build_siem_test_payload
 from secaudit_core.sensitive_data import redact_sensitive
 
@@ -51,6 +49,25 @@ def _encrypt_channel_secret(secret: str | None) -> str | None:
     return encrypt_secret(secret, settings)
 
 
+def _apply_telegram_channel(
+    channel_type: NotificationChannelType,
+    config_json: dict | None,
+    secret: str | None,
+    *,
+    has_stored_secret: bool,
+) -> tuple[dict | None, str | None]:
+    if channel_type != NotificationChannelType.TELEGRAM:
+        return config_json, secret
+    try:
+        return prepare_telegram_channel(
+            config_json,
+            secret,
+            has_stored_secret=has_stored_secret,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.get("", response_model=list[NotificationChannelRead])
 async def list_notification_channels(
     db: AsyncSession = Depends(get_db),
@@ -76,22 +93,19 @@ async def create_notification_channel(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Notification channel with this name already exists")
 
-    try:
-        config_json = validate_channel_config_egress(
-            channel_type=str(data.channel_type.value if hasattr(data.channel_type, "value") else data.channel_type),
-            config_json=data.config_json,
-            secret=data.secret,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+    config_json, secret = _apply_telegram_channel(
+        data.channel_type,
+        data.config_json,
+        data.secret,
+        has_stored_secret=False,
+    )
     channel = NotificationChannel(
         name=data.name,
         channel_type=data.channel_type,
         is_active=data.is_active,
         events=[event.value if hasattr(event, "value") else str(event) for event in data.events],
         config_json=config_json,
-        encrypted_secret=_encrypt_channel_secret(data.secret),
+        encrypted_secret=_encrypt_channel_secret(secret),
     )
     assign_notification_channel_owner(channel, user)
     db.add(channel)
@@ -133,7 +147,7 @@ async def update_notification_channel(
     channel = await db.get(NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
-    assert_can_mutate(user, channel.owner_sub, detail="Notification channel not found")
+    assert_can_access(user, channel.owner_sub, detail="Notification channel not found")
 
     if data.name is not None and data.name != channel.name:
         existing = await db.execute(select(NotificationChannel).where(NotificationChannel.name == data.name))
@@ -141,27 +155,31 @@ async def update_notification_channel(
             raise HTTPException(status_code=409, detail="Notification channel with this name already exists")
         channel.name = data.name
 
+    previous_type = channel.channel_type
     if data.channel_type is not None:
         channel.channel_type = data.channel_type
     if data.is_active is not None:
         channel.is_active = data.is_active
     if data.events is not None:
         channel.events = [event.value if hasattr(event, "value") else str(event) for event in data.events]
-    if data.config_json is not None or data.secret:
-        try:
-            channel.config_json = validate_channel_config_egress(
-                channel_type=str(
-                    (data.channel_type or channel.channel_type).value
-                    if hasattr(data.channel_type or channel.channel_type, "value")
-                    else (data.channel_type or channel.channel_type)
-                ),
-                config_json=data.config_json if data.config_json is not None else channel.config_json,
-                secret=data.secret,
-            )
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if data.secret:
-        channel.encrypted_secret = _encrypt_channel_secret(data.secret)
+
+    next_config = data.config_json if data.config_json is not None else channel.config_json
+    if channel.channel_type == NotificationChannelType.TELEGRAM:
+        stored_token = previous_type == NotificationChannelType.TELEGRAM and bool(channel.encrypted_secret)
+        next_config, secret = _apply_telegram_channel(
+            channel.channel_type,
+            next_config,
+            data.secret,
+            has_stored_secret=stored_token,
+        )
+        channel.config_json = next_config
+        if secret:
+            channel.encrypted_secret = _encrypt_channel_secret(secret)
+    else:
+        if data.config_json is not None:
+            channel.config_json = data.config_json
+        if data.secret:
+            channel.encrypted_secret = _encrypt_channel_secret(data.secret)
 
     await db.flush()
     await db.refresh(channel)
@@ -187,7 +205,7 @@ async def delete_notification_channel(
     channel = await db.get(NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
-    assert_can_mutate(user, channel.owner_sub, detail="Notification channel not found")
+    assert_can_access(user, channel.owner_sub, detail="Notification channel not found")
 
     channel_name = channel.name
     await db.delete(channel)
@@ -212,7 +230,7 @@ async def test_notification_channel(
     channel = await db.get(NotificationChannel, channel_id)
     if not channel:
         raise HTTPException(status_code=404, detail="Notification channel not found")
-    assert_can_mutate(user, channel.owner_sub, detail="Notification channel not found")
+    assert_can_access(user, channel.owner_sub, detail="Notification channel not found")
 
     if channel.channel_type == NotificationChannelType.SIEM:
         payload = build_siem_test_payload(settings)

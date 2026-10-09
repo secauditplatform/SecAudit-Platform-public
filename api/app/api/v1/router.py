@@ -1,12 +1,14 @@
 from fastapi import APIRouter
 
 from app.api.v1.routers import (
+    api_keys,
     audit_flow,
     audit_logs,
     auth,
     categories,
     credentials,
     dead_letters,
+    directory,
     health,
     hosts,
     inventory,
@@ -36,9 +38,11 @@ api_router.include_router(categories.router, prefix="/categories", tags=["catego
 api_router.include_router(profiles.router, prefix="/profiles", tags=["profiles"])
 api_router.include_router(credentials.router, prefix="/credentials", tags=["credentials"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
+api_router.include_router(api_keys.router, prefix="/api-keys", tags=["api-keys"])
 api_router.include_router(notifications.router, prefix="/notifications", tags=["notifications"])
 api_router.include_router(hosts.router, prefix="/hosts", tags=["hosts"])
 api_router.include_router(inventory.router, prefix="/inventory", tags=["inventory"])
+api_router.include_router(directory.router, prefix="/directory", tags=["directory"])
 api_router.include_router(audit_flow.router, prefix="/audit-flow", tags=["audit-flow"])
 api_router.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 api_router.include_router(network_operations.router, prefix="/network", tags=["network"])

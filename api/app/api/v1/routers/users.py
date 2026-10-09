@@ -4,10 +4,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser, require_roles
 from app.core.database import get_db
+from app.core.demo_operators import hide_demo_operators_from_actor, is_demo_operator_username
 from app.core.passwords import hash_password
 from app.models import Job, User, UserRole
 from app.schemas import UserCreate, UserRead, UserUpdate
 from app.services.audit_log import log_audit_event
+from app.services.mfa import clear_mfa, discard_pending_secret
 
 router = APIRouter()
 
@@ -28,13 +30,21 @@ async def _get_user_or_404(db: AsyncSession, user_id: int) -> User:
     return user
 
 
+def _reject_hidden_demo_operator(actor: AuthUser, user: User) -> None:
+    if hide_demo_operators_from_actor(actor.username) and is_demo_operator_username(user.username):
+        raise HTTPException(status_code=404, detail="User not found")
+
+
 @router.get("", response_model=list[UserRead])
 async def list_users(
     db: AsyncSession = Depends(get_db),
-    _: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+    actor: AuthUser = Depends(require_roles(UserRole.ADMIN)),
 ) -> list[UserRead]:
     result = await db.execute(select(User).order_by(User.username))
-    return [UserRead.model_validate(user) for user in result.scalars().all()]
+    users = list(result.scalars().all())
+    if hide_demo_operators_from_actor(actor.username):
+        users = [user for user in users if not is_demo_operator_username(user.username)]
+    return [UserRead.model_validate(user) for user in users]
 
 
 @router.post("", response_model=UserRead, status_code=201)
@@ -44,6 +54,9 @@ async def create_user(
     db: AsyncSession = Depends(get_db),
     actor: AuthUser = Depends(require_roles(UserRole.ADMIN)),
 ) -> UserRead:
+    if hide_demo_operators_from_actor(actor.username) and is_demo_operator_username(data.username):
+        raise HTTPException(status_code=403, detail="Cannot create this username on the demo stand")
+
     existing = await db.execute(
         select(User).where((User.username == data.username) | (User.email == data.email))
     )
@@ -78,9 +91,10 @@ async def create_user(
 async def get_user(
     user_id: int,
     db: AsyncSession = Depends(get_db),
-    _: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+    actor: AuthUser = Depends(require_roles(UserRole.ADMIN)),
 ) -> UserRead:
     user = await _get_user_or_404(db, user_id)
+    _reject_hidden_demo_operator(actor, user)
     return UserRead.model_validate(user)
 
 
@@ -93,10 +107,15 @@ async def update_user(
     actor: AuthUser = Depends(require_roles(UserRole.ADMIN)),
 ) -> UserRead:
     user = await _get_user_or_404(db, user_id)
+    _reject_hidden_demo_operator(actor, user)
     updates = data.model_dump(exclude_unset=True)
     password = updates.pop("password", None)
 
     if "username" in updates and updates["username"] != user.username:
+        if hide_demo_operators_from_actor(actor.username) and is_demo_operator_username(
+            updates["username"]
+        ):
+            raise HTTPException(status_code=403, detail="Cannot rename to this username on the demo stand")
         existing = await db.execute(select(User).where(User.username == updates["username"]))
         if existing.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="Username already taken")
@@ -148,6 +167,33 @@ async def update_user(
     return UserRead.model_validate(user)
 
 
+@router.post("/{user_id}/mfa/reset", response_model=UserRead)
+async def reset_user_mfa(
+    user_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    actor: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+) -> UserRead:
+    """Clear a user's TOTP enrollment so a locked-out account can re-enroll."""
+    user = await _get_user_or_404(db, user_id)
+    _reject_hidden_demo_operator(actor, user)
+
+    clear_mfa(user)
+    await db.flush()
+    await db.refresh(user)
+    await discard_pending_secret(user.username)
+    await log_audit_event(
+        db,
+        request,
+        actor,
+        action="user.mfa_reset",
+        resource_type="user",
+        resource_id=str(user.id),
+        resource_name=user.username,
+    )
+    return UserRead.model_validate(user)
+
+
 @router.delete("/{user_id}", status_code=204)
 async def delete_user(
     user_id: int,
@@ -156,6 +202,7 @@ async def delete_user(
     actor: AuthUser = Depends(require_roles(UserRole.ADMIN)),
 ) -> None:
     user = await _get_user_or_404(db, user_id)
+    _reject_hidden_demo_operator(actor, user)
     if user.username == actor.username:
         raise HTTPException(status_code=409, detail="Cannot delete your own account")
     if user.role == UserRole.ADMIN and (await _count_admins(db)) <= 1:

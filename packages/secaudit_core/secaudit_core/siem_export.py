@@ -11,7 +11,6 @@ from typing import Any
 import httpx
 
 from secaudit_core.celery_dispatch import send_task
-from secaudit_core.egress import pinned_https_url, sanitize_outbound_headers, validate_public_https_url
 from secaudit_core.enums import NotificationChannelType, NotificationEventType
 from secaudit_core.models import NotificationChannel
 from secaudit_core.secrets import decrypt_secret
@@ -193,9 +192,16 @@ def deliver_siem_to_channel(
     payload: dict[str, Any],
     settings: SecAuditSettings,
 ) -> None:
+    from secaudit_core.url_safety import validate_outbound_webhook_url
+
     url = _resolve_siem_url(channel, settings)
     if not url:
         raise ValueError("SIEM webhook URL is not configured")
+    url = validate_outbound_webhook_url(
+        url,
+        allow_http=settings.app_env.strip().lower() != "production",
+        allow_private=settings.outbound_webhooks_allow_private,
+    )
 
     audit_event = payload.get("audit") or payload
     config = channel.config_json or {}
@@ -208,30 +214,16 @@ def deliver_siem_to_channel(
         headers["Idempotency-Key"] = f"secaudit-audit-{audit_event['id']}"
     extra = config.get("headers")
     if isinstance(extra, dict):
-        headers.update(sanitize_outbound_headers({str(k): str(v) for k, v in extra.items()}))
+        headers.update({str(k): str(v) for k, v in extra.items()})
 
-    safe_url, pin_headers = pinned_https_url(url)
-    headers.update(pin_headers)
     if fmt == "cef":
         body = format_audit_cef(audit_event, settings, vendor=vendor, product=product)
         headers.setdefault("Content-Type", "text/plain; charset=utf-8")
-        response = httpx.post(
-            safe_url,
-            content=body,
-            headers=headers,
-            timeout=30.0,
-            follow_redirects=False,
-        )
+        response = httpx.post(url, content=body, headers=headers, timeout=30.0, follow_redirects=False)
     else:
         body = format_audit_json(audit_event, settings, vendor=vendor, product=product)
         headers.setdefault("Content-Type", "application/json")
-        response = httpx.post(
-            safe_url,
-            json=body,
-            headers=headers,
-            timeout=30.0,
-            follow_redirects=False,
-        )
+        response = httpx.post(url, json=body, headers=headers, timeout=30.0, follow_redirects=False)
     response.raise_for_status()
 
 

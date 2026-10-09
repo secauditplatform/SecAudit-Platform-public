@@ -718,7 +718,7 @@ export function JobsPage({
                   <option value="">{t("jobs.selectProfile")}</option>
                   {availableProfiles.map((s) => (
                     <option key={s.id} value={s.id}>
-                      {s.label}
+                      {s.profile_name}
                     </option>
                   ))}
                 </select>

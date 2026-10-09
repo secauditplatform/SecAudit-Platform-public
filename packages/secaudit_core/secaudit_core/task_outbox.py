@@ -15,7 +15,14 @@ from secaudit_core.celery_observability import (
     record_outbox_dispatch_lag,
 )
 from secaudit_core.enums import AuditFlowStatus, JobStatus, OutboxStatus
-from secaudit_core.models import AuditFlowRun, InventoryScan, JobRun, RemediationRun, TaskOutbox
+from secaudit_core.models import (
+    AuditFlowRun,
+    DirectorySync,
+    InventoryScan,
+    JobRun,
+    RemediationRun,
+    TaskOutbox,
+)
 
 MAX_OUTBOX_ATTEMPTS = 5
 OUTBOX_DISPATCH_LEASE = timedelta(minutes=5)
@@ -68,6 +75,7 @@ def _mark_dispatch_failed(db: Session, row: TaskOutbox, exc: Exception) -> None:
         "remediation_run": RemediationRun,
         "inventory_scan": InventoryScan,
         "audit_flow_run": AuditFlowRun,
+        "directory_sync": DirectorySync,
     }.get(row.callback_kind)
     if model is not None and row.callback_ref_id:
         failed_status = AuditFlowStatus.FAILED if model is AuditFlowRun else JobStatus.FAILED
@@ -113,6 +121,7 @@ def _callback_is_dispatchable(db: Session, row: TaskOutbox) -> bool:
         "remediation_run": RemediationRun,
         "inventory_scan": InventoryScan,
         "audit_flow_run": AuditFlowRun,
+        "directory_sync": DirectorySync,
     }.get(row.callback_kind)
     if model is None or not row.callback_ref_id:
         return True
@@ -236,7 +245,9 @@ def reconcile_stuck_outbox_dispatches(
             TaskOutbox.status == OutboxStatus.SENT,
             TaskOutbox.sent_at.isnot(None),
             TaskOutbox.sent_at < cutoff,
-            TaskOutbox.callback_kind.in_(("job_run", "remediation_run", "inventory_scan", "audit_flow_run")),
+            TaskOutbox.callback_kind.in_(
+                ("job_run", "remediation_run", "inventory_scan", "audit_flow_run", "directory_sync")
+            ),
         )
         .with_for_update(skip_locked=True)
     ).scalars().all()

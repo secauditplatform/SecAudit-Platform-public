@@ -102,6 +102,8 @@ class CredentialType(str, enum.Enum):
     SSH_KEY = "ssh_key"
     WINRM = "winrm"
     ANSIBLE_VAULT = "ansible_vault"
+    SNMP_V2C = "snmp_v2c"
+    SNMP_V3 = "snmp_v3"
 
 
 class NotificationChannelType(str, enum.Enum):
@@ -109,6 +111,7 @@ class NotificationChannelType(str, enum.Enum):
     WEBHOOK = "webhook"
     SLACK = "slack"
     TEAMS = "teams"
+    TELEGRAM = "telegram"
     SIEM = "siem"
 
 

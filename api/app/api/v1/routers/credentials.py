@@ -7,14 +7,14 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models import UserRole
 from app.core.secrets import encrypt_secret
-from app.models import Credential, Host
+from app.models import Credential, CredentialType, Host
 from app.schemas import CredentialCreate, CredentialRead, CredentialUpdate
+from secaudit_core.snmp_discovery import SnmpDiscoveryError, normalize_auth_protocol, normalize_priv_protocol
 from app.services.audit_flow import sweep_orphaned_ephemeral_credentials
 from app.services.audit_log import log_audit_event
 from app.services.object_rbac import (
     apply_credential_list_scope,
     assert_can_access,
-    assert_can_mutate,
     assert_credential_visible,
     assign_owner,
 )
@@ -29,10 +29,37 @@ def _credential_to_read(credential: Credential) -> CredentialRead:
         credential_type=credential.credential_type,
         username=credential.username,
         service_username=credential.service_username,
+        snmp_priv_protocol=credential.snmp_priv_protocol,
         description=credential.description,
         has_service_secret=bool(credential.encrypted_service_secret),
         created_at=credential.created_at,
     )
+
+
+def _apply_snmp_credential_fields(credential: Credential, data) -> None:
+    """Store SNMPv3 auth/priv protocol names. Secrets stay in the encrypted columns."""
+    kind = credential.credential_type
+    if kind not in (CredentialType.SNMP_V2C, CredentialType.SNMP_V3):
+        return
+    try:
+        if kind == CredentialType.SNMP_V2C:
+            credential.username = None
+            credential.service_username = None
+            credential.snmp_priv_protocol = None
+            credential.encrypted_key_passphrase = None
+            return
+        if not (credential.username or "").strip():
+            raise SnmpDiscoveryError("SNMPv3 requires a username")
+        credential.service_username = normalize_auth_protocol(
+            data.service_username if data.service_username is not None else credential.service_username
+        )
+        credential.snmp_priv_protocol = normalize_priv_protocol(
+            data.snmp_priv_protocol if data.snmp_priv_protocol is not None else credential.snmp_priv_protocol
+        )
+        if credential.snmp_priv_protocol and not credential.encrypted_key_passphrase:
+            raise SnmpDiscoveryError("SNMPv3 privacy protocol requires a privacy password")
+    except SnmpDiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("", response_model=list[CredentialRead])
@@ -83,7 +110,9 @@ async def create_credential(
             encrypt_secret(data.service_secret, settings) if data.service_secret else None
         ),
         description=data.description,
+        snmp_priv_protocol=data.snmp_priv_protocol,
     )
+    _apply_snmp_credential_fields(credential, data)
     assign_owner(credential, user)
     db.add(credential)
     await db.flush()
@@ -129,7 +158,7 @@ async def update_credential(
     user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
 ) -> CredentialRead:
     credential = await assert_credential_visible(db, user, credential_id)
-    assert_can_mutate(user, credential.owner_sub, detail="Credential not found")
+    assert_can_access(user, credential.owner_sub, detail="Credential not found")
 
     if data.name is not None and data.name != credential.name:
         existing = await db.execute(select(Credential).where(Credential.name == data.name))
@@ -155,6 +184,9 @@ async def update_credential(
         credential.encrypted_service_secret = (
             encrypt_secret(data.service_secret, settings) if data.service_secret else None
         )
+    if data.snmp_priv_protocol is not None:
+        credential.snmp_priv_protocol = data.snmp_priv_protocol or None
+    _apply_snmp_credential_fields(credential, data)
 
     await db.flush()
     await db.refresh(credential)
@@ -178,7 +210,7 @@ async def delete_credential(
     user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
 ) -> None:
     credential = await assert_credential_visible(db, user, credential_id)
-    assert_can_mutate(user, credential.owner_sub, detail="Credential not found")
+    assert_can_access(user, credential.owner_sub, detail="Credential not found")
 
     linked_hosts = await db.execute(select(Host).where(Host.credential_id == credential_id))
     for host in linked_hosts.scalars().all():

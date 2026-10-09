@@ -11,20 +11,35 @@ class Settings(SecAuditSettings):
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
     auth_enabled: bool = True
+    # Required when AUTH_ENABLED=false outside production (synthetic admin).
+    allow_auth_disabled: bool = False
     # Public demo stand: block execute/mutate APIs (jobs, remediation, scans, …).
     demo_mode: bool = False
+    # Max concurrent one-click demo sessions (Redis-backed).
+    demo_max_sessions: int = 5
+    # Drop a demo session after this many seconds without API activity.
+    demo_session_idle_seconds: int = 600
+    # Comma-separated local usernames allowed to sign in with password on the demo
+    # stand and bypass execute/mutate locks (content operators). Never put passwords here.
+    demo_operator_usernames: str = ""
+    # Main platform local-auth idle timeout (0 disables). Not used in DEMO_MODE.
+    auth_idle_timeout_seconds: int = 14400
     # When true, username/password login authenticates against DB users
     # managed via the Users API/UI — there is no env-backed fallback account.
     local_auth_enabled: bool = False
-    local_auth_token_ttl_seconds: int = 86400
-    local_auth_refresh_token_ttl_seconds: int = 604800
-    # Re-load active flag + roles from DB on every local JWT request (disable in unit tests).
-    local_auth_revalidate_from_db: bool = True
+    # Short-lived access tokens; refresh rotates roles/active checks.
+    local_auth_token_ttl_seconds: int = 900
+    local_auth_refresh_token_ttl_seconds: int = 86400
     local_auth_rate_limit_enabled: bool = True
     local_auth_rate_limit_max_attempts: int = 10
     local_auth_rate_limit_window_seconds: int = 60
-    # Comma-separated proxy peer IPs allowed to supply X-Forwarded-For for rate limits.
-    trusted_proxy_ips: str = ""
+    # When true, every local access token is checked against DB is_active/roles.
+    local_auth_revalidate_user: bool = True
+    # Lifetime of the intermediate token issued between password and TOTP steps.
+    local_auth_mfa_challenge_ttl_seconds: int = 300
+    # Lifetime of a pending (unconfirmed) TOTP enrollment secret held in Redis.
+    local_auth_mfa_setup_ttl_seconds: int = 600
+    local_auth_mfa_recovery_code_count: int = 8
 
     # Opt-in first local admin (created only when the users table is empty).
     bootstrap_admin_username: str | None = None

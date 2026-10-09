@@ -459,7 +459,7 @@ export function RemediationPage({
 
   const profileNameById = useMemo(() => {
     const map = new Map<number, string>();
-    profiles.data?.forEach((s) => map.set(s.id, s.label));
+    profiles.data?.forEach((s) => map.set(s.id, s.profile_name));
     return map;
   }, [profiles.data]);
 
@@ -565,7 +565,7 @@ export function RemediationPage({
                 <option value="">{t("jobs.selectProfile")}</option>
                 {availableProfiles.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.label}
+                    {s.profile_name}
                   </option>
                 ))}
               </select>

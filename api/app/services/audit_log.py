@@ -39,7 +39,10 @@ def _resolve_actor(user: AuthUser | None) -> tuple[str, list[str] | None, str]:
     if not username:
         username = user.sub or "unknown"
     auth_mode = user.auth_mode if getattr(user, "auth_mode", None) else "unknown"
-    return username, user.roles, auth_mode
+    roles = list(user.roles or [])
+    if not roles and auth_mode == "api_key":
+        roles = list(getattr(user, "scopes", None) or [])
+    return username, roles or None, auth_mode
 
 
 def _build_audit_event(

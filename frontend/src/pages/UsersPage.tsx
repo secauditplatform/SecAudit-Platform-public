@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { api, type PlatformUser, type UserRole } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
+import { ApiKeysPanel } from "../components/ApiKeysPanel";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { PageHeader } from "../components/ui/PageHeader";
@@ -130,6 +131,15 @@ export function UsersPage() {
     onError: (err) => toast.error(formatUserMutationError(err, t)),
   });
 
+  const resetMfaMutation = useMutation({
+    mutationFn: api.resetUserMfa,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["users"] });
+      toast.success(t("users.mfaResetDone"));
+    },
+    onError: (err) => toast.error(formatUserMutationError(err, t)),
+  });
+
   if (!isAdmin) {
     return <Navigate to="/" replace />;
   }
@@ -182,6 +192,17 @@ export function UsersPage() {
       variant: "danger",
     });
     if (ok) deleteMutation.mutate(user.id);
+  };
+
+  const handleResetMfa = async (user: PlatformUser) => {
+    if (!user.mfa_enabled) return;
+    const ok = await confirm({
+      title: t("users.mfaResetTitle"),
+      message: t("users.mfaResetConfirm", { name: user.username }),
+      confirmLabel: t("users.mfaReset"),
+      variant: "danger",
+    });
+    if (ok) resetMfaMutation.mutate(user.id);
   };
 
   return (
@@ -428,6 +449,7 @@ export function UsersPage() {
                       <th>{t("users.fullName")}</th>
                       <th>{t("users.role")}</th>
                       <th>{t("common.status")}</th>
+                      <th>{t("users.mfa")}</th>
                       <th>{t("users.created")}</th>
                       <th className="pf-table__col-actions">{t("common.actions")}</th>
                     </tr>
@@ -456,6 +478,11 @@ export function UsersPage() {
                             {user.is_active ? t("common.active") : t("common.inactive")}
                           </Badge>
                         </td>
+                        <td>
+                          <Badge variant={user.mfa_enabled ? "info" : "neutral"}>
+                            {user.mfa_enabled ? t("common.on") : t("common.off")}
+                          </Badge>
+                        </td>
                         <td className="pf-table__muted">
                           {new Date(user.created_at).toLocaleString(dateLocale)}
                         </td>
@@ -464,6 +491,16 @@ export function UsersPage() {
                             <Button variant="secondary" className="pf-btn--sm" onClick={() => startEdit(user)}>
                               {t("common.edit")}
                             </Button>
+                            {user.mfa_enabled ? (
+                              <Button
+                                variant="secondary"
+                                className="pf-btn--sm"
+                                onClick={() => void handleResetMfa(user)}
+                                disabled={resetMfaMutation.isPending}
+                              >
+                                {t("users.mfaReset")}
+                              </Button>
+                            ) : null}
                             <Button
                               variant="danger-secondary"
                               className="pf-btn--sm"
@@ -483,6 +520,8 @@ export function UsersPage() {
           </div>
         </div>
       </Panel>
+
+      <ApiKeysPanel />
     </>
   );
 }

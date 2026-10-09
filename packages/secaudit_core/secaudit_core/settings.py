@@ -7,12 +7,8 @@ class SecAuditSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
-    app_version: str = "1.0.0"
+    app_version: str = "1.4.0"
     secret_key: str = "dev-secret-key"
-    # Optional dedicated key for Fernet at-rest encryption. Falls back to secret_key.
-    secrets_fernet_key: str | None = None
-    # Optional dedicated key for local JWT HS256. Falls back to secret_key.
-    local_jwt_signing_key: str | None = None
 
     # Data-at-rest encryption backend: fernet (dev), vault (Transit), aws_kms (BYO-KMS).
     secrets_backend: str = "fernet"
@@ -75,7 +71,14 @@ class SecAuditSettings(BaseSettings):
     profiles_catalog_sync_interval_seconds: int = 3600
     profiles_catalog_sync_update_existing: bool = True
 
+    # Inventory / AuditFlow CIDR size policy (minimum IPv4 prefix length = largest net).
+    # Default /20 for operators; admins may use a wider limit (smaller number), e.g. /16.
+    inventory_max_cidr_prefix_len: int = 20
+    inventory_max_cidr_prefix_len_admin: int = 16
+
     notifications_enabled: bool = True
+    # When true, webhook/SIEM URLs may target RFC1918 hosts (still blocks metadata/loopback).
+    outbound_webhooks_allow_private: bool = False
     frontend_base_url: str = "http://localhost:5173"
     smtp_host: str | None = None
     smtp_port: int = 587
@@ -135,18 +138,6 @@ class SecAuditSettings(BaseSettings):
     @property
     def secrets_backend_effective(self) -> str:
         return (self.secrets_backend or "fernet").strip().lower()
-
-    @property
-    def secrets_fernet_key_effective(self) -> str:
-        """Key material for Fernet at-rest encryption (isolated from JWT when set)."""
-        value = (self.secrets_fernet_key or "").strip()
-        return value or self.secret_key
-
-    @property
-    def local_jwt_signing_key_effective(self) -> str:
-        """HS256 key for local access/refresh tokens (isolated from Fernet when set)."""
-        value = (self.local_jwt_signing_key or "").strip()
-        return value or self.secret_key
 
     @property
     def database_url_sync(self) -> str:

@@ -7,17 +7,23 @@ from app.core.auth import AuthUser, require_roles
 from app.core.database import get_db
 from app.models import ComplianceWaiver, Host, UserRole, WaiverStatus
 from app.schemas import (
+    ComplianceWaiverApprove,
     ComplianceWaiverCreate,
     ComplianceWaiverRead,
     ComplianceWaiverReject,
     ComplianceWaiverUpdate,
+    ComplianceWaiversBulkActionError,
+    ComplianceWaiversBulkActionResult,
+    ComplianceWaiversBulkApproveRequest,
+    ComplianceWaiversBulkRejectRequest,
 )
 from app.services.audit_log import log_audit_event
-from app.services.object_rbac import assert_can_access, assert_can_mutate
+from app.services.object_rbac import assert_can_access
 from app.services.waivers import (
     actor_name,
     assert_job_scope,
     assert_profile_exists,
+    bulk_transition,
     get_waiver_or_404,
     list_waivers,
     new_owner_sub,
@@ -30,11 +36,18 @@ router = APIRouter()
 
 _READ_ROLES = (UserRole.ADMIN, UserRole.OPERATOR)
 _WRITE_ROLES = (UserRole.ADMIN, UserRole.OPERATOR)
-_APPROVE_ROLES = (UserRole.ADMIN,)
+_APPROVE_ROLES = (UserRole.ADMIN, UserRole.OPERATOR)
 
 
 def _to_read(waiver: ComplianceWaiver) -> ComplianceWaiverRead:
     return ComplianceWaiverRead.model_validate(waiver)
+
+
+def _normalize_ticket(value: str | None) -> str | None:
+    if value is None:
+        return None
+    ticket = value.strip()
+    return ticket or None
 
 
 @router.get("", response_model=list[ComplianceWaiverRead])
@@ -76,12 +89,14 @@ async def create_compliance_waiver(
 
     auto_approve = bool(data.auto_approve and user.has_role(UserRole.ADMIN))
     now = datetime.now(UTC)
+    change_ticket = _normalize_ticket(data.change_ticket)
     waiver = ComplianceWaiver(
         profile_id=data.profile_id,
         rule_tech_name=data.rule_tech_name.strip(),
         host_id=data.host_id,
         job_id=data.job_id,
         reason=data.reason.strip(),
+        change_ticket=change_ticket,
         status=WaiverStatus.APPROVED if auto_approve else WaiverStatus.PENDING,
         requested_by=actor_name(user),
         approved_by=actor_name(user) if auto_approve else None,
@@ -110,10 +125,84 @@ async def create_compliance_waiver(
             "job_id": waiver.job_id,
             "status": waiver.status.value,
             "auto_approve": auto_approve,
+            "change_ticket": waiver.change_ticket,
             "expires_at": waiver.expires_at.isoformat() if waiver.expires_at else None,
         },
     )
     return _to_read(waiver)
+
+
+@router.post("/bulk/approve", response_model=ComplianceWaiversBulkActionResult)
+async def bulk_approve_compliance_waivers(
+    data: ComplianceWaiversBulkApproveRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
+) -> ComplianceWaiversBulkActionResult:
+    if not data.waiver_ids:
+        raise HTTPException(status_code=400, detail="waiver_ids is required")
+    result = await bulk_transition(
+        db,
+        user,
+        data.waiver_ids,
+        action="approve",
+        change_ticket=data.change_ticket,
+    )
+    if result["succeeded"]:
+        await db.flush()
+        await log_audit_event(
+            db,
+            request,
+            user,
+            action="waiver.bulk_approve",
+            resource_type="compliance_waiver",
+            metadata={
+                "waiver_ids": result["succeeded"],
+                "change_ticket": _normalize_ticket(data.change_ticket),
+                "failed_count": len(result["failed"]),
+            },
+        )
+    return ComplianceWaiversBulkActionResult(
+        succeeded=result["succeeded"],
+        failed=[ComplianceWaiversBulkActionError.model_validate(item) for item in result["failed"]],
+    )
+
+
+@router.post("/bulk/reject", response_model=ComplianceWaiversBulkActionResult)
+async def bulk_reject_compliance_waivers(
+    data: ComplianceWaiversBulkRejectRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
+) -> ComplianceWaiversBulkActionResult:
+    if not data.waiver_ids:
+        raise HTTPException(status_code=400, detail="waiver_ids is required")
+    result = await bulk_transition(
+        db,
+        user,
+        data.waiver_ids,
+        action="reject",
+        reason=data.reason,
+    )
+    if result["succeeded"]:
+        await db.flush()
+        await log_audit_event(
+            db,
+            request,
+            user,
+            action="waiver.bulk_reject",
+            resource_type="compliance_waiver",
+            metadata={
+                "waiver_ids": result["succeeded"],
+                "reason": data.reason,
+                "failed_count": len(result["failed"]),
+            },
+            outcome="failed",
+        )
+    return ComplianceWaiversBulkActionResult(
+        succeeded=result["succeeded"],
+        failed=[ComplianceWaiversBulkActionError.model_validate(item) for item in result["failed"]],
+    )
 
 
 @router.get("/{waiver_id}", response_model=ComplianceWaiverRead)
@@ -136,12 +225,14 @@ async def update_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_WRITE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_mutate(user, waiver.owner_sub, detail="Waiver not found")
+    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
     if waiver.status not in (WaiverStatus.PENDING, WaiverStatus.APPROVED) or not waiver.is_active:
         raise HTTPException(status_code=400, detail="Only pending or approved waivers can be updated")
 
     if data.reason is not None:
         waiver.reason = data.reason.strip()
+    if data.change_ticket is not None:
+        waiver.change_ticket = _normalize_ticket(data.change_ticket)
     if data.expires_at is not None:
         waiver.expires_at = data.expires_at
 
@@ -155,7 +246,10 @@ async def update_compliance_waiver(
         resource_type="compliance_waiver",
         resource_id=waiver.id,
         resource_name=waiver.rule_tech_name,
-        metadata={"expires_at": waiver.expires_at.isoformat() if waiver.expires_at else None},
+        metadata={
+            "expires_at": waiver.expires_at.isoformat() if waiver.expires_at else None,
+            "change_ticket": waiver.change_ticket,
+        },
     )
     return _to_read(waiver)
 
@@ -164,12 +258,13 @@ async def update_compliance_waiver(
 async def approve_compliance_waiver(
     waiver_id: int,
     request: Request,
+    data: ComplianceWaiverApprove | None = None,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
-    transition_approve(waiver, user)
+    payload = data or ComplianceWaiverApprove()
+    transition_approve(waiver, user, change_ticket=payload.change_ticket)
     await db.flush()
     await db.refresh(waiver)
     await log_audit_event(
@@ -180,7 +275,7 @@ async def approve_compliance_waiver(
         resource_type="compliance_waiver",
         resource_id=waiver.id,
         resource_name=waiver.rule_tech_name,
-        metadata={"approved_by": waiver.approved_by},
+        metadata={"approved_by": waiver.approved_by, "change_ticket": waiver.change_ticket},
     )
     return _to_read(waiver)
 
@@ -194,7 +289,6 @@ async def reject_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
     transition_reject(waiver, user, data.reason)
     await db.flush()
     await db.refresh(waiver)
@@ -217,10 +311,9 @@ async def revoke_compliance_waiver(
     waiver_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(*_WRITE_ROLES)),
+    user: AuthUser = Depends(require_roles(*_APPROVE_ROLES)),
 ) -> ComplianceWaiverRead:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_mutate(user, waiver.owner_sub, detail="Waiver not found")
     transition_revoke(waiver, user)
     await db.flush()
     await db.refresh(waiver)
@@ -245,7 +338,7 @@ async def delete_compliance_waiver(
     user: AuthUser = Depends(require_roles(*_WRITE_ROLES)),
 ) -> None:
     waiver = await get_waiver_or_404(db, waiver_id)
-    assert_can_mutate(user, waiver.owner_sub, detail="Waiver not found")
+    assert_can_access(user, waiver.owner_sub, detail="Waiver not found")
     rule_name = waiver.rule_tech_name
     await log_audit_event(
         db,

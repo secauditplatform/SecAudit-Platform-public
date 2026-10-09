@@ -13,6 +13,7 @@ from pathlib import Path
 from sqlalchemy import create_engine, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
+from secaudit_core.enums import CredentialType
 from secaudit_core.inventory_scan import (
     NMAP_PORT_SCAN_ARGS,
     ScanCancelledError,
@@ -28,8 +29,13 @@ from secaudit_core.inventory_scan_state import (
     is_scan_cancelled,
     set_scan_pid,
 )
-from secaudit_core.models import Host, InventoryScan, InventoryScanResult, JobStatus
+from secaudit_core.models import Credential, Host, InventoryScan, InventoryScanResult, JobStatus
 from secaudit_core.run_state import claim_pending_run, transition_running_run
+from secaudit_core.secrets import decrypt_secret
+from secaudit_core.settings import SecAuditSettings
+from secaudit_core.snmp_discovery import platform_hint, safe_snmp_error, snmp_addresses
+
+from app.snmp_probe import probe_snmp_addresses
 
 # Small chunks so the UI sees hosts/ports after each batch instead of only at the end.
 PORT_SCAN_CHUNK_SIZE = 8
@@ -268,10 +274,151 @@ def _apply_port_info_chunk(
     return hosts_created
 
 
+def _demo_mode_enabled() -> bool:
+    return os.environ.get("DEMO_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _apply_snmp_hits(db: Session, scan: InventoryScan, hits: list) -> None:
+    """Write SNMP replies into the same inventory rows nmap uses.
+
+    A reply creates or links a host. It does not record interface ports and
+    does not set a compliance status.
+    """
+    discovered = []
+    hints: dict[str, str | None] = {}
+    for hit in hits:
+        name = (hit.sys_name or "").strip()[:256] or None
+        discovered.append({"ip": hit.ip, "hostname": name})
+        hints[hit.ip] = platform_hint(hit.sys_descr, hit.sys_object_id)
+    _persist_discovered_hosts(db, scan, discovered)
+    rows = list(
+        db.execute(select(InventoryScanResult).where(InventoryScanResult.scan_id == scan.id)).scalars()
+    )
+    hosts_created = 0
+    for row in rows:
+        row.open_ports = "[]"
+        row.is_active = True
+        row.platform_hint = hints.get(row.ip_address)
+        if row.host_id is not None:
+            continue
+        existing = _find_existing_host(
+            db,
+            owner_sub=scan.owner_sub,
+            ip=row.ip_address,
+            resolved_hostname=row.resolved_hostname,
+        )
+        if existing:
+            if existing.owner_sub is None and scan.owner_sub is not None:
+                existing.owner_sub = scan.owner_sub
+            row.host_id = existing.id
+            continue
+        created = Host(
+            name=host_name_for_ip(row.ip_address, row.resolved_hostname),
+            hostname=row.ip_address,
+            port=22,
+            os_type="network",
+            is_active=True,
+            owner_sub=scan.owner_sub,
+        )
+        db.add(created)
+        db.flush()
+        hosts_created += 1
+        row.host_id = created.id
+    scan.hosts_created = (scan.hosts_created or 0) + hosts_created
+    db.commit()
+
+
+def _run_snmp_scan_sync(scan_id: int, *, database_url: str, redis_url: str) -> None:
+    engine = create_engine(database_url)
+    SessionLocal = sessionmaker(bind=engine)
+    secrets: list[str] = []
+    try:
+        with SessionLocal() as db:
+            if not claim_pending_run(db, InventoryScan, scan_id):
+                return
+            if _demo_mode_enabled():
+                raise RuntimeError("SNMP discovery is disabled in demo mode")
+            scan = db.get(InventoryScan, scan_id)
+            if scan is None:
+                return
+            target = scan.target
+            port = int(scan.snmp_port or 161)
+            credential = db.get(Credential, scan.credential_id) if scan.credential_id else None
+            if credential is None or credential.credential_type not in (
+                CredentialType.SNMP_V2C,
+                CredentialType.SNMP_V3,
+            ):
+                raise RuntimeError("SNMP discovery requires an SNMP credential")
+            settings = SecAuditSettings()
+            secret = decrypt_secret(credential.encrypted_secret, settings)
+            secrets.append(secret)
+            priv = None
+            if credential.encrypted_key_passphrase:
+                priv = decrypt_secret(credential.encrypted_key_passphrase, settings)
+                secrets.append(priv)
+            version = "v2c" if credential.credential_type == CredentialType.SNMP_V2C else "v3"
+            username = credential.username
+            auth_protocol = credential.service_username
+            priv_protocol = credential.snmp_priv_protocol
+        addresses = snmp_addresses(target, max_prefix_len=8)
+        report = probe_snmp_addresses(
+            addresses,
+            version=version,
+            port=port,
+            community=secret if version == "v2c" else None,
+            username=username,
+            auth_protocol=auth_protocol,
+            auth_key=secret if version == "v3" else None,
+            priv_protocol=priv_protocol,
+            priv_key=priv,
+            cancelled=lambda: is_scan_cancelled(redis_url, scan_id),
+        )
+        with SessionLocal() as db:
+            scan = db.get(InventoryScan, scan_id)
+            if not scan or scan.status == JobStatus.CANCELLED:
+                return
+            if report.hits:
+                _apply_snmp_hits(db, scan, report.hits)
+            elif report.rejected and not report.timeouts:
+                raise RuntimeError("SNMP credentials were rejected")
+            transition_running_run(db, InventoryScan, scan_id, JobStatus.COMPLETED)
+    except ScanCancelledError:
+        with SessionLocal() as db:
+            scan = db.get(InventoryScan, scan_id)
+            if scan:
+                transition_running_run(
+                    db,
+                    InventoryScan,
+                    scan_id,
+                    JobStatus.CANCELLED,
+                    error_message="Cancelled by user",
+                )
+    except Exception as exc:
+        with SessionLocal() as db:
+            scan = db.get(InventoryScan, scan_id)
+            if not scan:
+                return
+            transition_running_run(
+                db,
+                InventoryScan,
+                scan_id,
+                JobStatus.FAILED,
+                error_message=safe_snmp_error(str(exc), *secrets),
+            )
+    finally:
+        clear_scan_state(redis_url, scan_id)
+
+
 def run_inventory_scan_sync(scan_id: int, *, database_url: str, redis_url: str) -> None:
     """Execute inventory scan synchronously (called from Celery worker)."""
     engine = create_engine(database_url)
     SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as db:
+        scan = db.get(InventoryScan, scan_id)
+        method = scan.method if scan is not None else "nmap"
+    if method == "snmp":
+        _run_snmp_scan_sync(scan_id, database_url=database_url, redis_url=redis_url)
+        return
 
     with SessionLocal() as db:
         if not claim_pending_run(db, InventoryScan, scan_id):

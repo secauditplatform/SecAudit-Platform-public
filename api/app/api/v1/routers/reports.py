@@ -32,7 +32,13 @@ from app.services.drift import (
 )
 from app.services.object_rbac import assert_job_access, assert_job_run_access
 from app.services.remediation_workflow import build_remediation_suggestion
-from app.services.report_ux import fetch_multi_run_compare, fetch_run_csv, render_multi_compare_csv
+from app.services.report_ux import (
+    build_run_package_zip,
+    fetch_multi_run_compare,
+    fetch_run_csv,
+    load_run_evidence,
+    render_multi_compare_csv,
+)
 from app.services.reports import fetch_run_report_context, fetch_run_summary, render_run_report_html, render_run_report_pdf
 from secaudit_core.report_i18n import resolve_report_locale
 from app.services.trends import (
@@ -300,4 +306,53 @@ async def get_run_report_csv(
         content=content,
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/runs/{run_id}/report.pack.zip")
+async def get_run_report_pack(
+    run_id: int,
+    request: Request,
+    locale: str | None = Query(default=None, description="UI locale for report labels"),
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+) -> Response:
+    """Download HTML+PDF+CSV and the evidence documents as one ZIP."""
+    await assert_job_run_access(db, user, run_id)
+    context = await fetch_run_report_context(db, run_id)
+    if not context:
+        raise HTTPException(status_code=404, detail="Job run not found")
+    job_run, profile, hosts = context
+    resolved_locale = _report_locale(locale, request)
+
+    html = render_run_report_html(job_run, profile, hosts, locale=resolved_locale)
+    try:
+        pdf_bytes = await run_blocking(
+            render_run_report_pdf,
+            job_run,
+            profile,
+            hosts,
+            locale=resolved_locale,
+            timeout=settings.blocking_io_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="PDF rendering timed out") from exc
+
+    csv_content, _filename = await fetch_run_csv(db, run_id)
+    evidence_run, evidence_waivers, evidence_profile = await load_run_evidence(db, job_run, hosts)
+    pack_bytes = build_run_package_zip(
+        run_id=run_id,
+        html=html,
+        pdf=pdf_bytes,
+        csv_text=csv_content,
+        locale=resolved_locale,
+        include_evidence=True,
+        evidence_run=evidence_run,
+        evidence_waivers=evidence_waivers,
+        evidence_profile=evidence_profile,
+    )
+    return Response(
+        content=pack_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="report-{run_id}-pack.zip"'},
     )

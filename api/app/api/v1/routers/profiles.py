@@ -481,8 +481,14 @@ async def import_profile(
         status = 404 if "package directory not found" in message.lower() else 400
         raise HTTPException(status_code=status, detail=message) from exc
     except ValueError as exc:
-        status = 404 if str(exc) == "Category not found" else 409
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
+        message = str(exc)
+        if message == "Category not found":
+            status = 404
+        elif "allowlisted" in message.lower() or "package_path" in message.lower():
+            status = 400
+        else:
+            status = 409
+        raise HTTPException(status_code=status, detail=message) from exc
     await log_audit_event(
         db,
         request,

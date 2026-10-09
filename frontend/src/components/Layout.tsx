@@ -118,7 +118,7 @@ export function Layout() {
             <IconBars />
           </button>
           <span className="pf-masthead__title">SecAudit</span>
-          {primaryRole && import.meta.env.VITE_AUTH_ENABLED === "true" ? (
+          {primaryRole && import.meta.env.VITE_AUTH_ENABLED !== "false" ? (
             <span className="pf-masthead__role-badge">{t(`roleBadges.${primaryRole}`)}</span>
           ) : null}
         </div>
@@ -127,10 +127,12 @@ export function Layout() {
         <div className="pf-masthead__user">
           <SettingsPanel />
           <span className="pf-masthead__meta">
-            {username}
-            {import.meta.env.VITE_AUTH_ENABLED === "true" && (
+            <span className="pf-masthead__username">{username}</span>
+            {import.meta.env.VITE_AUTH_ENABLED !== "false" && (
               <>
-                {" · "}
+                <span className="pf-masthead__meta-sep" aria-hidden>
+                  {" · "}
+                </span>
                 <button type="button" onClick={logout} className="pf-masthead__logout">
                   {t("common.logout")}
                 </button>

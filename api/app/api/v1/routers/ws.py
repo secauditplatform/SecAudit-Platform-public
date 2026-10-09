@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser, authenticate_websocket
@@ -18,20 +18,13 @@ from app.services.object_rbac import (
 )
 from secaudit_core.enums import UserRole
 from secaudit_core.redis_client import async_redis
+from secaudit_core.sensitive_data import redact_live_log_frame
 
 router = APIRouter()
 
 
-def _ws_user_can_operate(user: AuthUser) -> bool:
-    return user.has_role(UserRole.OPERATOR, UserRole.ADMIN)
-
-
-async def _reject_demo_execute_ws(websocket: WebSocket) -> bool:
-    """Return True if the socket was closed because demo mode blocks execute streams."""
-    if not settings.demo_mode:
-        return False
-    await websocket.close(code=4403, reason="Demo mode: execute streams disabled")
-    return True
+def _live_log_frame(raw: str) -> str:
+    return redact_live_log_frame(raw)
 
 
 @router.get("/job-runs/{run_id}/logs", response_model=list[JobRunLogEntry])
@@ -44,7 +37,7 @@ async def get_job_run_logs(
     client = async_redis(settings.redis_url, settings=settings)
     try:
         raw = await client.lrange(f"job_run_logs:{run_id}", 0, 499)
-        entries = [JobRunLogEntry(**json.loads(item)) for item in reversed(raw)]
+        entries = [JobRunLogEntry(**json.loads(_live_log_frame(item))) for item in reversed(raw)]
         return entries
     finally:
         await client.aclose()
@@ -58,11 +51,6 @@ async def job_run_logs_ws(
     user, _token = await authenticate_websocket(websocket)
     if not user:
         await websocket.close(code=4401, reason="Not authenticated")
-        return
-    if not _ws_user_can_operate(user):
-        await websocket.close(code=4403, reason="Insufficient permissions")
-        return
-    if await _reject_demo_execute_ws(websocket):
         return
 
     from app.core.database import async_session
@@ -81,13 +69,13 @@ async def job_run_logs_ws(
     try:
         cached = await client.lrange(f"job_run_logs:{run_id}", 0, 99)
         for item in reversed(cached):
-            await websocket.send_text(item)
+            await websocket.send_text(_live_log_frame(item))
 
         await pubsub.subscribe(channel)
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message and message.get("type") == "message":
-                await websocket.send_text(message["data"])
+                await websocket.send_text(_live_log_frame(message["data"]))
             await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         pass
@@ -107,7 +95,7 @@ async def get_remediation_run_logs(
     client = async_redis(settings.redis_url, settings=settings)
     try:
         raw = await client.lrange(f"remediation_run_logs:{run_id}", 0, 499)
-        entries = [RemediationRunLogEntry(**json.loads(item)) for item in reversed(raw)]
+        entries = [RemediationRunLogEntry(**json.loads(_live_log_frame(item))) for item in reversed(raw)]
         return entries
     finally:
         await client.aclose()
@@ -121,11 +109,6 @@ async def remediation_run_logs_ws(
     user, _token = await authenticate_websocket(websocket)
     if not user:
         await websocket.close(code=4401, reason="Not authenticated")
-        return
-    if not _ws_user_can_operate(user):
-        await websocket.close(code=4403, reason="Insufficient permissions")
-        return
-    if await _reject_demo_execute_ws(websocket):
         return
 
     from app.core.database import async_session
@@ -144,13 +127,13 @@ async def remediation_run_logs_ws(
     try:
         cached = await client.lrange(f"remediation_run_logs:{run_id}", 0, 99)
         for item in reversed(cached):
-            await websocket.send_text(item)
+            await websocket.send_text(_live_log_frame(item))
 
         await pubsub.subscribe(channel)
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message and message.get("type") == "message":
-                await websocket.send_text(message["data"])
+                await websocket.send_text(_live_log_frame(message["data"]))
             await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         pass
@@ -170,7 +153,7 @@ async def get_audit_flow_logs(
     client = async_redis(settings.redis_url, settings=settings)
     try:
         raw = await client.lrange(f"audit_flow_run_logs:{run_id}", 0, 499)
-        return [AuditFlowLogEntry(**json.loads(item)) for item in reversed(raw)]
+        return [AuditFlowLogEntry(**json.loads(_live_log_frame(item))) for item in reversed(raw)]
     finally:
         await client.aclose()
 
@@ -183,11 +166,6 @@ async def audit_flow_logs_ws(
     user, _token = await authenticate_websocket(websocket)
     if not user:
         await websocket.close(code=4401, reason="Not authenticated")
-        return
-    if not _ws_user_can_operate(user):
-        await websocket.close(code=4403, reason="Insufficient permissions")
-        return
-    if await _reject_demo_execute_ws(websocket):
         return
 
     from app.core.database import async_session
@@ -206,13 +184,13 @@ async def audit_flow_logs_ws(
     try:
         cached = await client.lrange(f"audit_flow_run_logs:{run_id}", 0, 99)
         for item in reversed(cached):
-            await websocket.send_text(item)
+            await websocket.send_text(_live_log_frame(item))
 
         await pubsub.subscribe(channel)
         while True:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
             if message and message.get("type") == "message":
-                await websocket.send_text(message["data"])
+                await websocket.send_text(_live_log_frame(message["data"]))
             await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         pass

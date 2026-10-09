@@ -57,6 +57,9 @@ export function WaiversPage() {
   const [hostFilter, setHostFilter] = useState("all");
   const [expiryFilter, setExpiryFilter] = useState<ExpiryFilter>("all");
   const [rejectReasonById, setRejectReasonById] = useState<Record<number, string>>({});
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkChangeTicket, setBulkChangeTicket] = useState("");
+  const [bulkRejectReason, setBulkRejectReason] = useState("");
 
   const apiProfileId = profileFilter === "all" ? undefined : Number(profileFilter);
   const apiHostId =
@@ -75,7 +78,7 @@ export function WaiversPage() {
   });
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: () => api.profiles() });
-  const hosts = useQuery({ queryKey: ["hosts", "waivers-filter"], queryFn: () => api.hosts({ limit: 500 }) });
+  const hosts = useQuery({ queryKey: ["hosts", "waivers-filter"], queryFn: () => api.hosts({ limit: 200 }) });
 
   const profileLabel = useMemo(() => {
     const map = new Map<number, string>();
@@ -114,6 +117,7 @@ export function WaiversPage() {
       const haystack = [
         row.rule_tech_name,
         row.reason,
+        row.change_ticket ?? "",
         row.requested_by,
         row.approved_by ?? "",
         row.rejected_by ?? "",
@@ -127,6 +131,19 @@ export function WaiversPage() {
     });
   }, [waivers.data, search, hostFilter, expiryFilter, profileLabel, hostLabel]);
 
+  const pendingSelectable = useMemo(
+    () => filteredRows.filter((row) => row.status === "pending" && row.is_active),
+    [filteredRows]
+  );
+
+  const selectedPendingIds = useMemo(
+    () => pendingSelectable.filter((row) => selectedIds.has(row.id)).map((row) => row.id),
+    [pendingSelectable, selectedIds]
+  );
+
+  const allPendingSelected =
+    pendingSelectable.length > 0 && pendingSelectable.every((row) => selectedIds.has(row.id));
+
   const hasActiveFilters =
     search.trim() !== "" ||
     statusFilter !== "all" ||
@@ -136,8 +153,36 @@ export function WaiversPage() {
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["waivers"] });
 
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const toggleRow = (id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllPending = () => {
+    if (allPendingSelected) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const row of pendingSelectable) next.delete(row.id);
+        return next;
+      });
+      return;
+    }
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      for (const row of pendingSelectable) next.add(row.id);
+      return next;
+    });
+  };
+
   const approveMutation = useMutation({
-    mutationFn: api.approveWaiver,
+    mutationFn: ({ id, changeTicket }: { id: number; changeTicket?: string }) =>
+      api.approveWaiver(id, changeTicket),
     onSuccess: () => {
       toast.success(t("waivers.approved"));
       invalidate();
@@ -172,6 +217,56 @@ export function WaiversPage() {
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
 
+  const bulkApproveMutation = useMutation({
+    mutationFn: ({ ids, changeTicket }: { ids: number[]; changeTicket?: string }) =>
+      api.bulkApproveWaivers(ids, changeTicket),
+    onSuccess: (result) => {
+      const failed = result.failed.length;
+      if (failed === 0) {
+        toast.success(t("waivers.bulkApproved", { count: result.succeeded.length }));
+      } else {
+        toast.success(
+          t("waivers.bulkApprovedPartial", {
+            ok: result.succeeded.length,
+            failed,
+          })
+        );
+      }
+      clearSelection();
+      setBulkChangeTicket("");
+      invalidate();
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const bulkRejectMutation = useMutation({
+    mutationFn: ({ ids, reason }: { ids: number[]; reason?: string }) =>
+      api.bulkRejectWaivers(ids, reason),
+    onSuccess: (result) => {
+      const failed = result.failed.length;
+      if (failed === 0) {
+        toast.success(t("waivers.bulkRejected", { count: result.succeeded.length }));
+      } else {
+        toast.success(
+          t("waivers.bulkRejectedPartial", {
+            ok: result.succeeded.length,
+            failed,
+          })
+        );
+      }
+      clearSelection();
+      setBulkRejectReason("");
+      invalidate();
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const bulkPending =
+    approveMutation.isPending ||
+    rejectMutation.isPending ||
+    bulkApproveMutation.isPending ||
+    bulkRejectMutation.isPending;
+
   const clearFilters = () => {
     setSearch("");
     setStatusFilter("all");
@@ -189,6 +284,41 @@ export function WaiversPage() {
     });
     if (!ok) return;
     deleteMutation.mutate(row.id);
+  };
+
+  const handleBulkApprove = async () => {
+    if (selectedPendingIds.length === 0) return;
+    const ticket = bulkChangeTicket.trim();
+    const ok = await confirm({
+      title: t("waivers.bulkApproveTitle"),
+      message: ticket
+        ? t("waivers.bulkApproveConfirmTicket", {
+            count: selectedPendingIds.length,
+            ticket,
+          })
+        : t("waivers.bulkApproveConfirm", { count: selectedPendingIds.length }),
+      confirmLabel: t("waivers.bulkApprove"),
+    });
+    if (!ok) return;
+    bulkApproveMutation.mutate({
+      ids: selectedPendingIds,
+      changeTicket: ticket || undefined,
+    });
+  };
+
+  const handleBulkReject = async () => {
+    if (selectedPendingIds.length === 0) return;
+    const ok = await confirm({
+      title: t("waivers.bulkRejectTitle"),
+      message: t("waivers.bulkRejectConfirm", { count: selectedPendingIds.length }),
+      variant: "danger",
+      confirmLabel: t("waivers.bulkReject"),
+    });
+    if (!ok) return;
+    bulkRejectMutation.mutate({
+      ids: selectedPendingIds,
+      reason: bulkRejectReason.trim() || undefined,
+    });
   };
 
   const totalRows = waivers.data?.length ?? 0;
@@ -293,6 +423,63 @@ export function WaiversPage() {
           </div>
         </div>
 
+        {canApprove && pendingSelectable.length > 0 ? (
+          <div className="pf-waivers-bulk">
+            <div className="pf-waivers-bulk__start">
+              <Button
+                variant="secondary"
+                className="pf-btn--sm"
+                type="button"
+                disabled={bulkPending}
+                onClick={toggleSelectAllPending}
+              >
+                {allPendingSelected ? t("waivers.clearSelection") : t("waivers.selectAllPending")}
+              </Button>
+              <span className="pf-waivers-bulk__meta">
+                {t("waivers.selectedPending", { count: selectedPendingIds.length })}
+              </span>
+            </div>
+            <div className="pf-waivers-bulk__fields">
+              <input
+                className="pf-input"
+                value={bulkChangeTicket}
+                onChange={(e) => setBulkChangeTicket(e.target.value)}
+                placeholder={t("waivers.changeTicketPlaceholder")}
+                aria-label={t("waivers.changeTicket")}
+                disabled={bulkPending || selectedPendingIds.length === 0}
+              />
+              <input
+                className="pf-input"
+                value={bulkRejectReason}
+                onChange={(e) => setBulkRejectReason(e.target.value)}
+                placeholder={t("waivers.rejectReason")}
+                aria-label={t("waivers.rejectReason")}
+                disabled={bulkPending || selectedPendingIds.length === 0}
+              />
+            </div>
+            <div className="pf-waivers-bulk__actions">
+              <Button
+                variant="secondary"
+                className="pf-btn--sm"
+                type="button"
+                disabled={bulkPending || selectedPendingIds.length === 0}
+                onClick={() => void handleBulkApprove()}
+              >
+                {t("waivers.bulkApprove")}
+              </Button>
+              <Button
+                variant="danger-secondary"
+                className="pf-btn--sm"
+                type="button"
+                disabled={bulkPending || selectedPendingIds.length === 0}
+                onClick={() => void handleBulkReject()}
+              >
+                {t("waivers.bulkReject")}
+              </Button>
+            </div>
+          </div>
+        ) : null}
+
         {waivers.isLoading ? (
           <Spinner />
         ) : totalRows === 0 ? (
@@ -304,96 +491,128 @@ export function WaiversPage() {
             <table className="pf-table">
               <thead>
                 <tr>
+                  {canApprove ? (
+                    <th className="pf-table__check" scope="col" aria-label={t("waivers.selectColumn")} />
+                  ) : null}
                   <th>{t("waivers.rule")}</th>
                   <th>{t("waivers.profile")}</th>
                   <th>{t("reports.hostId")}</th>
                   <th>{t("common.status")}</th>
                   <th>{t("waivers.requestedBy")}</th>
+                  <th>{t("waivers.changeTicket")}</th>
                   <th>{t("waivers.expires")}</th>
                   <th>{t("waivers.reason")}</th>
                   <th className="pf-table__col-actions">{t("common.actions")}</th>
                 </tr>
               </thead>
               <tbody>
-                {filteredRows.map((row: ComplianceWaiver) => (
-                  <tr key={row.id}>
-                    <td className="pf-table__mono">{row.rule_tech_name}</td>
-                    <td>{profileLabel.get(row.profile_id) ?? `#${row.profile_id}`}</td>
-                    <td className="pf-table__mono">
-                      {row.host_id != null
-                        ? hostLabel.get(row.host_id) ?? row.host_id
-                        : t("waivers.allHosts")}
-                    </td>
-                    <td>
-                      <Badge variant={statusVariant(row.status)}>{t(`waivers.status.${row.status}`)}</Badge>
-                    </td>
-                    <td>{row.requested_by}</td>
-                    <td>
-                      {row.expires_at
-                        ? new Date(row.expires_at).toLocaleString(dateLocale)
-                        : t("waivers.noExpiry")}
-                    </td>
-                    <td>{row.reason}</td>
-                    <td className="pf-table__col-actions">
-                      <div className="pf-table__actions pf-table__actions--allow-wrap">
-                        {canApprove && row.status === "pending" && row.is_active && (
-                          <>
-                            <Button
-                              variant="secondary"
-                              className="pf-btn--sm"
-                              onClick={() => approveMutation.mutate(row.id)}
-                              disabled={approveMutation.isPending}
-                            >
-                              {t("waivers.approve")}
-                            </Button>
+                {filteredRows.map((row: ComplianceWaiver) => {
+                  const isPending = row.status === "pending" && row.is_active;
+                  return (
+                    <tr key={row.id}>
+                      {canApprove ? (
+                        <td className="pf-table__check">
+                          {isPending ? (
                             <input
-                              className="pf-input"
-                              style={{ width: "8rem" }}
-                              placeholder={t("waivers.rejectReason")}
-                              value={rejectReasonById[row.id] ?? ""}
-                              onChange={(e) =>
-                                setRejectReasonById((prev) => ({ ...prev, [row.id]: e.target.value }))
-                              }
+                              type="checkbox"
+                              className="pf-checkbox-control"
+                              checked={selectedIds.has(row.id)}
+                              disabled={bulkPending}
+                              onChange={() => toggleRow(row.id)}
+                              aria-label={t("waivers.selectRow", { rule: row.rule_tech_name })}
                             />
+                          ) : null}
+                        </td>
+                      ) : null}
+                      <td className="pf-table__mono">{row.rule_tech_name}</td>
+                      <td>{profileLabel.get(row.profile_id) ?? `#${row.profile_id}`}</td>
+                      <td className="pf-table__mono">
+                        {row.host_id != null
+                          ? hostLabel.get(row.host_id) ?? row.host_id
+                          : t("waivers.allHosts")}
+                      </td>
+                      <td>
+                        <Badge variant={statusVariant(row.status)}>
+                          {t(`waivers.status.${row.status}`)}
+                        </Badge>
+                      </td>
+                      <td>{row.requested_by}</td>
+                      <td className="pf-table__mono">{row.change_ticket || t("common.dash")}</td>
+                      <td>
+                        {row.expires_at
+                          ? new Date(row.expires_at).toLocaleString(dateLocale)
+                          : t("waivers.noExpiry")}
+                      </td>
+                      <td>{row.reason}</td>
+                      <td className="pf-table__col-actions">
+                        <div className="pf-table__actions pf-table__actions--allow-wrap">
+                          {canApprove && isPending && (
+                            <>
+                              <Button
+                                variant="secondary"
+                                className="pf-btn--sm"
+                                onClick={() =>
+                                  approveMutation.mutate({
+                                    id: row.id,
+                                    changeTicket: bulkChangeTicket.trim() || undefined,
+                                  })
+                                }
+                                disabled={bulkPending}
+                              >
+                                {t("waivers.approve")}
+                              </Button>
+                              <input
+                                className="pf-input"
+                                style={{ width: "8rem" }}
+                                placeholder={t("waivers.rejectReason")}
+                                value={rejectReasonById[row.id] ?? ""}
+                                onChange={(e) =>
+                                  setRejectReasonById((prev) => ({
+                                    ...prev,
+                                    [row.id]: e.target.value,
+                                  }))
+                                }
+                              />
+                              <Button
+                                variant="danger-secondary"
+                                className="pf-btn--sm"
+                                onClick={() =>
+                                  rejectMutation.mutate({
+                                    id: row.id,
+                                    reason: rejectReasonById[row.id]?.trim() || undefined,
+                                  })
+                                }
+                                disabled={bulkPending}
+                              >
+                                {t("waivers.reject")}
+                              </Button>
+                            </>
+                          )}
+                          {canApprove && row.status === "approved" && row.is_active && (
                             <Button
                               variant="danger-secondary"
                               className="pf-btn--sm"
-                              onClick={() =>
-                                rejectMutation.mutate({
-                                  id: row.id,
-                                  reason: rejectReasonById[row.id]?.trim() || undefined,
-                                })
-                              }
-                              disabled={rejectMutation.isPending}
+                              onClick={() => revokeMutation.mutate(row.id)}
+                              disabled={revokeMutation.isPending}
                             >
-                              {t("waivers.reject")}
+                              {t("waivers.revoke")}
                             </Button>
-                          </>
-                        )}
-                        {canApprove && row.status === "approved" && row.is_active && (
-                          <Button
-                            variant="danger-secondary"
-                            className="pf-btn--sm"
-                            onClick={() => revokeMutation.mutate(row.id)}
-                            disabled={revokeMutation.isPending}
-                          >
-                            {t("waivers.revoke")}
-                          </Button>
-                        )}
-                        {canDelete ? (
-                          <Button
-                            variant="danger-secondary"
-                            className="pf-btn--sm"
-                            onClick={() => void handleDelete(row)}
-                            disabled={deleteMutation.isPending}
-                          >
-                            {t("common.delete")}
-                          </Button>
-                        ) : null}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                          )}
+                          {canDelete ? (
+                            <Button
+                              variant="danger-secondary"
+                              className="pf-btn--sm"
+                              onClick={() => void handleDelete(row)}
+                              disabled={deleteMutation.isPending}
+                            >
+                              {t("common.delete")}
+                            </Button>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

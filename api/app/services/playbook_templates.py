@@ -394,14 +394,7 @@ PLAYBOOK_TEMPLATES: list[dict[str, str]] = [
   gather_facts: false
   tasks:
     - name: ICMP ping
-      ansible.builtin.command:
-        argv:
-          - ping
-          - "-c"
-          - "1"
-          - "-W"
-          - "2"
-          - "{{ ansible_host }}"
+      ansible.builtin.command: ping -c 1 -W 2 {{ ansible_host }}
       delegate_to: localhost
       register: icmp_ping
       changed_when: false

@@ -13,11 +13,11 @@ from app.services.dispatch import (
 from secaudit_core.celery_dispatch import revoke_task
 from secaudit_core.notifications import enqueue_run_notification, events_for_terminal_status
 
-from app.core.auth import AuthUser, require_roles
-from app.core.roles import require_reports
+from app.core.auth import AuthUser
+from app.core.roles import require_jobs_run, require_reports
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Host, Job, JobHost, JobRun, JobScope, JobStatus, UserRole
+from app.models import Host, Job, JobHost, JobRun, JobScope, JobStatus
 from app.pagination import paginate_scalars, pagination_params
 from app.schemas import CheckResultRead, JobCreate, JobRead, JobRunDetail, JobRunRead, JobUpdate, PaginatedResponse
 from app.services.audit_log import log_audit_event
@@ -26,7 +26,6 @@ from app.services.network_jobs import validate_job_scope
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
-    assert_can_mutate,
     assert_hosts_accessible,
     assign_host_target_scope,
     assign_owner,
@@ -78,7 +77,7 @@ async def create_job(
     data: JobCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+    user: AuthUser = Depends(require_jobs_run),
 ) -> JobRead:
     if not data.profile_id and not data.playbook_id:
         raise HTTPException(status_code=400, detail="profile_id or playbook_id is required")
@@ -95,16 +94,13 @@ async def create_job(
         ),
         network_check_mode=network_check_mode,
     )
-    try:
-        apply_webhook_fields(
-            job,
-            settings=settings,
-            webhook_enabled=data.webhook_enabled,
-            webhook_events=data.webhook_events,
-            webhook_url=data.webhook_url,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    apply_webhook_fields(
+        job,
+        settings=settings,
+        webhook_enabled=data.webhook_enabled,
+        webhook_events=data.webhook_events,
+        webhook_url=data.webhook_url,
+    )
     assign_owner(job, user)
     assign_host_target_scope(job, user)
     db.add(job)
@@ -134,7 +130,7 @@ async def update_job(
     data: JobUpdate,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+    user: AuthUser = Depends(require_jobs_run),
 ) -> JobRead:
     result = await db.execute(
         select(Job).options(selectinload(Job.job_hosts)).where(Job.id == job_id)
@@ -142,7 +138,7 @@ async def update_job(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    assert_can_mutate(user, job.owner_sub, detail="Job not found")
+    assert_can_access(user, job.owner_sub, detail="Job not found")
 
     updates = data.model_dump(exclude_unset=True)
     host_ids = updates.pop("host_ids", None)
@@ -167,17 +163,14 @@ async def update_job(
     for field, value in updates.items():
         setattr(job, field, value)
 
-    try:
-        apply_webhook_fields(
-            job,
-            settings=settings,
-            webhook_enabled=webhook_enabled,
-            webhook_events=webhook_events,
-            webhook_url=webhook_url,
-            clear_webhook_url=clear_webhook_url,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    apply_webhook_fields(
+        job,
+        settings=settings,
+        webhook_enabled=webhook_enabled,
+        webhook_events=webhook_events,
+        webhook_url=webhook_url,
+        clear_webhook_url=clear_webhook_url,
+    )
 
     if not job.profile_id and not job.playbook_id:
         raise HTTPException(status_code=400, detail="profile_id or playbook_id is required")
@@ -226,13 +219,13 @@ async def run_job(
     job_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+    user: AuthUser = Depends(require_jobs_run),
 ) -> JobRunRead:
     result = await db.execute(select(Job).where(Job.id == job_id))
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    assert_can_mutate(user, job.owner_sub, detail="Job not found")
+    assert_can_access(user, job.owner_sub, detail="Job not found")
 
     job_run = JobRun(job_id=job.id, status=JobStatus.PENDING)
     db.add(job_run)
@@ -359,7 +352,7 @@ async def stop_job_run(
     run_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+    user: AuthUser = Depends(require_jobs_run),
 ) -> JobRunRead:
     result = await db.execute(select(JobRun).where(JobRun.id == run_id))
     job_run = result.scalar_one_or_none()
@@ -367,7 +360,7 @@ async def stop_job_run(
         raise HTTPException(status_code=404, detail="Job run not found")
 
     job = await db.get(Job, job_run.job_id)
-    assert_can_mutate(user, job.owner_sub if job else None, detail="Job run not found")
+    assert_can_access(user, job.owner_sub if job else None, detail="Job run not found")
 
     if job_run.status not in (JobStatus.PENDING, JobStatus.RUNNING):
         raise HTTPException(status_code=409, detail=f"Cannot stop run in status '{job_run.status.value}'")
@@ -398,7 +391,7 @@ async def stop_job_run(
 async def delete_job_run(
     run_id: int,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+    user: AuthUser = Depends(require_jobs_run),
 ) -> None:
     result = await db.execute(
         select(JobRun).options(selectinload(JobRun.check_results)).where(JobRun.id == run_id)
@@ -408,7 +401,7 @@ async def delete_job_run(
         raise HTTPException(status_code=404, detail="Job run not found")
 
     job = await db.get(Job, job_run.job_id)
-    assert_can_mutate(user, job.owner_sub if job else None, detail="Job run not found")
+    assert_can_access(user, job.owner_sub if job else None, detail="Job run not found")
 
     if job_run.status in (JobStatus.PENDING, JobStatus.RUNNING):
         if job_run.celery_task_id:
@@ -425,7 +418,7 @@ async def delete_job(
     job_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+    user: AuthUser = Depends(require_jobs_run),
 ) -> None:
     result = await db.execute(
         select(Job)
@@ -438,7 +431,7 @@ async def delete_job(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    assert_can_mutate(user, job.owner_sub, detail="Job not found")
+    assert_can_access(user, job.owner_sub, detail="Job not found")
 
     for job_run in list(job.runs):
         if job_run.status in (JobStatus.PENDING, JobStatus.RUNNING):

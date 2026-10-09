@@ -17,6 +17,52 @@ from app.executors.ssh import unique_remote_script_path
 
 _settings = SecAuditSettings()
 
+# Keep OS/runtime basics for Netmiko/Paramiko; never inherit worker secrets.
+_LOCAL_ENV_PASSTHROUGH = frozenset(
+    {
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+        "TERM",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "USERNAME",
+        "USERPROFILE",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+    }
+)
+
+
+def _isolated_local_script_env() -> dict[str, str]:
+    """Build a minimal env so package scripts cannot read worker secrets from os.environ."""
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key.upper() in _LOCAL_ENV_PASSTHROUGH:
+            env[key] = value
+    # Prefer the same interpreter's environment encoding defaults.
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
 
 def _checked_output(result, *, success_codes: tuple[int, ...] = (0,)) -> str:
     """Accept only documented success codes while retaining both output streams."""
@@ -55,7 +101,6 @@ def run_script_locally_with_resource_env(
     cancel_event: threading.Event | None = None,
     extra_env: dict[str, str] | None = None,
     key_passphrase: str | None = None,
-    package_root: Path | None = None,
 ) -> str:
     """Run a package Python check on the worker (Netmiko/Paramiko reach the device).
 
@@ -63,6 +108,10 @@ def run_script_locally_with_resource_env(
     devices via netmiko expect resource_ip / resource_user / resource_pass (and
     optionally ssh_private_key_path) in the environment — same convention as
     Juniper_CRE_NUP / Cisco ONLINE scripts.
+
+    When SECAUDIT_OFFLINE_MODE is set (config_upload / both with uploaded config),
+    resource_* credentials are omitted so package collectors stay offline and
+    evaluate the vendor profile against the uploaded config file.
     """
     if not script_path.exists():
         raise FileNotFoundError(f"Script not found: {script_path}")
@@ -70,34 +119,39 @@ def run_script_locally_with_resource_env(
     cancel_event = cancel_event if cancel_event is not None else get_cancel_event()
     raise_if_cancelled()
 
-    resolved_script = script_path.resolve()
-    package_dir = (package_root or resolved_script.parent).resolve()
-    if package_dir not in resolved_script.parents and resolved_script != package_dir:
-        raise ValueError(f"Python script escapes package directory: {script_path}")
-
-    env = os.environ.copy()
-    env["resource_ip"] = hostname.strip()
-    env["resource_user"] = username
-    env["resource_port"] = str(port)
-    if password:
-        env["resource_pass"] = password
-    pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = (
-        f"{package_dir}{os.pathsep}{pythonpath}" if pythonpath else str(package_dir)
-    )
+    package_dir = script_path.resolve().parent
+    # Do not copy worker os.environ (SECRET_KEY, DB/Redis/Vault URLs, etc.).
+    env = _isolated_local_script_env()
     if extra_env:
-        env.update(extra_env)
-    # Worker runs as root; bytecode in the package tree blocks API (secaudit) re-sync.
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Explicit job/package extras only (e.g. SECAUDIT_CONFIG_FILE).
+        env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
+
+    offline = str(env.get("SECAUDIT_OFFLINE_MODE", "")).strip().lower() in {"1", "true", "yes"}
+    if not offline:
+        env["resource_ip"] = hostname.strip()
+        env["resource_user"] = username
+        env["resource_port"] = str(port)
+        if password:
+            env["resource_pass"] = password
+    env["PYTHONPATH"] = str(package_dir)
 
     key_path: Path | None = None
+    scratch_dir: tempfile.TemporaryDirectory[str] | None = None
     try:
-        if private_key:
+        scratch_dir = tempfile.TemporaryDirectory(prefix="secaudit_net_home_")
+        env["HOME"] = scratch_dir.name
+        env["USERPROFILE"] = scratch_dir.name
+        env["TEMP"] = scratch_dir.name
+        env["TMP"] = scratch_dir.name
+        env["TMPDIR"] = scratch_dir.name
+
+        if private_key and not offline:
             key_file = tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
                 suffix=".pem",
                 prefix="secaudit_net_key_",
+                dir=scratch_dir.name,
                 delete=False,
             )
             with key_file:
@@ -116,9 +170,10 @@ def run_script_locally_with_resource_env(
         span_attrs = {
             "secaudit.executor": "python_local",
             "secaudit.script": script_path.name,
-            "net.peer.name": hostname,
-            "net.peer.port": port,
-            "enduser.id": username,
+            "net.peer.name": hostname if not offline else "offline",
+            "net.peer.port": port if not offline else 0,
+            "enduser.id": username if not offline else "offline",
+            "secaudit.offline": offline,
         }
         with start_span(f"executor.python.local {script_path.name}", attributes=span_attrs, kind="client"):
             raise_if_cancelled()
@@ -143,6 +198,8 @@ def run_script_locally_with_resource_env(
                 key_path.unlink(missing_ok=True)
             except OSError:
                 pass
+        if scratch_dir is not None:
+            scratch_dir.cleanup()
 
 
 async def _watch_cancel(

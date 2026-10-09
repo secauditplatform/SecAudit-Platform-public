@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 from email.message import EmailMessage
 from typing import Any
@@ -12,12 +13,6 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from secaudit_core.celery_dispatch import send_task
-from secaudit_core.egress import (
-    pinned_https_url,
-    sanitize_outbound_headers,
-    validate_public_https_url,
-    validate_smtp_endpoint,
-)
 from secaudit_core.enums import JobStatus, NotificationChannelType, NotificationEventType
 from secaudit_core.models import NotificationChannel
 from secaudit_core.secrets import decrypt_secret
@@ -36,6 +31,11 @@ RUN_KIND_LABELS = {
     "remediation": "Remediation job",
     "inventory": "Inventory scan",
 }
+
+_TELEGRAM_API_ROOT = "https://api.telegram.org"
+_TELEGRAM_BOT_TOKEN_RE = re.compile(r"\d{6,16}:[A-Za-z0-9_-]{30,64}")
+_TELEGRAM_CHAT_ID_RE = re.compile(r"^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$")
+_TELEGRAM_MESSAGE_LIMIT = 4000
 
 EVENT_LABELS = {
     NotificationEventType.RUN_FAILED.value: "Run failed",
@@ -324,6 +324,14 @@ def deliver_per_job_webhook(db: Session, payload: dict[str, Any], settings: SecA
         return {"sent": 0, "errors": [safe_error]}
 
 
+def _resolve_webhook_url(channel: NotificationChannel, settings: SecAuditSettings) -> str | None:
+    if channel.encrypted_secret:
+        return decrypt_secret(channel.encrypted_secret, settings)
+    config = channel.config_json or {}
+    url = config.get("webhook_url")
+    return str(url) if url else None
+
+
 def _normalize_email_recipients(raw: object) -> list[str]:
     if raw is None:
         return []
@@ -347,13 +355,6 @@ def _deliver_email(channel: NotificationChannel, payload: dict[str, Any], settin
         )
 
     smtp_port = int(config.get("smtp_port") or settings.smtp_port or 587)
-    # Operator-supplied host must be public; env SMTP_HOST may be private (Mailpit).
-    allow_private = not bool((config.get("smtp_host") or "").strip())
-    smtp_host, smtp_port = validate_smtp_endpoint(
-        smtp_host,
-        smtp_port,
-        allow_private=allow_private,
-    )
     smtp_user = config.get("smtp_user") or settings.smtp_user
     smtp_password = None
     if channel.encrypted_secret:
@@ -388,10 +389,18 @@ def _deliver_email(channel: NotificationChannel, payload: dict[str, Any], settin
 
 
 def _deliver_webhook(url: str, body: dict[str, Any], headers: dict[str, str] | None = None) -> None:
-    safe_url, pin_headers = pinned_https_url(url)
-    request_headers = {"Content-Type": "application/json", **pin_headers}
+    from secaudit_core.settings import SecAuditSettings
+    from secaudit_core.url_safety import validate_outbound_webhook_url
+
+    settings = SecAuditSettings()
+    safe_url = validate_outbound_webhook_url(
+        url,
+        allow_http=settings.app_env.strip().lower() != "production",
+        allow_private=settings.outbound_webhooks_allow_private,
+    )
+    request_headers = {"Content-Type": "application/json"}
     if headers:
-        request_headers.update(sanitize_outbound_headers(headers))
+        request_headers.update(headers)
     response = httpx.post(
         safe_url,
         json=body,
@@ -400,14 +409,6 @@ def _deliver_webhook(url: str, body: dict[str, Any], headers: dict[str, str] | N
         follow_redirects=False,
     )
     response.raise_for_status()
-
-
-def _resolve_webhook_url(channel: NotificationChannel, settings: SecAuditSettings) -> str | None:
-    if channel.encrypted_secret:
-        return decrypt_secret(channel.encrypted_secret, settings)
-    config = channel.config_json or {}
-    url = config.get("webhook_url")
-    return str(url).strip() if url else None
 
 
 def _deliver_slack(channel: NotificationChannel, payload: dict[str, Any], settings: SecAuditSettings) -> None:
@@ -446,6 +447,96 @@ def _deliver_teams(channel: NotificationChannel, payload: dict[str, Any], settin
     _deliver_webhook(url, body)
 
 
+def normalize_telegram_chat_id(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("Telegram chat ID is required")
+    if not _TELEGRAM_CHAT_ID_RE.fullmatch(text):
+        raise ValueError("Telegram chat ID is invalid")
+    return text
+
+
+def normalize_telegram_bot_token(secret: str) -> str:
+    text = (secret or "").strip()
+    url_match = re.fullmatch(
+        r"https://api\.telegram\.org/bot(\d{6,16}:[A-Za-z0-9_-]{30,64})(?:/sendMessage)?/?",
+        text,
+    )
+    token = url_match.group(1) if url_match else text
+    if not _TELEGRAM_BOT_TOKEN_RE.fullmatch(token):
+        raise ValueError("Telegram bot token is invalid")
+    return token
+
+
+def prepare_telegram_channel(
+    config_json: dict | None,
+    secret: str | None,
+    *,
+    has_stored_secret: bool,
+) -> tuple[dict, str | None]:
+    """Validate a Telegram channel and return config plus the token to store.
+
+    The bot token is never kept in ``config_json``. An empty secret keeps the
+    already stored token when ``has_stored_secret`` is true.
+    """
+    config = dict(config_json or {})
+    config["chat_id"] = normalize_telegram_chat_id(config.get("chat_id"))
+    for key in ("bot_token", "token", "telegram_token"):
+        config.pop(key, None)
+
+    raw_secret = (secret or "").strip()
+    if raw_secret:
+        return config, normalize_telegram_bot_token(raw_secret)
+    if not has_stored_secret:
+        raise ValueError("Telegram bot token is required")
+    return config, None
+
+
+def _telegram_chat_id_for_api(chat_id: str) -> str | int:
+    if chat_id.startswith("@"):
+        return chat_id
+    return int(chat_id)
+
+
+def _deliver_telegram(channel: NotificationChannel, payload: dict[str, Any], settings: SecAuditSettings) -> None:
+    if not channel.encrypted_secret:
+        raise ValueError("Telegram bot token is not configured")
+    token = normalize_telegram_bot_token(decrypt_secret(channel.encrypted_secret, settings))
+    chat_id = normalize_telegram_chat_id((channel.config_json or {}).get("chat_id"))
+    title, text = _format_message(payload)
+    message = f"{title}\n\n{text}"
+    if len(message) > _TELEGRAM_MESSAGE_LIMIT:
+        message = message[: _TELEGRAM_MESSAGE_LIMIT - 1] + "…"
+
+    try:
+        response = httpx.post(
+            f"{_TELEGRAM_API_ROOT}/bot{token}/sendMessage",
+            json={
+                "chat_id": _telegram_chat_id_for_api(chat_id),
+                "text": message,
+                "disable_web_page_preview": True,
+            },
+            timeout=30.0,
+            follow_redirects=False,
+        )
+    except httpx.HTTPError as exc:
+        raise ValueError("Telegram delivery failed") from exc
+
+    if response.is_success:
+        return
+
+    description = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            description = str(body.get("description") or "")
+    except ValueError:
+        description = ""
+    description = description.replace(token, "[REDACTED]")[:200]
+    detail = description or f"HTTP {response.status_code}"
+    raise ValueError(f"Telegram API error: {detail}")
+
+
 def _deliver_generic_webhook(channel: NotificationChannel, payload: dict[str, Any], settings: SecAuditSettings) -> None:
     url = _resolve_webhook_url(channel, settings)
     if not url:
@@ -464,6 +555,9 @@ def deliver_to_channel(channel: NotificationChannel, payload: dict[str, Any], se
         return
     if channel.channel_type == NotificationChannelType.TEAMS:
         _deliver_teams(channel, payload, settings)
+        return
+    if channel.channel_type == NotificationChannelType.TELEGRAM:
+        _deliver_telegram(channel, payload, settings)
         return
     if channel.channel_type == NotificationChannelType.WEBHOOK:
         _deliver_generic_webhook(channel, payload, settings)

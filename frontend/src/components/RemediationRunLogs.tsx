@@ -18,7 +18,7 @@ type RemediationRunLogsProps = {
 export function RemediationRunLogs({ runId }: RemediationRunLogsProps) {
   const { t } = useTranslation();
   const { token, ready } = useAuth();
-  const authEnabled = import.meta.env.VITE_AUTH_ENABLED === "true";
+  const authEnabled = import.meta.env.VITE_AUTH_ENABLED !== "false";
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const containerRef = useRef<HTMLDivElement>(null);
 

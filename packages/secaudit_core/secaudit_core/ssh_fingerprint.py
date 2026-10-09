@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import re
 import subprocess
 
+from secaudit_core.inventory_scan import HOSTNAME_PATTERN
+
 
 _FINGERPRINT_RE = re.compile(r"^SHA256:([A-Za-z0-9+/]+={0,2})$", re.IGNORECASE)
+_DANGEROUS_HOST_CHARS = set(";|&$`<>(){}\\\"'\n\r\t ")
 
 
 def normalize_ssh_fingerprint(value: str) -> str:
@@ -62,14 +66,33 @@ def verify_or_pin_host_key(
     return fingerprint, entry
 
 
+def validate_ssh_scan_host(hostname: str) -> str:
+    """Validate hostname/IP for ssh-keyscan (reject flag injection / metacharacters)."""
+    host = (hostname or "").strip()
+    if not host or len(host) > 253:
+        raise ValueError("Hostname is required")
+    if host.startswith("-"):
+        raise ValueError("Hostname must not start with '-'")
+    if any(ch in host for ch in _DANGEROUS_HOST_CHARS):
+        raise ValueError("Hostname contains invalid characters")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if not HOSTNAME_PATTERN.fullmatch(host):
+        raise ValueError("Invalid hostname for SSH key scan")
+    return host
+
+
 def scan_ssh_host_key(hostname: str, port: int = 22, *, timeout: int = 15) -> tuple[str, str]:
     """Fetch host keys via ssh-keyscan. Returns (fingerprint, known_hosts_line)."""
-    host = hostname.strip()
-    if not host:
-        raise ValueError("Hostname is required")
+    host = validate_ssh_scan_host(hostname)
+    if not isinstance(port, int) or port < 1 or port > 65535:
+        raise ValueError("SSH port must be between 1 and 65535")
 
     result = subprocess.run(
-        ["ssh-keyscan", "-p", str(port), "-T", "10", host],
+        ["ssh-keyscan", "-p", str(port), "-T", "10", "--", host],
         capture_output=True,
         text=True,
         timeout=timeout,

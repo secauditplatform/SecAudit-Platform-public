@@ -47,6 +47,15 @@ def resolve_filter_host_ids(
     os_type = (dynamic_filter.get("os_type") or "").strip()
     if os_type:
         stmt = stmt.where(Host.os_type == os_type)
+    site = (dynamic_filter.get("site") or "").strip()
+    if site:
+        stmt = stmt.where(Host.site == site)
+    environment = (dynamic_filter.get("environment") or "").strip()
+    if environment:
+        stmt = stmt.where(Host.environment == environment)
+    criticality = (dynamic_filter.get("criticality") or "").strip().lower()
+    if criticality:
+        stmt = stmt.where(Host.criticality == criticality)
     return list(db.execute(stmt).scalars().all())
 
 
@@ -56,31 +65,18 @@ def find_existing_inventory_host(
     owner_sub: str | None,
     ip: str,
     hostname: str | None = None,
+    ssh_host_key_fingerprint: str | None = None,
 ) -> Host | None:
     """Reuse a durable inventory host for this owner (never another tenant, never ephemeral)."""
-    from sqlalchemy import func, or_
+    from secaudit_core.audit_flow_inventory import find_inventory_host
 
-    keys = []
-    for value in (ip, hostname):
-        text = (value or "").strip().lower()
-        if text:
-            keys.append(text)
-    if not keys:
-        return None
-    identity = or_(func.lower(Host.hostname).in_(keys), func.lower(Host.name).in_(keys))
-    if owner_sub is None:
-        owner_match = Host.owner_sub.is_(None)
-    else:
-        owner_match = or_(Host.owner_sub == owner_sub, Host.owner_sub.is_(None))
-    candidates = list(
-        db.execute(
-            select(Host).where(identity, owner_match, Host.is_ephemeral.is_(False)).limit(20)
-        ).scalars()
+    return find_inventory_host(
+        db,
+        owner_sub=owner_sub,
+        ip=ip,
+        hostname=hostname,
+        ssh_host_key_fingerprint=ssh_host_key_fingerprint,
     )
-    if not candidates:
-        return None
-    same_owner = [host for host in candidates if host.owner_sub == owner_sub]
-    return same_owner[0] if same_owner else candidates[0]
 
 
 def resolve_remediation_host_ids(

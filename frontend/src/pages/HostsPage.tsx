@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { api, type Host, type InventoryScan } from "../api/client";
+import { api, type Host, type HostCriticality, type InventoryScan } from "../api/client";
 import { HostCredentialPopover } from "../components/HostCredentialPopover";
+import { DirectoryDiscoveryPanel } from "../components/DirectoryDiscoveryPanel";
+import { HostCsvImportPanel } from "../components/HostCsvImportPanel";
 import { OpsListExpandFooter } from "../components/OpsListExpandFooter";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
@@ -19,6 +21,17 @@ import { useAuth } from "../auth/AuthProvider";
 import { ObjectOwnerCell } from "../components/ObjectOwnerCell";
 import { useTableSort } from "../hooks/useTableSort";
 import { sliceOpsList } from "../utils/opsListLimit";
+import { hostCriticalityVariant } from "../utils/statusVariant";
+
+function scanMethodLabel(
+  scan: Pick<InventoryScan, "method" | "nmap_flags" | "snmp_port">,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if ((scan.method ?? "nmap") === "snmp") {
+    return t("hosts.scanMethodSnmpUsed", { port: scan.snmp_port ?? 161 });
+  }
+  return `${t("hosts.scanNmapFlagsUsed")}: ${formatNmapFlagsDisplay(scan.nmap_flags, t("hosts.scanNmapFlagsDefault"))}`;
+}
 
 function formatNmapFlagsDisplay(raw: string | null | undefined, fallback: string): string {
   if (!raw) return fallback;
@@ -170,9 +183,8 @@ function ScanTaskRow({
                   {t("hosts.scanSkippedExisting")}: <strong>{skippedExisting}</strong>
                 </span>
               ) : null}
-              <span className="pf-scan-task__flags" title={formatNmapFlagsDisplay(scan.nmap_flags, t("hosts.scanNmapFlagsDefault"))}>
-                {t("hosts.scanNmapFlagsUsed")}:{" "}
-                <code>{formatNmapFlagsDisplay(scan.nmap_flags, t("hosts.scanNmapFlagsDefault"))}</code>
+              <span className="pf-scan-task__flags" title={scanMethodLabel(scan, t)}>
+                {scanMethodLabel(scan, t)}
               </span>
               <span>{new Date(scan.created_at).toLocaleString(dateLocale)}</span>
             </div>
@@ -192,12 +204,13 @@ function ScanTaskRow({
       {expanded && (
         <div className="pf-scan-task__body">
           <p className="pf-scan-task__flags-detail">
-            <span className="pf-table__muted">{t("hosts.scanNmapFlagsUsed")}: </span>
-            <code>{formatNmapFlagsDisplay(detail.data?.nmap_flags ?? scan.nmap_flags, t("hosts.scanNmapFlagsDefault"))}</code>
+            <span className="pf-table__muted">{scanMethodLabel(live, t)}</span>
           </p>
           {isLive && (
             <p className="pf-table__muted">
-              {results.length === 0 ? t("hosts.scanInProgressDiscovery") : t("hosts.scanInProgressPorts")}
+              {(live.method ?? "nmap") === "snmp" || results.length === 0
+                ? t("hosts.scanInProgressDiscovery")
+                : t("hosts.scanInProgressPorts")}
             </p>
           )}
           {detail.isLoading ? (
@@ -224,7 +237,14 @@ function ScanTaskRow({
                     return (
                       <tr key={row.id}>
                         <td className="pf-table__mono">{row.ip_address}</td>
-                        <td>{row.resolved_hostname || t("common.dash")}</td>
+                        <td>
+                          {row.resolved_hostname || t("common.dash")}
+                          {row.platform_hint ? (
+                            <div className="pf-table__muted" title={row.platform_hint}>
+                              {row.platform_hint.split("\n")[0]}
+                            </div>
+                          ) : null}
+                        </td>
                         <td className="pf-table__mono">
                           {row.open_ports.length > 0
                             ? row.open_ports.join(", ")
@@ -297,13 +317,19 @@ export function HostsPage() {
     hostname: "",
     port: "22",
     os_type: "linux",
+    site: "",
+    environment: "",
+    criticality: "" as HostCriticality | "",
     credential_id: "" as number | "",
     is_active: true,
   });
   const [form, setForm] = useState(emptyHostForm);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [scanTarget, setScanTarget] = useState("127.0.0.1");
+  const [scanMethod, setScanMethod] = useState<"nmap" | "snmp">("nmap");
   const [scanNmapFlags, setScanNmapFlags] = useState("");
+  const [scanCredentialId, setScanCredentialId] = useState<number | "">("");
+  const [scanSnmpPort, setScanSnmpPort] = useState("161");
   const [expandedScanId, setExpandedScanId] = useState<number | null>(null);
   const [scanHistoryCollapsed, setScanHistoryCollapsed] = useState(false);
   const [scanListExpanded, setScanListExpanded] = useState(false);
@@ -313,6 +339,9 @@ export function HostsPage() {
   const [hostOsFilter, setHostOsFilter] = useState("all");
   const [hostStatusFilter, setHostStatusFilter] = useState<HostStatusFilter>("all");
   const [hostCredentialFilter, setHostCredentialFilter] = useState<HostCredentialFilter>("all");
+  const [hostSiteFilter, setHostSiteFilter] = useState("all");
+  const [hostEnvironmentFilter, setHostEnvironmentFilter] = useState("all");
+  const [hostCriticalityFilter, setHostCriticalityFilter] = useState<HostCriticality | "all">("all");
   const [hostListExpanded, setHostListExpanded] = useState(false);
   const hostFormPanelRef = useRef<HTMLDivElement | null>(null);
   const urlEditHostId = parseHostEditId(searchParams.get("edit"));
@@ -358,6 +387,9 @@ export function HostsPage() {
         hostname: host.hostname,
         port: String(host.port ?? 22),
         os_type: host.os_type ?? "linux",
+        site: host.site ?? "",
+        environment: host.environment ?? "",
+        criticality: host.criticality ?? "",
         credential_id: host.credential_id ?? "",
         is_active: host.is_active,
       });
@@ -487,7 +519,8 @@ export function HostsPage() {
       return (
         scan.target.toLowerCase().includes(query) ||
         String(scan.id).includes(query) ||
-        formatNmapFlagsDisplay(scan.nmap_flags, "").toLowerCase().includes(query)
+        formatNmapFlagsDisplay(scan.nmap_flags, "").toLowerCase().includes(query) ||
+        (scan.method ?? "nmap").includes(query)
       );
     });
   }, [scans.data, scanSearch, scanStatusFilter]);
@@ -507,22 +540,68 @@ export function HostsPage() {
       if (hostStatusFilter === "inactive" && host.is_active) return false;
       if (hostCredentialFilter === "with" && !hostHasCredential(host)) return false;
       if (hostCredentialFilter === "without" && hostHasCredential(host)) return false;
+      if (hostSiteFilter !== "all" && (host.site ?? "") !== hostSiteFilter) return false;
+      if (hostEnvironmentFilter !== "all" && (host.environment ?? "") !== hostEnvironmentFilter) {
+        return false;
+      }
+      if (hostCriticalityFilter !== "all" && (host.criticality ?? "") !== hostCriticalityFilter) {
+        return false;
+      }
       if (!query) return true;
       return (
         host.name.toLowerCase().includes(query) ||
         host.hostname.toLowerCase().includes(query) ||
-        String(host.port).includes(query)
+        String(host.port).includes(query) ||
+        (host.site ?? "").toLowerCase().includes(query) ||
+        (host.environment ?? "").toLowerCase().includes(query) ||
+        (host.criticality ?? "").toLowerCase().includes(query)
       );
     });
-  }, [hostRows, hostSearch, hostOsFilter, hostStatusFilter, hostCredentialFilter]);
+  }, [
+    hostRows,
+    hostSearch,
+    hostOsFilter,
+    hostStatusFilter,
+    hostCredentialFilter,
+    hostSiteFilter,
+    hostEnvironmentFilter,
+    hostCriticalityFilter,
+  ]);
+
+  const hostSiteOptions = useMemo(
+    () =>
+      [...new Set(hostRows.map((host) => host.site?.trim()).filter(Boolean) as string[])].sort((a, b) =>
+        a.localeCompare(b)
+      ),
+    [hostRows]
+  );
+
+  const hostEnvironmentOptions = useMemo(
+    () =>
+      [
+        ...new Set(hostRows.map((host) => host.environment?.trim()).filter(Boolean) as string[]),
+      ].sort((a, b) => a.localeCompare(b)),
+    [hostRows]
+  );
 
   const hasActiveHostFilters =
     hostSearch.trim() !== "" ||
     hostOsFilter !== "all" ||
     hostStatusFilter !== "all" ||
-    hostCredentialFilter !== "all";
+    hostCredentialFilter !== "all" ||
+    hostSiteFilter !== "all" ||
+    hostEnvironmentFilter !== "all" ||
+    hostCriticalityFilter !== "all";
 
-  type HostSortKey = "name" | "hostname" | "port" | "os_type" | "is_active";
+  type HostSortKey =
+    | "name"
+    | "hostname"
+    | "port"
+    | "os_type"
+    | "site"
+    | "environment"
+    | "criticality"
+    | "is_active";
   const hostAccessor = useCallback((host: Host, key: HostSortKey) => {
     if (key === "is_active") return host.is_active;
     return host[key];
@@ -548,6 +627,9 @@ export function HostsPage() {
     setHostOsFilter("all");
     setHostStatusFilter("all");
     setHostCredentialFilter("all");
+    setHostSiteFilter("all");
+    setHostEnvironmentFilter("all");
+    setHostCriticalityFilter("all");
     setHostListExpanded(false);
   };
 
@@ -585,26 +667,89 @@ export function HostsPage() {
               <p className="pf-form__hint">{t("hosts.scanTargetHint")}</p>
             </div>
             <div className="pf-form__group">
-              <label htmlFor="scan-nmap-flags">{t("hosts.scanNmapFlags")}</label>
-              <input
-                id="scan-nmap-flags"
-                className="pf-input"
-                value={scanNmapFlags}
-                onChange={(e) => setScanNmapFlags(e.target.value)}
-                placeholder="-sT -p 22,80,443"
-              />
-              <p className="pf-form__hint">{t("hosts.scanNmapFlagsHint")}</p>
+              <label htmlFor="scan-method">{t("hosts.scanMethod")}</label>
+              <select
+                id="scan-method"
+                className="pf-select"
+                value={scanMethod}
+                onChange={(e) => setScanMethod(e.target.value === "snmp" ? "snmp" : "nmap")}
+              >
+                <option value="nmap">{t("hosts.scanMethodNmap")}</option>
+                <option value="snmp">{t("hosts.scanMethodSnmp")}</option>
+              </select>
             </div>
+            {scanMethod === "nmap" ? (
+              <div className="pf-form__group">
+                <label htmlFor="scan-nmap-flags">{t("hosts.scanNmapFlags")}</label>
+                <input
+                  id="scan-nmap-flags"
+                  className="pf-input"
+                  value={scanNmapFlags}
+                  onChange={(e) => setScanNmapFlags(e.target.value)}
+                  placeholder="-sT -p 22,80,443"
+                />
+                <p className="pf-form__hint">{t("hosts.scanNmapFlagsHint")}</p>
+              </div>
+            ) : (
+              <>
+                <div className="pf-form__group">
+                  <label htmlFor="scan-snmp-credential">{t("hosts.scanSnmpCredential")}</label>
+                  <select
+                    id="scan-snmp-credential"
+                    className="pf-select"
+                    value={scanCredentialId}
+                    onChange={(e) => setScanCredentialId(e.target.value ? Number(e.target.value) : "")}
+                  >
+                    <option value="">{t("hosts.scanSnmpCredentialEmpty")}</option>
+                    {(credentials.data ?? [])
+                      .filter((cred) => cred.credential_type === "snmp_v2c" || cred.credential_type === "snmp_v3")
+                      .map((cred) => (
+                        <option key={cred.id} value={cred.id}>
+                          {cred.name}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+                <div className="pf-form__group">
+                  <label htmlFor="scan-snmp-port">{t("hosts.scanSnmpPort")}</label>
+                  <input
+                    id="scan-snmp-port"
+                    className="pf-input"
+                    value={scanSnmpPort}
+                    onChange={(e) => setScanSnmpPort(e.target.value)}
+                    inputMode="numeric"
+                  />
+                  <p className="pf-form__hint">{t("hosts.scanSnmpHint")}</p>
+                </div>
+              </>
+            )}
           </div>
           <div className="pf-form__actions">
             <Button
               onClick={() =>
-                scanMutation.mutate({
-                  target: scanTarget.trim(),
-                  ...(scanNmapFlags.trim() ? { nmap_flags: scanNmapFlags.trim() } : {}),
-                })
+                scanMutation.mutate(
+                  scanMethod === "snmp"
+                    ? {
+                        target: scanTarget.trim(),
+                        method: "snmp",
+                        credential_id: Number(scanCredentialId),
+                        ...(scanSnmpPort.trim() && scanSnmpPort.trim() !== "161"
+                          ? { snmp_port: Number(scanSnmpPort) }
+                          : {}),
+                      }
+                    : {
+                        target: scanTarget.trim(),
+                        method: "nmap",
+                        ...(scanNmapFlags.trim() ? { nmap_flags: scanNmapFlags.trim() } : {}),
+                      },
+                )
               }
-              disabled={!canExecute || !scanTarget.trim() || scanMutation.isPending}
+              disabled={
+                !canExecute ||
+                !scanTarget.trim() ||
+                scanMutation.isPending ||
+                (scanMethod === "snmp" && scanCredentialId === "")
+              }
               title={!canExecute ? t("common.demoActionDisabled") : undefined}
             >
               {t("hosts.scanStart")}
@@ -709,6 +854,10 @@ export function HostsPage() {
         )}
       </Panel>
 
+      <DirectoryDiscoveryPanel canExecute={canExecute} />
+
+      {canOperate ? <HostCsvImportPanel canExecute={canExecute} /> : null}
+
       <div ref={hostFormPanelRef}>
       <Panel title={isEditing ? t("hosts.editTitle", { name: form.name }) : t("hosts.addHost")}>
         <div className="pf-form pf-form--wide">
@@ -760,6 +909,43 @@ export function HostsPage() {
                 <option value="network">{t("hosts.osNetwork")}</option>
               </select>
             </div>
+            <div className="pf-form__group">
+              <label htmlFor="host-site">{t("hosts.site")}</label>
+              <input
+                id="host-site"
+                className="pf-input"
+                value={form.site}
+                onChange={(e) => setForm({ ...form, site: e.target.value })}
+                placeholder={t("hosts.sitePlaceholder")}
+              />
+            </div>
+            <div className="pf-form__group">
+              <label htmlFor="host-environment">{t("hosts.environment")}</label>
+              <input
+                id="host-environment"
+                className="pf-input"
+                value={form.environment}
+                onChange={(e) => setForm({ ...form, environment: e.target.value })}
+                placeholder={t("hosts.environmentPlaceholder")}
+              />
+            </div>
+            <div className="pf-form__group">
+              <label htmlFor="host-criticality">{t("hosts.criticality")}</label>
+              <select
+                id="host-criticality"
+                className="pf-select"
+                value={form.criticality}
+                onChange={(e) =>
+                  setForm({ ...form, criticality: e.target.value as HostCriticality | "" })
+                }
+              >
+                <option value="">{t("hosts.criticalityUnset")}</option>
+                <option value="low">{t("hosts.criticalityLabel.low")}</option>
+                <option value="medium">{t("hosts.criticalityLabel.medium")}</option>
+                <option value="high">{t("hosts.criticalityLabel.high")}</option>
+                <option value="critical">{t("hosts.criticalityLabel.critical")}</option>
+              </select>
+            </div>
             <div className="pf-form__group pf-form__group--host-credential">
               <label htmlFor="host-cred">{t("hosts.credential")}</label>
               <select
@@ -771,7 +957,9 @@ export function HostsPage() {
                 }
               >
                 <option value="">{t("hosts.notSelected")}</option>
-                {credentials.data?.map((c) => (
+                {credentials.data
+                  ?.filter((c) => c.credential_type !== "snmp_v2c" && c.credential_type !== "snmp_v3")
+                  .map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
                     {c.username ? ` (${c.username})` : ""} · {c.credential_type}
@@ -806,6 +994,9 @@ export function HostsPage() {
                         hostname: form.hostname,
                         port: parsedPort,
                         os_type: form.os_type,
+                        site: form.site.trim() || null,
+                        environment: form.environment.trim() || null,
+                        criticality: form.criticality || null,
                         credential_id: form.credential_id === "" ? null : form.credential_id,
                         is_active: form.is_active,
                       },
@@ -827,6 +1018,9 @@ export function HostsPage() {
                     hostname: form.hostname,
                     port: parsedPort,
                     os_type: form.os_type,
+                    site: form.site.trim() || null,
+                    environment: form.environment.trim() || null,
+                    criticality: form.criticality || null,
                     credential_id: form.credential_id === "" ? undefined : form.credential_id,
                     is_active: true,
                   })
@@ -886,6 +1080,55 @@ export function HostsPage() {
                     <option value="linux">{t("hosts.osLinux")}</option>
                     <option value="windows">{t("hosts.osWindows")}</option>
                     <option value="network">{t("hosts.osNetwork")}</option>
+                  </select>
+                </div>
+                <div className="pf-filters__group">
+                  <label htmlFor="hosts-filter-site">{t("hosts.site")}</label>
+                  <select
+                    id="hosts-filter-site"
+                    className="pf-select"
+                    value={hostSiteFilter}
+                    onChange={(e) => setHostSiteFilter(e.target.value)}
+                  >
+                    <option value="all">{t("hosts.listSiteAll")}</option>
+                    {hostSiteOptions.map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="pf-filters__group">
+                  <label htmlFor="hosts-filter-environment">{t("hosts.environment")}</label>
+                  <select
+                    id="hosts-filter-environment"
+                    className="pf-select"
+                    value={hostEnvironmentFilter}
+                    onChange={(e) => setHostEnvironmentFilter(e.target.value)}
+                  >
+                    <option value="all">{t("hosts.listEnvironmentAll")}</option>
+                    {hostEnvironmentOptions.map((value) => (
+                      <option key={value} value={value}>
+                        {value}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="pf-filters__group">
+                  <label htmlFor="hosts-filter-criticality">{t("hosts.criticality")}</label>
+                  <select
+                    id="hosts-filter-criticality"
+                    className="pf-select"
+                    value={hostCriticalityFilter}
+                    onChange={(e) =>
+                      setHostCriticalityFilter(e.target.value as HostCriticality | "all")
+                    }
+                  >
+                    <option value="all">{t("hosts.listCriticalityAll")}</option>
+                    <option value="low">{t("hosts.criticalityLabel.low")}</option>
+                    <option value="medium">{t("hosts.criticalityLabel.medium")}</option>
+                    <option value="high">{t("hosts.criticalityLabel.high")}</option>
+                    <option value="critical">{t("hosts.criticalityLabel.critical")}</option>
                   </select>
                 </div>
                 <div className="pf-filters__group">
@@ -973,6 +1216,27 @@ export function HostsPage() {
                       direction={hostSort.direction}
                       onSort={toggleHostSort}
                     />
+                    <SortableTh<HostSortKey>
+                      label={t("hosts.site")}
+                      sortKey="site"
+                      activeKey={hostSort.key}
+                      direction={hostSort.direction}
+                      onSort={toggleHostSort}
+                    />
+                    <SortableTh<HostSortKey>
+                      label={t("hosts.environment")}
+                      sortKey="environment"
+                      activeKey={hostSort.key}
+                      direction={hostSort.direction}
+                      onSort={toggleHostSort}
+                    />
+                    <SortableTh<HostSortKey>
+                      label={t("hosts.criticality")}
+                      sortKey="criticality"
+                      activeKey={hostSort.key}
+                      direction={hostSort.direction}
+                      onSort={toggleHostSort}
+                    />
                     <th className="pf-hosts-table__credential">{t("hosts.credential")}</th>
                     <th>{t("hosts.sshFingerprint")}</th>
                     <SortableTh<HostSortKey>
@@ -999,6 +1263,33 @@ export function HostsPage() {
                         <Badge variant="info" literal>
                           {host.os_type ?? t("common.dash")}
                         </Badge>
+                      </td>
+                      <td>
+                        {host.site ? (
+                          <Badge variant="info" literal>
+                            {host.site}
+                          </Badge>
+                        ) : (
+                          t("common.dash")
+                        )}
+                      </td>
+                      <td>
+                        {host.environment ? (
+                          <Badge variant="info" literal>
+                            {host.environment}
+                          </Badge>
+                        ) : (
+                          t("common.dash")
+                        )}
+                      </td>
+                      <td>
+                        {host.criticality ? (
+                          <Badge variant={hostCriticalityVariant(host.criticality)} literal>
+                            {t(`hosts.criticalityLabel.${host.criticality}`)}
+                          </Badge>
+                        ) : (
+                          t("common.dash")
+                        )}
                       </td>
                       <td className="pf-hosts-table__credential">
                         <HostCredentialPopover

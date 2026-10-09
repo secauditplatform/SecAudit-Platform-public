@@ -16,31 +16,29 @@ PACKAGE_COPY_IGNORE = shutil.ignore_patterns(
 )
 
 
+def resolve_script_under_package(package_dir: Path, script_file: str) -> Path:
+    """Resolve script_file to an absolute path confined to package_dir."""
+    resolved = resolve_under_package(package_dir, script_file, label="script_file")
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Script not found in package: {script_file!r}")
+    return resolved
+
+
 def resolve_under_package(
     package_dir: Path,
     relative: str,
     *,
-    must_exist: bool = True,
-    must_be_file: bool = True,
+    label: str = "path",
+    must_exist: bool = False,
+    require_file: bool = False,
 ) -> Path:
-    """Resolve a relative package path confined to ``package_dir``.
-
-    Rejects empty refs, ``..`` segments, and absolute paths (including the
-    POSIX quirk where ``Path('/pkg') / '/etc/passwd'`` becomes ``/etc/passwd``).
-    """
+    """Resolve a package-relative path and reject traversal outside ``package_dir``."""
     if not relative or not str(relative).strip():
-        raise ValueError("package path reference is empty")
+        raise ValueError(f"{label} is empty")
 
-    raw = str(relative).strip().replace("\\", "/")
-    # Absolute refs must never be joined — on POSIX they replace the package root.
-    if raw.startswith("/") or raw.startswith("~") or Path(raw).is_absolute():
-        raise ValueError(f"package path must be relative: {relative!r}")
-
-    normalized = raw.lstrip("/")
-    if not normalized or normalized in {".", ".."}:
-        raise ValueError(f"package path is invalid: {relative!r}")
+    normalized = str(relative).replace("\\", "/").lstrip("/")
     if ".." in Path(normalized).parts:
-        raise ValueError(f"package path must stay inside package: {relative!r}")
+        raise ValueError(f"{label} must stay inside package: {relative!r}")
 
     package_root = package_dir.resolve()
     if not package_root.is_dir():
@@ -48,32 +46,32 @@ def resolve_under_package(
 
     resolved = (package_root / normalized).resolve()
     if package_root not in resolved.parents and resolved != package_root:
-        raise ValueError(f"package path escapes package directory: {relative!r}")
+        raise ValueError(f"{label} escapes package directory: {relative!r}")
 
-    if must_exist:
-        if must_be_file:
-            if not resolved.is_file():
-                raise FileNotFoundError(f"File not found in package: {relative!r}")
-        elif not resolved.exists():
-            raise FileNotFoundError(f"Path not found in package: {relative!r}")
-
+    if must_exist and not resolved.exists():
+        raise FileNotFoundError(f"{label} not found in package: {relative!r}")
+    if require_file and not resolved.is_file():
+        raise FileNotFoundError(f"{label} is not a file in package: {relative!r}")
     return resolved
 
 
-def resolve_script_under_package(package_dir: Path, script_file: str) -> Path:
-    """Resolve script_file to an absolute path confined to package_dir."""
+def assert_path_under_roots(path: Path | str, *roots: Path | str, label: str = "path") -> Path:
+    """Require ``path`` to resolve under at least one allowlisted root directory."""
+    if not roots:
+        raise ValueError("At least one root is required")
     try:
-        return resolve_under_package(
-            package_dir,
-            script_file,
-            must_exist=True,
-            must_be_file=True,
-        )
-    except ValueError as exc:
-        message = str(exc)
-        if "package path" in message:
-            message = message.replace("package path", "script_file", 1)
-        raise ValueError(message) from exc
+        resolved = Path(path).resolve()
+    except OSError as exc:
+        raise ValueError(f"Invalid {label}: {path}") from exc
+
+    for root in roots:
+        try:
+            root_resolved = Path(root).resolve()
+        except OSError:
+            continue
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            return resolved
+    raise ValueError(f"{label} must be under an allowlisted directory")
 
 
 def normalize_text_newlines(text: str) -> str:

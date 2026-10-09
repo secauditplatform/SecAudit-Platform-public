@@ -8,7 +8,6 @@ from pathlib import Path
 from defusedxml import ElementTree as DefusedET
 
 from secaudit_core.enums import CheckStatus
-from secaudit_core.package_paths import resolve_under_package
 
 OSC_RESULT_TO_STATUS: dict[str, CheckStatus] = {
     "pass": CheckStatus.PASS,
@@ -58,6 +57,8 @@ def _profile_meta(package_dir: Path) -> dict:
 
 def resolve_scap_benchmark_path(package_dir: Path) -> Path | None:
     """Return path to XCCDF benchmark (or SCAP data-stream) XML inside a package."""
+    from secaudit_core.package_paths import resolve_under_package
+
     direct = package_dir / "scap_benchmark.xml"
     if direct.is_file():
         return direct
@@ -65,11 +66,12 @@ def resolve_scap_benchmark_path(package_dir: Path) -> Path | None:
     ref = _profile_meta(package_dir).get("scap_xccdf_path")
     if ref:
         try:
-            candidate = resolve_under_package(package_dir, str(ref))
+            candidate = resolve_under_package(
+                package_dir, str(ref), label="scap_xccdf_path", require_file=True
+            )
         except (ValueError, FileNotFoundError):
             return None
-        if candidate.is_file():
-            return candidate
+        return candidate
     return None
 
 
@@ -82,6 +84,8 @@ def resolve_scap_profile_id(package_dir: Path, *, db_profile_id: str | None = No
 
 def resolve_oval_path(package_dir: Path) -> Path | None:
     """Return path to the primary OVAL definitions file for OVAL-only packages."""
+    from secaudit_core.package_paths import resolve_under_package
+
     direct = package_dir / "scap_oval.xml"
     if direct.is_file():
         return direct
@@ -89,11 +93,12 @@ def resolve_oval_path(package_dir: Path) -> Path | None:
     ref = _profile_meta(package_dir).get("scap_oval_path")
     if ref:
         try:
-            candidate = resolve_under_package(package_dir, str(ref))
+            candidate = resolve_under_package(
+                package_dir, str(ref), label="scap_oval_path", require_file=True
+            )
         except (ValueError, FileNotFoundError):
             return None
-        if candidate.is_file():
-            return candidate
+        return candidate
     return None
 
 
@@ -103,16 +108,20 @@ def resolve_scap_content_files(package_dir: Path, benchmark_path: Path) -> list[
     Real XCCDF benchmarks reference external OVAL/CPE files via ``check-content-ref``;
     those siblings must be present next to the benchmark so ``oscap`` can resolve them.
     """
+    from secaudit_core.package_paths import resolve_under_package
+
     files: list[Path] = [benchmark_path]
     seen = {benchmark_path.name}
 
     meta = _profile_meta(package_dir)
     for ref in meta.get("scap_extra_files") or []:
         try:
-            candidate = resolve_under_package(package_dir, str(ref))
+            candidate = resolve_under_package(
+                package_dir, str(ref), label="scap_extra_files", require_file=True
+            )
         except (ValueError, FileNotFoundError):
             continue
-        if candidate.is_file() and candidate.name not in seen:
+        if candidate.name not in seen:
             files.append(candidate)
             seen.add(candidate.name)
 

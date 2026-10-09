@@ -101,7 +101,11 @@ secrets:
 
 config:
   authEnabled: "true"
+  # Required only when authEnabled=false outside production (synthetic admin).
+  allowAuthDisabled: "false"
   localAuthEnabled: "false"
+  # Local auth idle timeout in seconds (4h). Demo stand uses DEMO_SESSION_IDLE_SECONDS instead.
+  authIdleTimeoutSeconds: "14400"
   consoleEnabled: "false"
   consoleAllowInProduction: "false"
   secretsBackend: "fernet"
@@ -168,6 +172,10 @@ securityContext:
   capabilities:
     drop: ["ALL"]
   readOnlyRootFilesystem: false
+
+networkPolicy:
+  # Default-deny + allow frontend→api, api/worker/beat→DB/Redis/DNS (+ limited egress).
+  enabled: true
 
 serviceAccount:
   create: true

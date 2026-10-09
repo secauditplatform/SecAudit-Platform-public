@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 
 from secaudit_core.enums import ExecutionType
-from secaudit_core.package_paths import resolve_under_package
 
 SCRIPT_EXTENSIONS: dict[str, ExecutionType] = {
     ".sh": ExecutionType.SSH,
@@ -148,27 +147,11 @@ def _find_profile_file(package_dir: Path) -> Path | None:
     return None
 
 
-def _safe_package_file(package_dir: Path, reference: str | None) -> Path | None:
-    """Return confined file path or None if missing; raise ValueError on escape."""
-    if not reference or not str(reference).strip():
-        return None
-    try:
-        path = resolve_under_package(
-            package_dir,
-            str(reference),
-            must_exist=False,
-            must_be_file=False,
-        )
-    except ValueError:
-        raise
-    except FileNotFoundError:
-        return None
-    return path if path.is_file() else None
-
-
 def _load_metadata_file(package_dir: Path, reference: str | None) -> dict | None:
-    path = _safe_package_file(package_dir, reference)
-    if path is not None:
+    if not reference:
+        return None
+    path = package_dir / reference
+    if path.is_file():
         return _read_json(path)
     return None
 
@@ -204,9 +187,9 @@ def _has_os_metadata(package_dir: Path, profile_meta: dict, os_meta: dict | None
     if os_meta is not None:
         return True
     os_ref = profile_meta.get("os")
-    if isinstance(os_ref, str) and _safe_package_file(package_dir, os_ref) is not None:
-        return True
-    return (package_dir / "os.json").is_file()
+    return bool(isinstance(os_ref, str) and (package_dir / os_ref).is_file()) or (
+        package_dir / "os.json"
+    ).is_file()
 
 
 def _has_software_metadata(
@@ -217,9 +200,9 @@ def _has_software_metadata(
     if software_meta is not None:
         return True
     software_ref = profile_meta.get("software")
-    if isinstance(software_ref, str) and _safe_package_file(package_dir, software_ref) is not None:
-        return True
-    return (package_dir / "software.json").is_file()
+    return bool(isinstance(software_ref, str) and (package_dir / software_ref).is_file()) or (
+        package_dir / "software.json"
+    ).is_file()
 
 
 _NETWORK_OS_TOKENS = (
@@ -529,8 +512,8 @@ def resolve_rules_path(package_dir: Path, profile_meta: dict | None = None) -> P
 
     rules_ref = _rules_ref_from_meta(meta)
     if rules_ref:
-        path = _safe_package_file(package_dir, rules_ref)
-        if path is not None:
+        path = package_dir / rules_ref
+        if path.is_file():
             return path
 
     conventional = package_dir / PROFILE_RULES_JSON
@@ -981,8 +964,8 @@ def _attach_rules_to_scripts(package_dir: Path, profile_meta: dict, scripts: lis
 def _require_referenced_file(package_dir: Path, reference: str | None, label: str) -> None:
     if not reference:
         return
-    path = _safe_package_file(package_dir, reference)
-    if path is None:
+    path = package_dir / reference
+    if not path.is_file():
         raise FileNotFoundError(f"{label} file not found: {reference}")
 
 

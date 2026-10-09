@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from secaudit_core.inventory_scan import host_name_for_ip, infer_host_defaults
 from secaudit_core.models import AuditFlowHost, AuditFlowRun, Host
+from secaudit_core.ssh_fingerprint import normalize_ssh_fingerprint
 
 
 def _ports(row: AuditFlowHost) -> list[int]:
@@ -44,26 +45,76 @@ def _identity_keys(ip: str, hostname: str | None) -> list[str]:
     return keys
 
 
-def find_inventory_host(
-    db: Session, *, owner_sub: str | None, ip: str, hostname: str | None
-) -> Host | None:
-    keys = _identity_keys(ip, hostname)
-    if not keys:
-        return None
-    identity = or_(func.lower(Host.hostname).in_(keys), func.lower(Host.name).in_(keys))
-    if owner_sub is None:
-        owner_match = Host.owner_sub.is_(None)
-    else:
-        owner_match = or_(Host.owner_sub == owner_sub, Host.owner_sub.is_(None))
-    candidates = list(
-        db.execute(
-            select(Host).where(identity, owner_match, Host.is_ephemeral.is_(False)).limit(20)
-        ).scalars()
-    )
+def _fingerprint_variants(value: str | None) -> list[str]:
+    raw = (value or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    try:
+        normalized = normalize_ssh_fingerprint(raw)
+    except ValueError:
+        return variants
+    if normalized not in variants:
+        variants.append(normalized)
+    # OpenSSH may store padding; keep both forms for DB match.
+    if normalized.startswith("SHA256:"):
+        body = normalized.split(":", 1)[1]
+        padded = f"SHA256:{body}="
+        if padded not in variants:
+            variants.append(padded)
+    return variants
+
+
+def _pick_owner_preferred(candidates: list[Host], owner_sub: str | None) -> Host | None:
     if not candidates:
         return None
     same_owner = [host for host in candidates if host.owner_sub == owner_sub]
     return same_owner[0] if same_owner else candidates[0]
+
+
+def _owner_match(owner_sub: str | None):
+    if owner_sub is None:
+        return Host.owner_sub.is_(None)
+    return or_(Host.owner_sub == owner_sub, Host.owner_sub.is_(None))
+
+
+def find_inventory_host(
+    db: Session,
+    *,
+    owner_sub: str | None,
+    ip: str,
+    hostname: str | None,
+    ssh_host_key_fingerprint: str | None = None,
+) -> Host | None:
+    owner_clause = _owner_match(owner_sub)
+
+    fingerprints = _fingerprint_variants(ssh_host_key_fingerprint)
+    if fingerprints:
+        by_fp = list(
+            db.execute(
+                select(Host)
+                .where(
+                    Host.ssh_host_key_fingerprint.in_(fingerprints),
+                    owner_clause,
+                    Host.is_ephemeral.is_(False),
+                )
+                .limit(20)
+            ).scalars()
+        )
+        found = _pick_owner_preferred(by_fp, owner_sub)
+        if found:
+            return found
+
+    keys = _identity_keys(ip, hostname)
+    if not keys:
+        return None
+    identity = or_(func.lower(Host.hostname).in_(keys), func.lower(Host.name).in_(keys))
+    candidates = list(
+        db.execute(
+            select(Host).where(identity, owner_clause, Host.is_ephemeral.is_(False)).limit(20)
+        ).scalars()
+    )
+    return _pick_owner_preferred(candidates, owner_sub)
 
 
 def persist_audit_flow_hosts_to_inventory(db: Session, run: AuditFlowRun) -> int:
@@ -81,7 +132,11 @@ def persist_audit_flow_hosts_to_inventory(db: Session, run: AuditFlowRun) -> int
     for row in hosts:
         port, os_type = inventory_port_and_os(row)
         existing = find_inventory_host(
-            db, owner_sub=run.owner_sub, ip=row.ip_address, hostname=row.hostname
+            db,
+            owner_sub=run.owner_sub,
+            ip=row.ip_address,
+            hostname=row.hostname,
+            ssh_host_key_fingerprint=row.ssh_host_key_fingerprint,
         )
         if existing:
             if existing.owner_sub is None and run.owner_sub:

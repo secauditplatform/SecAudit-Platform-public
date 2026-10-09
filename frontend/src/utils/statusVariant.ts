@@ -49,3 +49,12 @@ export function severityVariant(severity: string): StatusBadgeVariant {
   }
   return "neutral";
 }
+
+/** Host inventory criticality badges */
+export function hostCriticalityVariant(criticality: string): StatusBadgeVariant {
+  const value = criticality.trim().toLowerCase();
+  if (value === "critical" || value === "high") return "danger";
+  if (value === "medium") return "warning";
+  if (value === "low") return "success";
+  return "neutral";
+}

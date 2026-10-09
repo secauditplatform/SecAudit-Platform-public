@@ -21,9 +21,11 @@ from secaudit_core.enums import (
     WaiverStatus,
 )
 from secaudit_core.models import (
+    ApiKey,
     AuditFlowCredential,
     AuditFlowHost,
     AuditFlowRun,
+    AuditFlowTemplate,
     AuditLog,
     Base,
     Category,
@@ -38,6 +40,8 @@ from secaudit_core.models import (
     InterpreterRule,
     InventoryScan,
     InventoryScanResult,
+    DirectorySource,
+    DirectorySync,
     Job,
     JobHost,
     JobRun,
@@ -61,9 +65,11 @@ from secaudit_core.models import (
 
 __all__ = [
     "Base",
+    "ApiKey",
     "AuditFlowCredential",
     "AuditFlowHost",
     "AuditFlowRun",
+    "AuditFlowTemplate",
     "AuditFlowStatus",
     "AuditLog",
     "Category",
@@ -82,6 +88,8 @@ __all__ = [
     "InterpreterRule",
     "InventoryScan",
     "InventoryScanResult",
+    "DirectorySource",
+    "DirectorySync",
     "Job",
     "JobHost",
     "JobRun",

@@ -21,6 +21,7 @@ type CredentialForm = {
   key_passphrase: string;
   service_username: string;
   service_secret: string;
+  snmp_priv_protocol: string;
   description: string;
 };
 
@@ -32,8 +33,16 @@ const emptyForm = (): CredentialForm => ({
   key_passphrase: "",
   service_username: "",
   service_secret: "",
+  snmp_priv_protocol: "",
   description: "",
 });
+
+const SNMP_AUTH_PROTOCOLS = ["MD5", "SHA", "SHA224", "SHA256", "SHA384", "SHA512"] as const;
+const SNMP_PRIV_PROTOCOLS = ["DES", "AES", "AES192", "AES256"] as const;
+
+function isSnmpType(type: string): boolean {
+  return type === "snmp_v2c" || type === "snmp_v3";
+}
 
 export function CredentialsPage() {
   const { t, dateLocale } = useTranslation();
@@ -57,6 +66,8 @@ export function CredentialsPage() {
     { value: "ssh_password", label: t("credentials.typeSshPassword") },
     { value: "ssh_key", label: t("credentials.typeSshKey") },
     { value: "winrm", label: t("credentials.typeWinrm") },
+    { value: "snmp_v2c", label: t("credentials.typeSnmpV2c") },
+    { value: "snmp_v3", label: t("credentials.typeSnmpV3") },
   ];
 
   const credentials = useQuery({ queryKey: ["credentials"], queryFn: api.credentials });
@@ -71,7 +82,13 @@ export function CredentialsPage() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: number; data: Partial<CredentialForm> }) => api.updateCredential(id, data),
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: number;
+      data: Parameters<typeof api.updateCredential>[1];
+    }) => api.updateCredential(id, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
       setEditingId(null);
@@ -103,8 +120,9 @@ export function CredentialsPage() {
       username: cred.username ?? "",
       secret: "",
       key_passphrase: "",
-      service_username: cred.service_username ?? "",
+      service_username: cred.service_username ?? (cred.credential_type === "snmp_v3" ? "SHA256" : ""),
       service_secret: "",
+      snmp_priv_protocol: cred.snmp_priv_protocol ?? "",
       description: cred.description ?? "",
     });
     scrollToCredentialForm();
@@ -116,6 +134,8 @@ export function CredentialsPage() {
   };
 
   const isEditing = editingId !== null;
+  const snmp = isSnmpType(form.credential_type);
+  const snmpV3 = form.credential_type === "snmp_v3";
   const editingCredential = credentials.data?.find((item) => item.id === editingId);
   const credentialRows = credentials.data ?? [];
 
@@ -180,20 +200,28 @@ export function CredentialsPage() {
                 ))}
               </select>
             </div>
-            <div className="pf-form__group">
-              <label htmlFor="cred-user">{t("credentials.user")}</label>
-              <input
-                id="cred-user"
-                className="pf-input"
-                value={form.username}
-                onChange={(e) => setForm({ ...form, username: e.target.value })}
-                placeholder="root"
-              />
-            </div>
+            {form.credential_type !== "snmp_v2c" ? (
+              <div className="pf-form__group">
+                <label htmlFor="cred-user">{snmpV3 ? t("credentials.snmpUser") : t("credentials.user")}</label>
+                <input
+                  id="cred-user"
+                  className="pf-input"
+                  value={form.username}
+                  onChange={(e) => setForm({ ...form, username: e.target.value })}
+                  placeholder={snmpV3 ? "snmp-ro" : "root"}
+                />
+              </div>
+            ) : null}
           </div>
           <div className="pf-form__group">
             <label htmlFor="cred-secret">
-              {form.credential_type === "ssh_key" ? t("credentials.privateKey") : t("credentials.passwordSecret")}
+              {form.credential_type === "ssh_key"
+                ? t("credentials.privateKey")
+                : form.credential_type === "snmp_v2c"
+                  ? t("credentials.snmpCommunity")
+                  : snmpV3
+                    ? t("credentials.snmpAuthSecret")
+                    : t("credentials.passwordSecret")}
             </label>
             {form.credential_type === "ssh_key" ? (
               <SecretTextarea
@@ -215,17 +243,62 @@ export function CredentialsPage() {
               />
             )}
           </div>
-          {form.credential_type === "ssh_key" ? (
+          {form.credential_type === "ssh_key" || snmpV3 ? (
             <div className="pf-form__group">
-              <label htmlFor="cred-key-passphrase">{t("credentials.keyPassphrase")}</label>
+              <label htmlFor="cred-key-passphrase">
+                {snmpV3 ? t("credentials.snmpPrivSecret") : t("credentials.keyPassphrase")}
+              </label>
               <PasswordInput
                 id="cred-key-passphrase"
                 value={form.key_passphrase}
                 onChange={(e) => setForm({ ...form, key_passphrase: e.target.value })}
-                placeholder={isEditing ? t("credentials.keepKeyPassphraseEmpty") : t("common.optional")}
+                placeholder={
+                  isEditing
+                    ? snmpV3
+                      ? t("credentials.keepPasswordEmpty")
+                      : t("credentials.keepKeyPassphraseEmpty")
+                    : t("common.optional")
+                }
               />
             </div>
           ) : null}
+          {snmpV3 ? (
+            <div className="pf-form__row">
+              <div className="pf-form__group">
+                <label htmlFor="cred-snmp-auth">{t("credentials.snmpAuthProtocol")}</label>
+                <select
+                  id="cred-snmp-auth"
+                  className="pf-select"
+                  value={form.service_username || "SHA256"}
+                  onChange={(e) => setForm({ ...form, service_username: e.target.value })}
+                >
+                  {SNMP_AUTH_PROTOCOLS.map((proto) => (
+                    <option key={proto} value={proto}>
+                      {proto}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="pf-form__group">
+                <label htmlFor="cred-snmp-priv">{t("credentials.snmpPrivProtocol")}</label>
+                <select
+                  id="cred-snmp-priv"
+                  className="pf-select"
+                  value={form.snmp_priv_protocol}
+                  onChange={(e) => setForm({ ...form, snmp_priv_protocol: e.target.value })}
+                >
+                  <option value="">{t("credentials.snmpPrivNone")}</option>
+                  {SNMP_PRIV_PROTOCOLS.map((proto) => (
+                    <option key={proto} value={proto}>
+                      {proto}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          ) : null}
+          {!snmp ? (
+          <>
           <div className="pf-form__group pf-form__group--divider">
             <div className="pf-form__hint">{t("credentials.serviceSection")}</div>
           </div>
@@ -254,6 +327,8 @@ export function CredentialsPage() {
               />
             </div>
           </div>
+          </>
+          ) : null}
           <div className="pf-form__group">
             <label htmlFor="cred-desc">{t("credentials.descriptionField")}</label>
             <input
@@ -278,8 +353,15 @@ export function CredentialsPage() {
                         description: form.description || undefined,
                         ...(form.secret ? { secret: form.secret } : {}),
                         ...(form.key_passphrase ? { key_passphrase: form.key_passphrase } : {}),
-                        ...(form.service_username ? { service_username: form.service_username } : {}),
-                        ...(form.service_secret ? { service_secret: form.service_secret } : {}),
+                        ...(snmpV3
+                          ? {
+                              service_username: form.service_username || "SHA256",
+                              snmp_priv_protocol: form.snmp_priv_protocol || null,
+                            }
+                          : {
+                              ...(form.service_username ? { service_username: form.service_username } : {}),
+                              ...(form.service_secret ? { service_secret: form.service_secret } : {}),
+                            }),
                       },
                     })
                   }
@@ -295,13 +377,30 @@ export function CredentialsPage() {
               <Button
                 onClick={() =>
                   createMutation.mutate({
-                    ...form,
+                    name: form.name,
+                    credential_type: form.credential_type,
+                    username: form.credential_type === "snmp_v2c" ? undefined : form.username,
+                    secret: form.secret,
+                    description: form.description,
                     ...(form.key_passphrase ? { key_passphrase: form.key_passphrase } : {}),
-                    ...(form.service_username ? { service_username: form.service_username } : {}),
-                    ...(form.service_secret ? { service_secret: form.service_secret } : {}),
+                    ...(snmpV3
+                      ? {
+                          service_username: form.service_username || "SHA256",
+                          snmp_priv_protocol: form.snmp_priv_protocol || null,
+                        }
+                      : {
+                          ...(form.service_username ? { service_username: form.service_username } : {}),
+                          ...(form.service_secret ? { service_secret: form.service_secret } : {}),
+                        }),
                   })
                 }
-                disabled={!form.name || !form.secret || createMutation.isPending}
+                disabled={
+                  !form.name ||
+                  !form.secret ||
+                  (snmpV3 && !form.username.trim()) ||
+                  (snmpV3 && !!form.snmp_priv_protocol && !form.key_passphrase) ||
+                  createMutation.isPending
+                }
               >
                 {t("common.save")}
               </Button>

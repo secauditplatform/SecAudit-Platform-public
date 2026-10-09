@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import re
 import shlex
 
 from secaudit_core.enums import CategoryType
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.settings import SecAuditSettings
-
-_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def decrypt_credential_service_secret(cred, settings: SecAuditSettings | None = None) -> str | None:
@@ -60,37 +57,18 @@ def profile_uses_service_credentials(category_type: CategoryType | None) -> bool
 
 
 def service_script_cli_suffix(env: dict[str, str] | None) -> str:
-    """CLI flags expected by service audit scripts (-software_user/-software_password)."""
-    if not env:
-        return ""
-    user = (
-        env.get("DB_USER")
-        or env.get("SECAUDIT_SERVICE_USER")
-        or env.get("SERVICE_USER")
-        or env.get("resource_user")
-    )
-    password = (
-        env.get("DB_PASS")
-        or env.get("SECAUDIT_SERVICE_PASS")
-        or env.get("SERVICE_PASS")
-        or env.get("resource_pass")
-    )
-    parts: list[str] = []
-    if user:
-        parts.extend(["-software_user", shlex.quote(user)])
-    if password:
-        parts.extend(["-software_password", shlex.quote(password)])
-    return (" " + " ".join(parts)) if parts else ""
+    """Deprecated: service passwords must not appear on remote argv.
+
+    Credentials are injected via environment (``shell_export_prefix`` /
+    ``powershell_env_prefix`` / env file). Always returns an empty string.
+    """
+    return ""
 
 
 def shell_export_prefix(env: dict[str, str] | None) -> str:
     if not env:
         return ""
-    exports: list[str] = []
-    for key, value in env.items():
-        if not _ENV_KEY_RE.fullmatch(key):
-            raise ValueError(f"Invalid environment variable name: {key!r}")
-        exports.append(f"export {key}={shlex.quote(value)}")
+    exports = [f"export {key}={shlex.quote(value)}" for key, value in env.items()]
     return "; ".join(exports) + "; "
 
 
@@ -99,8 +77,6 @@ def powershell_env_prefix(env: dict[str, str] | None) -> str:
         return ""
     lines: list[str] = []
     for key, value in env.items():
-        if not _ENV_KEY_RE.fullmatch(key):
-            raise ValueError(f"Invalid environment variable name: {key!r}")
         safe = value.replace("'", "''")
         lines.append(f"$env:{key} = '{safe}'")
     return "\n".join(lines) + "\n"

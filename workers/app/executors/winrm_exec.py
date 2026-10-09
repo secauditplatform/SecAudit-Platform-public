@@ -7,7 +7,7 @@ import winrm
 from secaudit_core.service_credentials import powershell_env_prefix
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.tracing import start_span
-from winrm.exceptions import WinRMTransportError
+from winrm.exceptions import WinRMOperationTimeoutError, WinRMTransportError
 
 from app.cancel_context import get_cancel_event, raise_if_cancelled
 
@@ -20,6 +20,10 @@ SSH_DEFAULT_PORT = 22
 WINRM_DISCOVERY_PORTS = frozenset({22, 0, 139, 445, 3389})
 # pywinrm run_ps() wraps content in `powershell -encodedcommand ...` (~8191 char Windows limit).
 WINRM_MAX_INLINE_ENCODED_CHARS = 7000
+# How often a cancellable WinRM receive wakes up. The job timeout stays the
+# caller's budget; this only bounds how long we wait before noticing cancel.
+WINRM_CANCEL_POLL_SEC = 2
+WINRM_READ_TIMEOUT_SLACK_SEC = 30
 # Upper bound for binary search; each chunk is embedded in Set/Add-Content via -EncodedCommand.
 WINRM_B64_UPLOAD_CHUNK_CHARS = 1500
 
@@ -159,13 +163,107 @@ def _checked_output(result, *, success_codes: tuple[int, ...] = (0,)) -> str:
     return stdout if stdout.strip() else stderr
 
 
+def _winrm_operation_timeout(timeout: int, cancel_event: threading.Event | None) -> int:
+    """WS-Man receive timeout. Cancellable runs poll instead of blocking for the whole budget."""
+    budget = max(1, int(timeout))
+    if cancel_event is None:
+        return budget
+    return max(1, min(budget, WINRM_CANCEL_POLL_SEC))
+
+
+def _close_winrm_shell(session: winrm.Session, shell_id: str | None) -> None:
+    """Delete the remote shell so PowerShell stops, not only the local waiter."""
+    if not shell_id:
+        return
+    try:
+        session.protocol.close_shell(shell_id)
+    except Exception:
+        try:
+            session.protocol.transport.close_session()
+        except Exception:
+            pass
+
+
+def _encoded_powershell_command(ps_command: str) -> str:
+    encoded_ps = base64.b64encode(ps_command.encode("utf-16-le")).decode("ascii")
+    return f"powershell -encodedcommand {encoded_ps}"
+
+
+def _collect_winrm_output(
+    session: winrm.Session,
+    shell_id: str,
+    command_id: str,
+    cancel_event: threading.Event,
+) -> tuple[bytes, bytes, int]:
+    stdout_parts: list[bytes] = []
+    stderr_parts: list[bytes] = []
+    command_done = False
+    return_code = -1
+    while not command_done:
+        if cancel_event.is_set():
+            raise InterruptedError("Job run cancelled")
+        try:
+            stdout, stderr, return_code, command_done = session.protocol.get_command_output_raw(
+                shell_id, command_id
+            )
+        except WinRMOperationTimeoutError:
+            continue
+        except Exception as exc:
+            if cancel_event.is_set():
+                raise InterruptedError("Job run cancelled") from exc
+            raise
+        if stdout:
+            stdout_parts.append(stdout)
+        if stderr:
+            stderr_parts.append(stderr)
+        if not command_done and cancel_event.is_set():
+            raise InterruptedError("Job run cancelled")
+    return b"".join(stdout_parts), b"".join(stderr_parts), return_code
+
+
+def _run_ps_until_finished_or_cancelled(
+    session: winrm.Session,
+    ps_command: str,
+    cancel_event: threading.Event,
+):
+    """Run PowerShell while the shell id is known, so cancel can delete that shell."""
+    raise_if_cancelled()
+    shell_id = session.protocol.open_shell()
+    command_id: str | None = None
+    shell_closed = False
+    try:
+        if cancel_event.is_set():
+            raise InterruptedError("Job run cancelled")
+        command_id = session.protocol.run_command(shell_id, _encoded_powershell_command(ps_command))
+        stdout, stderr, status_code = _collect_winrm_output(session, shell_id, command_id, cancel_event)
+        result = winrm.Response((stdout, stderr, status_code))
+        if result.std_err:
+            result.std_err = session._clean_error_msg(result.std_err)
+        return result
+    except InterruptedError:
+        _close_winrm_shell(session, shell_id)
+        shell_closed = True
+        raise
+    finally:
+        if not shell_closed:
+            try:
+                if command_id is not None:
+                    session.protocol.cleanup_command(shell_id, command_id)
+                session.protocol.close_shell(shell_id)
+            except Exception:
+                _close_winrm_shell(session, shell_id)
+
+
 def _invoke_run_ps(
     session: winrm.Session,
     ps_command: str,
     cancel_event: threading.Event | None,
 ):
     raise_if_cancelled()
-    result = session.run_ps(ps_command)
+    if cancel_event is None:
+        result = session.run_ps(ps_command)
+    else:
+        result = _run_ps_until_finished_or_cancelled(session, ps_command, cancel_event)
     if cancel_event and cancel_event.is_set():
         raise InterruptedError("Job run cancelled")
     return result
@@ -260,13 +358,14 @@ def _run_winrm_once(
         "secaudit.winrm.staged": _should_stage_ps_script(ps_command),
     }
     with start_span(f"executor.winrm {scheme}:{port}", attributes=span_attrs, kind="client"):
+        operation_timeout = _winrm_operation_timeout(timeout, cancel_event)
         session = winrm.Session(
             endpoint,
             auth=(username, password),
             transport="ntlm",
             server_cert_validation=server_cert_validation,
-            operation_timeout_sec=timeout,
-            read_timeout_sec=timeout + 30,
+            operation_timeout_sec=operation_timeout,
+            read_timeout_sec=operation_timeout + WINRM_READ_TIMEOUT_SLACK_SEC,
         )
 
         result = _execute_ps_script(session, ps_command, script_stem, cancel_event)

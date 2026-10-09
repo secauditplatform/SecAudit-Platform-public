@@ -104,7 +104,6 @@ class HealthResponse(BaseModel):
     status: str
     app_name: str
     version: str = "0.1.0"
-    demo_mode: bool = False
 
 
 class ComponentHealth(BaseModel):
@@ -345,14 +344,48 @@ class ScapProfilePreview(BaseModel):
 
 # --- Hosts ---
 
+HostCriticality = Literal["low", "medium", "high", "critical"]
+
+
+def _normalize_host_label(value: str | None, *, max_len: int) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    return cleaned[:max_len]
+
 
 class HostBase(BaseModel):
     name: StrippedStr
     hostname: StrippedStr
     port: int = 22
     os_type: str | None = None
+    site: str | None = None
+    environment: str | None = None
+    criticality: HostCriticality | None = None
     credential_id: int | None = None
     is_active: bool = True
+
+    @field_validator("site", "environment", mode="before")
+    @classmethod
+    def _normalize_site_environment(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _normalize_host_label(str(value), max_len=64)
+
+    @field_validator("criticality", mode="before")
+    @classmethod
+    def _normalize_criticality(cls, value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        cleaned = str(value).strip().lower()
+        if not cleaned:
+            return None
+        allowed = {"low", "medium", "high", "critical"}
+        if cleaned not in allowed:
+            raise ValueError("criticality must be one of: low, medium, high, critical")
+        return cleaned
 
 
 class HostLinkedCredentialRead(BaseModel):
@@ -371,11 +404,34 @@ class HostUpdate(BaseModel):
     hostname: StrippedStr | None = None
     port: int | None = None
     os_type: str | None = None
+    site: str | None = None
+    environment: str | None = None
+    criticality: HostCriticality | None = None
     credential_id: int | None = None
     credential_ids: list[int] | None = None
     is_active: bool | None = None
     ssh_host_key_fingerprint: str | None = None
     clear_ssh_host_key: bool = False
+
+    @field_validator("site", "environment", mode="before")
+    @classmethod
+    def _normalize_site_environment(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _normalize_host_label(str(value), max_len=64)
+
+    @field_validator("criticality", mode="before")
+    @classmethod
+    def _normalize_criticality(cls, value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        cleaned = str(value).strip().lower()
+        if not cleaned:
+            return None
+        allowed = {"low", "medium", "high", "critical"}
+        if cleaned not in allowed:
+            raise ValueError("criticality must be one of: low, medium, high, critical")
+        return cleaned
 
 
 class HostCredentialLinkRequest(BaseModel):
@@ -411,11 +467,48 @@ class HostTagAssignRequest(BaseModel):
     tag_names: list[StrippedStr] = Field(default_factory=list)
 
 
+class HostCsvRejectedRow(BaseModel):
+    row: int
+    reason: str
+
+
+class HostCsvImportResult(BaseModel):
+    apply: bool
+    created: int
+    updated: int
+    unchanged: int
+    truncated: bool
+    rejected: list[HostCsvRejectedRow]
+
+
 class DynamicHostFilter(BaseModel):
     tags: list[StrippedStr] = Field(default_factory=list)
     active_only: bool = True
     search: str | None = None
     os_type: str | None = None
+    site: str | None = None
+    environment: str | None = None
+    criticality: HostCriticality | None = None
+
+    @field_validator("site", "environment", mode="before")
+    @classmethod
+    def _normalize_site_environment(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _normalize_host_label(str(value), max_len=64)
+
+    @field_validator("criticality", mode="before")
+    @classmethod
+    def _normalize_criticality(cls, value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        cleaned = str(value).strip().lower()
+        if not cleaned:
+            return None
+        allowed = {"low", "medium", "high", "critical"}
+        if cleaned not in allowed:
+            raise ValueError("criticality must be one of: low, medium, high, critical")
+        return cleaned
 
 
 class HostBulkDeleteRequest(BaseModel):
@@ -452,12 +545,15 @@ def _coerce_open_ports(value: object) -> list[int]:
 
 
 class InventoryScanCreate(BaseModel):
-    target: str = Field(..., min_length=1, max_length=256, description="CIDR, IP, or IP range for nmap")
+    target: str = Field(..., min_length=1, max_length=256, description="CIDR, IP, hostname, or nmap range")
+    method: str = Field(default="nmap", description="nmap (default) or snmp")
     nmap_flags: str | None = Field(
         None,
         max_length=256,
         description="Optional custom nmap flags (empty = default two-phase scan)",
     )
+    credential_id: int | None = None
+    snmp_port: int | None = Field(default=None, ge=1, le=65535)
 
 
 class InventoryScanResultRead(BaseModel):
@@ -469,6 +565,7 @@ class InventoryScanResultRead(BaseModel):
     host_id: int | None
     open_ports: Annotated[list[int], BeforeValidator(_coerce_open_ports)] = []
     ports_scanned: bool = True
+    platform_hint: str | None = None
     is_active: bool = False
     created_at: datetime
 
@@ -485,6 +582,7 @@ class InventoryScanResultRead(BaseModel):
                 "host_id": data.host_id,
                 "open_ports": raw,
                 "ports_scanned": raw is not None,
+                "platform_hint": getattr(data, "platform_hint", None),
                 "is_active": data.is_active,
                 "created_at": data.created_at,
             }
@@ -505,12 +603,99 @@ class InventoryScanRead(BaseModel):
     hosts_found: int
     hosts_created: int
     nmap_flags: str | None = None
+    method: str = "nmap"
+    credential_id: int | None = None
+    snmp_port: int | None = None
     owner_sub: str | None = None
     created_at: datetime
 
 
 class InventoryScanDetail(InventoryScanRead):
     results: list[InventoryScanResultRead] = []
+
+
+class DirectorySourceCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    server: str = Field(..., min_length=1, max_length=256)
+    port: int = Field(default=389, ge=1, le=65535)
+    use_ssl: bool = False
+    start_tls: bool = True
+    verify_tls: bool = False
+    base_dn: str = Field(..., min_length=3, max_length=512)
+    bind_dn: str = Field(..., min_length=3, max_length=512)
+    bind_password: str = Field(..., min_length=1, max_length=256)
+    enabled_only: bool = True
+    map_ou_to_site: bool = True
+    is_active: bool = True
+
+
+class DirectorySourceUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    server: str | None = Field(default=None, min_length=1, max_length=256)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    use_ssl: bool | None = None
+    start_tls: bool | None = None
+    verify_tls: bool | None = None
+    base_dn: str | None = Field(default=None, min_length=3, max_length=512)
+    bind_dn: str | None = Field(default=None, min_length=3, max_length=512)
+    bind_password: str | None = Field(default=None, max_length=256)
+    enabled_only: bool | None = None
+    map_ou_to_site: bool | None = None
+    is_active: bool | None = None
+
+
+class DirectorySourceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    server: str
+    port: int
+    use_ssl: bool
+    start_tls: bool
+    verify_tls: bool
+    base_dn: str
+    bind_dn: str
+    enabled_only: bool
+    map_ou_to_site: bool
+    is_active: bool
+    has_bind_password: bool = True
+    created_at: datetime
+
+
+class DirectorySourceTest(BaseModel):
+    server: str = Field(..., min_length=1, max_length=256)
+    port: int = Field(default=389, ge=1, le=65535)
+    use_ssl: bool = False
+    start_tls: bool = True
+    verify_tls: bool = False
+    base_dn: str = Field(..., min_length=3, max_length=512)
+    bind_dn: str = Field(..., min_length=3, max_length=512)
+    bind_password: str | None = Field(default=None, max_length=256)
+    enabled_only: bool = True
+    source_id: int | None = None
+
+
+class DirectoryProbeRead(BaseModel):
+    computers: int
+    sample: list[str] = []
+    truncated: bool = False
+
+
+class DirectorySyncRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source_id: int
+    status: JobStatus
+    hosts_found: int
+    hosts_created: int
+    hosts_updated: int
+    hosts_matched: int
+    error_message: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
 
 
 # --- Credentials ---
@@ -521,6 +706,7 @@ class CredentialBase(BaseModel):
     credential_type: CredentialType
     username: str | None = None
     service_username: str | None = None
+    snmp_priv_protocol: str | None = None
     description: str | None = None
 
 
@@ -544,6 +730,7 @@ class CredentialUpdate(BaseModel):
     key_passphrase: str | None = None
     service_username: str | None = None
     service_secret: str | None = None
+    snmp_priv_protocol: str | None = None
     description: str | None = None
 
 
@@ -905,6 +1092,7 @@ class PlaybookTemplateRead(BaseModel):
 class PlaybookRunRequest(BaseModel):
     host_ids: list[int] = Field(min_length=1)
     connection_mode: Literal["auto", "ssh", "paramiko", "winrm"] = "auto"
+    check_mode: bool = False
 
 
 class PlaybookRunRead(BaseModel):
@@ -921,6 +1109,7 @@ class PlaybookRunRead(BaseModel):
     created_at: datetime
     host_count: int = 0
     host_ids: list[int] = Field(default_factory=list)
+    check_mode: bool = False
 
 
 class JobRunRead(BaseModel):
@@ -934,6 +1123,7 @@ class JobRunRead(BaseModel):
     celery_task_id: str | None
     error_message: str | None
     created_at: datetime
+    check_mode: bool = False
 
 
 class CheckResultRead(BaseModel):
@@ -1131,6 +1321,52 @@ class UserRead(UserBase):
     id: int
     is_active: bool
     created_at: datetime
+    mfa_enabled: bool = False
+
+    @field_validator("mfa_enabled", mode="before")
+    @classmethod
+    def _coerce_mfa_enabled(cls, value: object) -> bool:
+        # Rows created before the MFA migration (and unflushed ORM objects) read None.
+        return bool(value)
+
+
+# --- API keys / service accounts ---
+
+API_KEY_SCOPE_LITERAL = Literal["jobs:run", "reports:read", "inventory:scan"]
+
+
+class ApiKeyCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    scopes: list[API_KEY_SCOPE_LITERAL] = Field(..., min_length=1)
+    expires_at: datetime | None = None
+
+
+class ApiKeyUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    scopes: list[API_KEY_SCOPE_LITERAL] | None = Field(default=None, min_length=1)
+    expires_at: datetime | None = None
+    is_active: bool | None = None
+
+
+class ApiKeyRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    key_prefix: str
+    scopes: list[str]
+    created_by: str | None = None
+    created_at: datetime
+    last_used_at: datetime | None = None
+    expires_at: datetime | None = None
+    revoked_at: datetime | None = None
+    is_active: bool
+
+
+class ApiKeyCreated(ApiKeyRead):
+    """Create/rotate response includes the plaintext secret once."""
+
+    secret: str
 
 
 # --- Reports ---
@@ -1154,6 +1390,7 @@ class ComplianceWaiverBase(BaseModel):
     host_id: int | None = None
     job_id: int | None = None
     reason: str
+    change_ticket: str | None = None
     expires_at: datetime | None = None
 
 
@@ -1163,11 +1400,37 @@ class ComplianceWaiverCreate(ComplianceWaiverBase):
 
 class ComplianceWaiverUpdate(BaseModel):
     reason: str | None = None
+    change_ticket: str | None = None
     expires_at: datetime | None = None
+
+
+class ComplianceWaiverApprove(BaseModel):
+    change_ticket: str | None = None
 
 
 class ComplianceWaiverReject(BaseModel):
     reason: str | None = None
+
+
+class ComplianceWaiversBulkApproveRequest(BaseModel):
+    waiver_ids: list[int]
+    change_ticket: str | None = None
+
+
+class ComplianceWaiversBulkRejectRequest(BaseModel):
+    waiver_ids: list[int]
+    reason: str | None = None
+
+
+class ComplianceWaiversBulkActionError(BaseModel):
+    waiver_id: int
+    message: str
+    code: str | None = None
+
+
+class ComplianceWaiversBulkActionResult(BaseModel):
+    succeeded: list[int]
+    failed: list[ComplianceWaiversBulkActionError]
 
 
 class ComplianceWaiverRead(ComplianceWaiverBase):
@@ -1208,6 +1471,9 @@ class DriftSummary(BaseModel):
     baseline_compliance_percent: float
     current_compliance_percent: float
     compliance_delta: float
+    baseline_failed: int = 0
+    closed_failed: int = 0
+    closed_fail_percent: float | None = None
 
 
 class DriftReport(BaseModel):
@@ -1239,6 +1505,9 @@ class DiffSummary(BaseModel):
     left_compliance_percent: float
     right_compliance_percent: float
     compliance_delta: float
+    baseline_failed: int = 0
+    closed_failed: int = 0
+    closed_fail_percent: float | None = None
 
 
 class DiffReport(BaseModel):
@@ -1472,6 +1741,73 @@ class AuditFlowCreate(BaseModel):
     save_to_inventory: bool = False
 
 
+class AuditFlowTemplateCreate(BaseModel):
+    name: StrippedStr = Field(..., min_length=1, max_length=128)
+    description: str | None = None
+    targets: list[StrippedStr] = Field(..., min_length=1, max_length=16)
+    credentials: list[AuditFlowCredentialIn] = Field(default_factory=list, max_length=20)
+    save_to_inventory: bool = False
+    cron_expression: str | None = None
+    is_scheduled: bool = False
+    is_active: bool = True
+
+    @field_validator("cron_expression")
+    @classmethod
+    def validate_cron(cls, value: str | None) -> str | None:
+        return validate_cron_expression(value)
+
+    @model_validator(mode="after")
+    def require_cron_when_scheduled(self) -> "AuditFlowTemplateCreate":
+        if self.is_scheduled and not self.cron_expression:
+            raise ValueError("cron_expression is required when is_scheduled is true")
+        if not self.is_scheduled:
+            self.cron_expression = None
+        return self
+
+
+class AuditFlowTemplateUpdate(BaseModel):
+    name: StrippedStr | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = None
+    targets: list[StrippedStr] | None = Field(default=None, min_length=1, max_length=16)
+    credentials: list[AuditFlowCredentialIn] | None = Field(default=None, max_length=20)
+    save_to_inventory: bool | None = None
+    cron_expression: str | None = None
+    is_scheduled: bool | None = None
+    is_active: bool | None = None
+
+    @field_validator("cron_expression")
+    @classmethod
+    def validate_cron(cls, value: str | None) -> str | None:
+        return validate_cron_expression(value)
+
+
+class AuditFlowTemplateCredentialRead(BaseModel):
+    label: str
+    credential_type: CredentialType
+    username: str
+    service_username: str | None = None
+    has_secret: bool = True
+    has_service_secret: bool = False
+
+
+class AuditFlowTemplateRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: str | None = None
+    targets: list[str] = Field(default_factory=list)
+    credentials: list[AuditFlowTemplateCredentialRead] = Field(default_factory=list)
+    save_to_inventory: bool = False
+    cron_expression: str | None = None
+    is_scheduled: bool = False
+    last_scheduled_at: datetime | None = None
+    is_active: bool = True
+    owner_sub: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 class AuditFlowCredentialRead(BaseModel):
     id: int
     label: str
@@ -1527,6 +1863,7 @@ class AuditFlowHostRead(BaseModel):
     profile_name: str | None = None
     confidence: int = 0
     alternatives: list[dict] = Field(default_factory=list)
+    match_hints: list[dict] = Field(default_factory=list)
     extra_profiles: list[dict] = Field(default_factory=list)
     extra_checks: list[dict] = Field(default_factory=list)
     check_summary: dict | None = None
@@ -1537,6 +1874,38 @@ class AuditFlowHostRead(BaseModel):
     ephemeral_host_id: int | None = None
     inventory_reused: bool = False
     ssh_host_key_fingerprint: str | None = None
+
+
+class AuditFlowInventoryDriftHost(BaseModel):
+    change: Literal["appeared", "disappeared", "unchanged", "changed"]
+    ip_address: str
+    hostname: str | None = None
+    ssh_host_key_fingerprint: str | None = None
+    os_guess: str | None = None
+    profile_id: int | None = None
+    profile_name: str | None = None
+    left_run_id: int | None = None
+    right_run_id: int | None = None
+    left_os_guess: str | None = None
+    right_os_guess: str | None = None
+    left_profile_name: str | None = None
+    right_profile_name: str | None = None
+
+
+class AuditFlowInventoryDriftSummary(BaseModel):
+    left_run_id: int
+    right_run_id: int
+    left_hosts: int
+    right_hosts: int
+    appeared: int
+    disappeared: int
+    unchanged: int
+    changed: int
+
+
+class AuditFlowInventoryDriftReport(BaseModel):
+    summary: AuditFlowInventoryDriftSummary
+    items: list[AuditFlowInventoryDriftHost]
 
 
 class AuditFlowProgress(BaseModel):
@@ -1552,6 +1921,7 @@ class AuditFlowRunRead(BaseModel):
     error_message: str | None = None
     hosts_found: int = 0
     save_to_inventory: bool = False
+    template_id: int | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
     created_at: datetime

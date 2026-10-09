@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import redis
 
 from secaudit_core.redis_client import sync_redis
+from secaudit_core.sensitive_data import redact_sensitive
 
 _TTL = 86400
 
@@ -39,11 +40,12 @@ def set_audit_flow_pid(redis_url: str, run_id: int, pid: int) -> None:
 
 
 def append_audit_flow_log(redis_url: str, run_id: int, message: str, *, level: str = "info") -> None:
+    safe = redact_sensitive(message)
     payload = json.dumps(
         {
             "audit_flow_run_id": run_id,
             "level": level,
-            "message": message,
+            "message": safe if isinstance(safe, str) else str(safe),
             "timestamp": datetime.now(UTC).isoformat(),
         }
     )

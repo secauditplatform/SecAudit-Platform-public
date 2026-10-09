@@ -7,7 +7,7 @@ import { resolveWsBaseUrl } from "../utils/wsUrl";
 import { authenticateWebSocket } from "../utils/wsAuth";
 import "xterm/css/xterm.css";
 
-const authEnabled = import.meta.env.VITE_AUTH_ENABLED === "true";
+const authEnabled = import.meta.env.VITE_AUTH_ENABLED !== "false";
 
 type ConsoleTerminalProps = {
   sessionKey: number;

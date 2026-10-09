@@ -8,7 +8,9 @@ data:
   APP_ENV: {{ .Values.appEnv | quote }}
   API_DEBUG: "false"
   AUTH_ENABLED: {{ .Values.config.authEnabled | quote }}
+  ALLOW_AUTH_DISABLED: {{ .Values.config.allowAuthDisabled | default "false" | quote }}
   LOCAL_AUTH_ENABLED: {{ .Values.config.localAuthEnabled | quote }}
+  AUTH_IDLE_TIMEOUT_SECONDS: {{ .Values.config.authIdleTimeoutSeconds | quote }}
   CONSOLE_ENABLED: {{ .Values.config.consoleEnabled | quote }}
   CONSOLE_ALLOW_IN_PRODUCTION: {{ .Values.config.consoleAllowInProduction | quote }}
   SECRETS_BACKEND: {{ .Values.config.secretsBackend | quote }}

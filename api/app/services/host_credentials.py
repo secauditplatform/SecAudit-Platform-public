@@ -6,7 +6,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser
-from app.models import Credential, Host, HostCredentialLink
+from app.models import Credential, CredentialType, Host, HostCredentialLink
 from app.services.object_rbac import assert_credential_attachable
 from fastapi import HTTPException
 
@@ -34,6 +34,11 @@ async def _validate_credentials(
         if cred is None:
             raise HTTPException(status_code=404, detail="Credential not found")
         assert_credential_attachable(user, cred.owner_sub)
+        if cred.credential_type in (CredentialType.SNMP_V2C, CredentialType.SNMP_V3):
+            raise HTTPException(
+                status_code=400,
+                detail="SNMP credentials are used by inventory discovery, not host login",
+            )
         ordered.append(cred)
     return ordered
 

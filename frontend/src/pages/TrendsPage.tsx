@@ -208,7 +208,7 @@ export function TrendsPage() {
     }
     if (profileFilter !== "all") {
       const profileName =
-        profiles.data?.find((profile) => String(profile.id) === profileFilter)?.label ?? profileFilter;
+        profiles.data?.find((profile) => String(profile.id) === profileFilter)?.profile_name ?? profileFilter;
       chips.push({
         key: "scope-profile",
         label: `${t("trends.profileFilter")}: ${profileName}`,

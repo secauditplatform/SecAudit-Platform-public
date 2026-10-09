@@ -84,6 +84,13 @@ class ProfileScore(TypedDict):
     confidence: int
 
 
+class MatchHint(TypedDict, total=False):
+    code: str
+    detail: str
+    profile_id: int
+    confidence: int
+
+
 class MatchDecision(TypedDict):
     profile_id: int | None
     profile_name: str | None
@@ -92,6 +99,7 @@ class MatchDecision(TypedDict):
     auto_select: bool
     skip_reason: str | None
     skip_detail: str | None
+    hints: list[MatchHint]
 
 
 _LINUX_HINTS = (
@@ -614,6 +622,71 @@ def rank_profiles(fp: Fingerprint, profiles: list[ProfileMatchInput], *, limit: 
     return ranked[:limit]
 
 
+def build_match_hints(
+    fp: Fingerprint,
+    profiles: list[ProfileMatchInput],
+    *,
+    profile_id: int | None,
+    profile_name: str | None,
+    confidence: int,
+    alternatives: list[ProfileScore],
+) -> list[MatchHint]:
+    """Human-readable reasons for the chosen CRE profile vs near alternatives."""
+    hints: list[MatchHint] = []
+    family = fp.get("family")
+    source = fp.get("source") or "ports"
+    version = fp.get("os_version")
+    pretty = fp.get("pretty")
+
+    if pretty:
+        hints.append({"code": "detected_os", "detail": str(pretty)})
+    if family:
+        hints.append({"code": "detected_family", "detail": str(family)})
+    if version:
+        hints.append({"code": "detected_version", "detail": str(version)})
+    hints.append({"code": "fingerprint_source", "detail": str(source)})
+
+    if profile_id and profile_name:
+        hints.append(
+            {
+                "code": "selected",
+                "detail": profile_name,
+                "profile_id": profile_id,
+                "confidence": confidence,
+            }
+        )
+
+    rejected: list[str] = []
+    seen_rejected: set[str] = set()
+    for profile in profiles:
+        if not is_os_profile(profile):
+            continue
+        if (fp.get("platform") or "").lower() and profile.get("platform") != (fp.get("platform") or "").lower():
+            continue
+        pr_family = _profile_family(profile)
+        if not pr_family or not family or pr_family == family:
+            continue
+        if pr_family in seen_rejected:
+            continue
+        seen_rejected.add(pr_family)
+        rejected.append(pr_family)
+        if len(rejected) >= 4:
+            break
+    for name in rejected:
+        hints.append({"code": "family_rejected", "detail": name})
+
+    for alt in alternatives[:3]:
+        hints.append(
+            {
+                "code": "alternative",
+                "detail": alt["profile_name"],
+                "profile_id": alt["profile_id"],
+                "confidence": alt["confidence"],
+            }
+        )
+    return hints
+
+
 def decide_profile(
     fp: Fingerprint,
     profiles: list[ProfileMatchInput],
@@ -631,6 +704,14 @@ def decide_profile(
             "auto_select": False,
             "skip_reason": "no_matching_profile",
             "skip_detail": "No matching compliance profile",
+            "hints": build_match_hints(
+                fp,
+                profiles,
+                profile_id=None,
+                profile_name=None,
+                confidence=0,
+                alternatives=[],
+            ),
         }
 
     top = ranked[0]
@@ -647,6 +728,15 @@ def decide_profile(
         skip_reason = "low_confidence"
         skip_detail = "Profile match needs confirmation"
 
+    hints = build_match_hints(
+        fp,
+        profiles,
+        profile_id=top["profile_id"],
+        profile_name=top["profile_name"],
+        confidence=top["confidence"],
+        alternatives=alternatives,
+    )
+
     return {
         "profile_id": top["profile_id"],
         "profile_name": top["profile_name"],
@@ -655,6 +745,7 @@ def decide_profile(
         "auto_select": auto,
         "skip_reason": None if auto else skip_reason,
         "skip_detail": None if auto else skip_detail,
+        "hints": hints,
     }
 
 
@@ -684,16 +775,19 @@ def fingerprint_from_facts(
     os_release: str | None = None,
     win_caption: str | None = None,
     nmap_os: str | None = None,
+    snmp_sysdescr: str | None = None,
     services: str | None = None,
     open_ports: list[int] | None = None,
 ) -> Fingerprint:
     os_release = sanitize_probe_text(os_release) or None
     win_caption = sanitize_probe_text(win_caption) or None
     nmap_os = sanitize_probe_text(nmap_os) or None
+    snmp_sysdescr = sanitize_probe_text(snmp_sysdescr) or None
     services = sanitize_probe_text(services) or None
     auth_parts = [p for p in (os_release, win_caption) if p]
     nmap_parts = [p for p in (nmap_os, services) if p]
-    raw = "\n".join(auth_parts + nmap_parts)
+    hint_parts = [p for p in (nmap_os, snmp_sysdescr, services) if p]
+    raw = "\n".join(auth_parts + hint_parts)
     auth_blob = "\n".join(auth_parts)
     fields = _parse_os_release(os_release or "")
     os_id = _os_release_id(os_release or "") or _os_release_id(raw)
@@ -708,6 +802,7 @@ def fingerprint_from_facts(
         win_family, win_release = _windows_identity(win_text)
         family = win_family or family
 
+    banner = nmap_os or snmp_sysdescr
     guessed = platform
     if win_family:
         guessed = "windows"
@@ -740,6 +835,8 @@ def fingerprint_from_facts(
         source = "facts"
     elif nmap_parts:
         source = "nmap"
+    elif snmp_sysdescr:
+        source = "snmp"
 
     if guessed == "windows":
         os_name = "Windows Server" if family == "windows_server" else "Windows"
@@ -751,14 +848,14 @@ def fingerprint_from_facts(
     elif guessed == "linux":
         os_version = fields.get("VERSION_ID") or None
         if not os_version:
-            ver_src = fields.get("PRETTY_NAME") or auth_blob or (nmap_os or "")
+            ver_src = fields.get("PRETTY_NAME") or auth_blob or (banner or "")
             ver = _VERSION_RE.search(ver_src)
             os_version = ver.group(1) if ver else None
         os_name = fields.get("NAME") or fields.get("ID") or (family.title() if family else "Linux")
         vendor = fields.get("HOME_URL")
         pretty = _linux_pretty(fields, os_release or auth_blob or "")
-        if not pretty and nmap_os and not _is_port_service_line(nmap_os):
-            pretty = nmap_os
+        if not pretty and banner and not _is_port_service_line(banner):
+            pretty = banner
         if not pretty:
             pretty = f"{os_name} {os_version}".strip() if os_version else os_name
         family = family or detect_family(pretty or raw, os_id=os_id)
@@ -766,10 +863,10 @@ def fingerprint_from_facts(
         family = family or detect_family(raw)
         os_name = (family or "Network").replace("_", " ").title()
         vendor = family
-        ver_src = auth_blob or (nmap_os if nmap_os and not _is_port_service_line(nmap_os) else "")
+        ver_src = auth_blob or (banner if banner and not _is_port_service_line(banner) else "")
         ver = _VERSION_RE.search(ver_src)
         os_version = ver.group(1) if ver else None
-        pretty_source = auth_blob or (nmap_os if nmap_os and not _is_port_service_line(nmap_os) else "") or os_name
+        pretty_source = auth_blob or (banner if banner and not _is_port_service_line(banner) else "") or os_name
         pretty = (sanitize_probe_text(pretty_source) or os_name).splitlines()[0].strip()[:256]
         if _is_port_service_line(pretty):
             pretty = os_name

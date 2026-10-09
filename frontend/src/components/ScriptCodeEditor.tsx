@@ -1,5 +1,5 @@
 import Editor from "@monaco-editor/react";
-import { PLAYBOOK_EDITOR_OPTIONS } from "./PlaybookYamlEditor";
+import { monacoEditorOptionsForViewport, useIsMobileViewport } from "./PlaybookYamlEditor";
 
 export function scriptEditorLanguage(executionType: string): string {
   switch (executionType.toUpperCase()) {
@@ -30,6 +30,7 @@ export function ScriptCodeEditor({
   height = "420px",
   readOnly = false,
 }: ScriptCodeEditorProps) {
+  const isMobile = useIsMobileViewport();
   return (
     <Editor
       height={height}
@@ -38,7 +39,7 @@ export function ScriptCodeEditor({
       value={value}
       onChange={(next) => onChange(next ?? "")}
       options={{
-        ...PLAYBOOK_EDITOR_OPTIONS,
+        ...monacoEditorOptionsForViewport(isMobile),
         readOnly,
       }}
     />

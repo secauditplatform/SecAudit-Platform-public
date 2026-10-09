@@ -165,6 +165,9 @@ export function PlaybooksPage() {
   const [playbookJobsListExpanded, setPlaybookJobsListExpanded] = useState(false);
   const [batchHostIds, setBatchHostIds] = useState<number[]>([]);
   const [batchConnectionMode, setBatchConnectionMode] = useState<PlaybookConnectionMode>("auto");
+  const [quickRunPlaybookId, setQuickRunPlaybookId] = useState<number | null>(null);
+  const [quickRunHostIds, setQuickRunHostIds] = useState<number[]>([]);
+  const [quickRunConnectionMode, setQuickRunConnectionMode] = useState<PlaybookConnectionMode>("auto");
   const [playbookPlatform, setPlaybookPlatform] = useState<PlaybookPlatformScope>("linux");
   const [pageView, setPageView] = useState<PlaybookPageView>(() => {
     const view = parsePageView(searchParams.get("view"));
@@ -474,17 +477,32 @@ export function PlaybooksPage() {
       playbookId,
       ids,
       mode,
+      checkMode = false,
     }: {
       playbookId: number;
       ids: number[];
       mode: PlaybookConnectionMode;
-    }) => api.runPlaybook(playbookId, ids, mode),
-    onSuccess: (run) => {
-      selectRun(run.id);
+      fromCatalog?: boolean;
+      checkMode?: boolean;
+    }) => api.runPlaybook(playbookId, ids, mode, checkMode),
+    onSuccess: (run, variables) => {
       queryClient.invalidateQueries({ queryKey: ["playbook-runs", selectedId] });
       queryClient.invalidateQueries({ queryKey: ["playbook-runs-all"] });
       queryClient.invalidateQueries({ queryKey: ["job-runs"] });
-      toast.success(t("toast.playbookRunStarted"));
+      toast.success(
+        variables.checkMode ? t("toast.playbookCheckStarted") : t("toast.playbookRunStarted")
+      );
+      if (variables.fromCatalog) {
+        setQuickRunPlaybookId(null);
+        setQuickRunHostIds([]);
+        setSelectedComplianceIds([]);
+        setEditorOpen(false);
+        setPageView("jobs");
+        setSelectedRunId(run.id);
+        syncPlaybooksUrl("jobs", run.id);
+        return;
+      }
+      selectRun(run.id);
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -494,18 +512,20 @@ export function PlaybooksPage() {
       playbookIds,
       ids,
       mode,
+      checkMode = false,
     }: {
       playbookIds: number[];
       ids: number[];
       mode: PlaybookConnectionMode;
+      checkMode?: boolean;
     }) => {
       const runs = [];
       for (const playbookId of playbookIds) {
-        runs.push(await api.runPlaybook(playbookId, ids, mode));
+        runs.push(await api.runPlaybook(playbookId, ids, mode, checkMode));
       }
       return runs;
     },
-    onSuccess: (runs) => {
+    onSuccess: (runs, variables) => {
       if (runs.length > 0) {
         selectRun(runs[runs.length - 1].id);
         setPageView("jobs");
@@ -514,7 +534,11 @@ export function PlaybooksPage() {
       setSelectedComplianceIds([]);
       queryClient.invalidateQueries({ queryKey: ["playbook-runs-all"] });
       queryClient.invalidateQueries({ queryKey: ["job-runs"] });
-      toast.success(t("playbooks.complianceBatchStarted", { count: runs.length }));
+      toast.success(
+        variables.checkMode
+          ? t("toast.playbookCheckStarted")
+          : t("playbooks.complianceBatchStarted", { count: runs.length })
+      );
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -550,7 +574,7 @@ export function PlaybooksPage() {
   });
 
   const restartRunMutation = useMutation({
-    mutationFn: (run: { playbook_id?: number | null; host_ids?: number[] }) => {
+    mutationFn: (run: { playbook_id?: number | null; host_ids?: number[]; check_mode?: boolean }) => {
       if (!run.playbook_id) {
         return Promise.reject(new Error(t("playbooks.restartMissingPlaybook")));
       }
@@ -558,14 +582,16 @@ export function PlaybooksPage() {
       if (hostIds.length === 0) {
         return Promise.reject(new Error(t("playbooks.restartMissingHosts")));
       }
-      return api.runPlaybook(run.playbook_id, hostIds, connectionMode);
+      return api.runPlaybook(run.playbook_id, hostIds, connectionMode, Boolean(run.check_mode));
     },
     onSuccess: (run) => {
       selectRun(run.id);
       queryClient.invalidateQueries({ queryKey: ["playbook-runs", selectedId] });
       queryClient.invalidateQueries({ queryKey: ["playbook-runs-all"] });
       queryClient.invalidateQueries({ queryKey: ["job-runs"] });
-      toast.success(t("toast.playbookRunStarted"));
+      toast.success(
+        run.check_mode ? t("toast.playbookCheckStarted") : t("toast.playbookRunStarted")
+      );
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -618,6 +644,29 @@ export function PlaybooksPage() {
       document.querySelector(".pf-playbooks-run")?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 80);
   };
+
+  const startQuickRun = (id: number) => {
+    setQuickRunPlaybookId(id);
+    setQuickRunHostIds([]);
+    setQuickRunConnectionMode("auto");
+    setSelectedComplianceIds([]);
+    setEditorOpen(false);
+    window.setTimeout(() => {
+      document
+        .querySelector(".pf-playbooks-quick-run")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
+  };
+
+  const cancelQuickRun = () => {
+    setQuickRunPlaybookId(null);
+    setQuickRunHostIds([]);
+  };
+
+  const quickRunPlaybook = useMemo(
+    () => playbooks.data?.find((item) => item.id === quickRunPlaybookId) ?? null,
+    [playbooks.data, quickRunPlaybookId]
+  );
 
   const templateText = (
     template: PlaybookTemplate,
@@ -764,6 +813,9 @@ export function PlaybooksPage() {
           <>
             <div className="pf-playbooks-results__meta">
               <Badge variant={runStatusVariant(runDetail.data.status)}>{runDetail.data.status}</Badge>
+              {runDetail.data.check_mode ? (
+                <Badge variant="info">{t("playbooks.checkModeBadge")}</Badge>
+              ) : null}
               {runDetail.data.error_message && (
                 <span className="pf-playbooks-results__error">{runDetail.data.error_message}</span>
               )}
@@ -798,6 +850,7 @@ export function PlaybooksPage() {
               <th>{t("jobs.runId")}</th>
               {options.showPlaybookColumn && <th>{t("playbooks.playbookCol")}</th>}
               <th>{t("common.status")}</th>
+              <th>{t("playbooks.modeCol")}</th>
               <th>{t("playbooks.hostsCount")}</th>
               <th>{t("reports.started")}</th>
               <th>{t("reports.finished")}</th>
@@ -819,6 +872,13 @@ export function PlaybooksPage() {
                 )}
                 <td>
                   <Badge variant={runStatusVariant(run.status)}>{run.status}</Badge>
+                </td>
+                <td>
+                  {run.check_mode ? (
+                    <Badge variant="info">{t("playbooks.checkModeBadge")}</Badge>
+                  ) : (
+                    t("common.dash")
+                  )}
                 </td>
                 <td>{run.host_count}</td>
                 <td>
@@ -1279,7 +1339,7 @@ export function PlaybooksPage() {
                               type="button"
                               variant="primary"
                               className="pf-btn--sm"
-                              onClick={() => openComplianceTemplate(pb.id, { focusRun: true })}
+                              onClick={() => startQuickRun(pb.id)}
                             >
                               {t("playbooks.complianceRun")}
                             </Button>
@@ -1309,7 +1369,103 @@ export function PlaybooksPage() {
             onToggle={() => setComplianceListExpanded((value) => !value)}
           />
 
-          {selectedComplianceIds.length > 0 && (
+          {quickRunPlaybookId != null && quickRunPlaybook ? (
+            <div className="pf-playbooks-quick-run pf-compliance-batch-run">
+              <div className="pf-compliance-batch-run__head">
+                <div>
+                  <h3 className="pf-compliance-batch-run__title">
+                    {t("playbooks.quickRunTitle", { name: quickRunPlaybook.name })}
+                  </h3>
+                </div>
+                <div className="pf-playbooks-quick-run__actions">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="pf-btn--sm"
+                    onClick={cancelQuickRun}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="pf-btn--sm"
+                    disabled={
+                      !canExecute || quickRunHostIds.length === 0 || runMutation.isPending
+                    }
+                    title={!canExecute ? t("common.demoActionDisabled") : t("playbooks.dryRunHint")}
+                    onClick={() =>
+                      runMutation.mutate({
+                        playbookId: quickRunPlaybook.id,
+                        ids: quickRunHostIds,
+                        mode: quickRunConnectionMode,
+                        fromCatalog: true,
+                        checkMode: true,
+                      })
+                    }
+                  >
+                    {runMutation.isPending && runMutation.variables?.checkMode
+                      ? t("playbooks.running")
+                      : t("playbooks.dryRun")}
+                  </Button>
+                  <Button
+                    type="button"
+                    className="pf-btn--sm"
+                    disabled={
+                      !canExecute || quickRunHostIds.length === 0 || runMutation.isPending
+                    }
+                    title={!canExecute ? t("common.demoActionDisabled") : undefined}
+                    onClick={() =>
+                      runMutation.mutate({
+                        playbookId: quickRunPlaybook.id,
+                        ids: quickRunHostIds,
+                        mode: quickRunConnectionMode,
+                        fromCatalog: true,
+                      })
+                    }
+                  >
+                    {runMutation.isPending && !runMutation.variables?.checkMode
+                      ? t("playbooks.running")
+                      : t("playbooks.quickRunStart")}
+                  </Button>
+                </div>
+              </div>
+              <div className="pf-form__row" style={{ marginBottom: "0.75rem" }}>
+                <div className="pf-form__group">
+                  <label htmlFor="playbook-quick-run-connection-mode">
+                    {t("playbooks.connectionMode")}
+                  </label>
+                  <select
+                    id="playbook-quick-run-connection-mode"
+                    className="pf-select"
+                    value={quickRunConnectionMode}
+                    onChange={(event) =>
+                      setQuickRunConnectionMode(event.target.value as PlaybookConnectionMode)
+                    }
+                  >
+                    <option value="auto">{t("playbooks.connectionAuto")}</option>
+                    <option value="ssh">{t("playbooks.connectionSsh")}</option>
+                    <option value="paramiko">{t("playbooks.connectionParamiko")}</option>
+                    <option value="winrm">{t("playbooks.connectionWinrm")}</option>
+                  </select>
+                </div>
+              </div>
+              <HostPicker
+                hosts={activeHosts}
+                selectedIds={quickRunHostIds}
+                onToggle={(id) =>
+                  setQuickRunHostIds((prev) =>
+                    prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+                  )
+                }
+                onSelectAll={(ids) => setQuickRunHostIds(ids)}
+                onClearAll={() => setQuickRunHostIds([])}
+                hint={t("playbooks.quickRunHostsHint")}
+              />
+            </div>
+          ) : null}
+
+          {selectedComplianceIds.length > 0 && quickRunPlaybookId == null && (
             <div className="pf-compliance-batch-run">
               <div className="pf-compliance-batch-run__head">
                 <div>
@@ -1324,24 +1480,54 @@ export function PlaybooksPage() {
                     {t("playbooks.complianceRunSelectedHint")}
                   </p>
                 </div>
-                <Button
-                  type="button"
-                  className="pf-btn--sm"
-                  disabled={
-                    batchHostIds.length === 0 || runSelectedComplianceMutation.isPending
-                  }
-                  onClick={() =>
-                    runSelectedComplianceMutation.mutate({
-                      playbookIds: selectedComplianceIds,
-                      ids: batchHostIds,
-                      mode: batchConnectionMode,
-                    })
-                  }
-                >
-                  {runSelectedComplianceMutation.isPending
-                    ? t("playbooks.complianceBatchRunning")
-                    : t("playbooks.complianceRunSelected")}
-                </Button>
+                <div className="pf-playbooks-quick-run__actions">
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    className="pf-btn--sm"
+                    disabled={
+                      !canExecute ||
+                      batchHostIds.length === 0 ||
+                      runSelectedComplianceMutation.isPending
+                    }
+                    title={!canExecute ? t("common.demoActionDisabled") : t("playbooks.dryRunHint")}
+                    onClick={() =>
+                      runSelectedComplianceMutation.mutate({
+                        playbookIds: selectedComplianceIds,
+                        ids: batchHostIds,
+                        mode: batchConnectionMode,
+                        checkMode: true,
+                      })
+                    }
+                  >
+                    {runSelectedComplianceMutation.isPending &&
+                    runSelectedComplianceMutation.variables?.checkMode
+                      ? t("playbooks.complianceBatchRunning")
+                      : t("playbooks.dryRun")}
+                  </Button>
+                  <Button
+                    type="button"
+                    className="pf-btn--sm"
+                    disabled={
+                      !canExecute ||
+                      batchHostIds.length === 0 ||
+                      runSelectedComplianceMutation.isPending
+                    }
+                    title={!canExecute ? t("common.demoActionDisabled") : undefined}
+                    onClick={() =>
+                      runSelectedComplianceMutation.mutate({
+                        playbookIds: selectedComplianceIds,
+                        ids: batchHostIds,
+                        mode: batchConnectionMode,
+                      })
+                    }
+                  >
+                    {runSelectedComplianceMutation.isPending &&
+                    !runSelectedComplianceMutation.variables?.checkMode
+                      ? t("playbooks.complianceBatchRunning")
+                      : t("playbooks.complianceRunSelected")}
+                  </Button>
+                </div>
               </div>
               <div className="pf-form__row" style={{ marginBottom: "0.75rem" }}>
                 <div className="pf-form__group">
@@ -1422,6 +1608,14 @@ export function PlaybooksPage() {
                     </td>
                     <td className="pf-table__col-actions">
                       <div className="pf-table__actions pf-playbook-run-actions">
+                        <Button
+                          type="button"
+                          variant="primary"
+                          className="pf-btn--sm"
+                          onClick={() => startQuickRun(pb.id)}
+                        >
+                          {t("playbooks.complianceRun")}
+                        </Button>
                         <Button
                           type="button"
                           variant="secondary"
@@ -1788,15 +1982,36 @@ export function PlaybooksPage() {
             hint={t("playbooks.hostPickerHint")}
           />
           <div className="pf-form__actions" style={{ marginTop: "1rem" }}>
-            <Button
-              onClick={() =>
-                runMutation.mutate({ playbookId: selectedId, ids: hostIds, mode: connectionMode })
-              }
-              disabled={!canExecute || !hostIds.length || runMutation.isPending}
-              title={!canExecute ? t("common.demoActionDisabled") : undefined}
-            >
-              {runMutation.isPending ? t("playbooks.running") : t("playbooks.runPlaybook")}
-            </Button>
+            <div className="pf-form__actions-buttons">
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  runMutation.mutate({
+                    playbookId: selectedId,
+                    ids: hostIds,
+                    mode: connectionMode,
+                    checkMode: true,
+                  })
+                }
+                disabled={!canExecute || !hostIds.length || runMutation.isPending}
+                title={!canExecute ? t("common.demoActionDisabled") : t("playbooks.dryRunHint")}
+              >
+                {runMutation.isPending && runMutation.variables?.checkMode
+                  ? t("playbooks.running")
+                  : t("playbooks.dryRun")}
+              </Button>
+              <Button
+                onClick={() =>
+                  runMutation.mutate({ playbookId: selectedId, ids: hostIds, mode: connectionMode })
+                }
+                disabled={!canExecute || !hostIds.length || runMutation.isPending}
+                title={!canExecute ? t("common.demoActionDisabled") : undefined}
+              >
+                {runMutation.isPending && !runMutation.variables?.checkMode
+                  ? t("playbooks.running")
+                  : t("playbooks.runPlaybook")}
+              </Button>
+            </div>
           </div>
           {runMutation.isError && (
             <div className="pf-alert pf-alert--error">{(runMutation.error as Error).message}</div>

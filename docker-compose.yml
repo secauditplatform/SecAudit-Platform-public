@@ -1,3 +1,6 @@
+# Host ports are bound to 127.0.0.1. On Windows, localhost resolves to ::1 first,
+# and Docker's IPv6 publish accepts the connection then never answers. An IPv4-only
+# bind makes ::1 refuse immediately, so http://localhost:<port> works.
 # Shared Redis Sentinel settings — all app services must use the same values.
 x-redis-sentinel: &redis-sentinel
   REDIS_URL: redis://secaudit-master/0
@@ -163,7 +166,9 @@ services:
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
       APP_ENV: ${APP_ENV:-development}
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      ALLOW_AUTH_DISABLED: ${ALLOW_AUTH_DISABLED:-false}
       LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+      AUTH_IDLE_TIMEOUT_SECONDS: ${AUTH_IDLE_TIMEOUT_SECONDS:-14400}
       CONSOLE_ENABLED: ${CONSOLE_ENABLED:-true}
       CONSOLE_SANDBOX_ENABLED: ${CONSOLE_SANDBOX_ENABLED:-true}
       CONSOLE_SANDBOX_URL: ${CONSOLE_SANDBOX_URL:-http://console:8001}
@@ -213,7 +218,6 @@ services:
       context: .
       dockerfile: console/Dockerfile
     ports:
-      # Bind to loopback only — console is reached via the API proxy, not the public host.
       - "127.0.0.1:8001:8001"
     cap_drop:
       - ALL
@@ -225,22 +229,19 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=32m
       - /var/empty/secaudit-console:rw,noexec,nosuid,nodev,size=1m
-    # Do not mount .env here — avoids leaking SECRET_KEY / DB / Redis into the sandbox.
+    env_file:
+      - .env
     environment:
-      # JWT verification only (local HS256). Falls back to SECRET_KEY value at compose
-      # interpolation time without exporting SECRET_KEY into the container.
-      LOCAL_JWT_SIGNING_KEY: ${LOCAL_JWT_SIGNING_KEY:-${SECRET_KEY:-dev-secret-key}}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
       APP_ENV: ${APP_ENV:-development}
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      ALLOW_AUTH_DISABLED: ${ALLOW_AUTH_DISABLED:-false}
       LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
-      LOCAL_AUTH_REVALIDATE_FROM_DB: "false"
-      DEMO_MODE: ${DEMO_MODE:-false}
       CONSOLE_ENABLED: ${CONSOLE_ENABLED:-true}
       CONSOLE_ALLOW_IN_PRODUCTION: ${CONSOLE_ALLOW_IN_PRODUCTION:-false}
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://localhost:8080/realms/secaudit}
       KEYCLOAK_REALM: secaudit
-      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-account}
     volumes:
       - ./api:/app
       - ./packages/secaudit_core:/packages/secaudit_core
@@ -254,8 +255,9 @@ services:
       retries: 10
       start_period: 5s
     command: uvicorn app.console_main:app --host 0.0.0.0 --port 8001 --reload --reload-dir /app
-    # Console needs Keycloak JWKS on the Compose network; it does not receive
-    # SECRET_KEY, Postgres, or Redis credentials (no env_file).
+    # Network tradeoff: shares the default Compose network so diagnostics can reach
+    # lab targets and Keycloak JWKS. It does not mount Postgres/Redis data volumes;
+    # prefer denying DB ports via external firewall/network policies in production.
 
   worker:
     build:
@@ -344,6 +346,7 @@ services:
       # Setting ws://… breaks HTTPS / reverse-proxy setups (mixed content).
       VITE_AUTH_ENABLED: ${AUTH_ENABLED:-true}
       VITE_LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+      VITE_AUTH_IDLE_TIMEOUT_SECONDS: ${AUTH_IDLE_TIMEOUT_SECONDS:-14400}
       VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL:-http://localhost:8080}
       VITE_KEYCLOAK_REALM: secaudit
       VITE_KEYCLOAK_CLIENT_ID: secaudit-frontend
@@ -391,10 +394,9 @@ services:
       - tempo
       - prometheus
     environment:
-      # Lab default: require login (no anonymous Admin). Set credentials via
-      # GF_SECURITY_ADMIN_USER / GF_SECURITY_ADMIN_PASSWORD if needed.
-      GF_AUTH_ANONYMOUS_ENABLED: "false"
-      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
       GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor,traceqlMetrics"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/secaudit_overview.json
     volumes:

@@ -22,7 +22,7 @@ function isActiveStatus(status: string | null | undefined): boolean {
 export function AuditFlowLogs({ runId, runStatus }: AuditFlowLogsProps) {
   const { t } = useTranslation();
   const { token, ready, authenticated } = useAuth();
-  const authEnabled = import.meta.env.VITE_AUTH_ENABLED === "true";
+  const authEnabled = import.meta.env.VITE_AUTH_ENABLED !== "false";
   const canLoad = Boolean(ready && (!authEnabled || (authenticated && token)));
 
   const [liveEntries, setLiveEntries] = useState<AuditFlowLogEntry[]>([]);

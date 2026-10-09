@@ -80,7 +80,7 @@ export function ReportsPage() {
   const [checkSeverityFilter, setCheckSeverityFilter] = useState("all");
   const [checkMessageFilter, setCheckMessageFilter] = useState("");
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState<"html" | "pdf" | "csv" | null>(null);
+  const [downloading, setDownloading] = useState<"html" | "pdf" | "csv" | "pack" | null>(null);
   const [expandedCheckId, setExpandedCheckId] = useState<number | null>(null);
   const [compareBaselineRunId, setCompareBaselineRunId] = useState<number | null>(null);
   const [driftChangeFilter, setDriftChangeFilter] = useState("all");
@@ -178,7 +178,7 @@ export function ReportsPage() {
     deleteRunMutation.mutate(run.id);
   };
 
-  const handleDownload = async (format: "html" | "pdf" | "csv") => {
+  const handleDownload = async (format: "html" | "pdf" | "csv" | "pack") => {
     if (activeRunId == null) return;
     setDownloadError(null);
     setDownloading(format);
@@ -187,6 +187,8 @@ export function ReportsPage() {
         await api.downloadReportHtml(activeRunId, locale);
       } else if (format === "pdf") {
         await api.downloadReportPdf(activeRunId, locale);
+      } else if (format === "pack") {
+        await api.downloadReportPack(activeRunId, locale);
       } else {
         await api.downloadReportCsv(activeRunId, {
           status: checkStatusFilter !== "all" ? checkStatusFilter : undefined,
@@ -555,6 +557,9 @@ export function ReportsPage() {
                 <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("csv")} disabled={downloading !== null}>
                   {downloading === "csv" ? t("reports.downloading") : t("reports.downloadCsv")}
                 </Button>
+                <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("pack")} disabled={downloading !== null}>
+                  {downloading === "pack" ? t("reports.downloading") : t("reports.downloadPack")}
+                </Button>
                 {canOperate && selectedRun?.status === "completed" && (
                   <Button
                     variant="secondary"
@@ -713,6 +718,18 @@ export function ReportsPage() {
                     percent: drift.data.summary.right_compliance_percent,
                   })}
                 </span>
+                {drift.data.summary.closed_fail_percent != null ? (
+                  <>
+                    <span className="pf-drift-summary-meta__sep">·</span>
+                    <span>
+                      {t("reports.closedFailPercent", {
+                        percent: drift.data.summary.closed_fail_percent,
+                        closed: drift.data.summary.closed_failed ?? 0,
+                        baseline: drift.data.summary.baseline_failed ?? 0,
+                      })}
+                    </span>
+                  </>
+                ) : null}
               </div>
 
               <div className="pf-drift-cards">
@@ -1198,6 +1215,15 @@ export function ReportsPage() {
                                     confirmLabel: t("reports.requestWaiver"),
                                   });
                                   if (!reason) return;
+                                  const changeTicket = await prompt({
+                                    title: t("waivers.changeTicketPrompt"),
+                                    subtitle: row.rule_tech_name,
+                                    message: t("waivers.changeTicketMessage"),
+                                    label: t("waivers.changeTicket"),
+                                    placeholder: t("waivers.changeTicketPlaceholder"),
+                                    confirmLabel: t("common.save"),
+                                    required: false,
+                                  });
                                   try {
                                     await api.createWaiver({
                                       profile_id: profileId,
@@ -1205,6 +1231,7 @@ export function ReportsPage() {
                                       host_id: row.host_id,
                                       job_id: selectedRun.job_id,
                                       reason,
+                                      change_ticket: changeTicket?.trim() || null,
                                     });
                                     toast.success(t("waivers.requested"));
                                     queryClient.invalidateQueries({ queryKey: ["waivers"] });

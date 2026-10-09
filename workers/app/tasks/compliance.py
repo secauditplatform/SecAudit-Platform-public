@@ -6,7 +6,7 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import create_engine, or_, select
+from sqlalchemy import create_engine, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.celery_app import celery_app, settings
@@ -26,6 +26,7 @@ from secaudit_core.oscap import (
     resolve_scap_profile_id,
 )
 from secaudit_core.tracing import set_current_span_attributes, start_span
+from secaudit_core.evidence_profile import profile_snapshot_from_profile
 from secaudit_core.models import (
     CheckResult,
     CheckScript,
@@ -89,6 +90,23 @@ logger = logging.getLogger(__name__)
 
 def _raw_output_limit() -> int:
     return settings.raw_output_max_chars
+
+
+def _remember_profile_snapshot(db: Session, job: Job, job_run: JobRun) -> None:
+    """Record profile identity once, when the run starts. Later edits do not rewrite it."""
+    if job_run.profile_snapshot or not job.profile_id:
+        return
+    profile = db.get(Profile, job.profile_id)
+    if profile is None:
+        return
+    snapshot = profile_snapshot_from_profile(profile)
+    db.execute(
+        update(JobRun)
+        .where(JobRun.id == job_run.id, JobRun.profile_snapshot.is_(None))
+        .values(profile_snapshot=snapshot)
+    )
+    db.commit()
+    job_run.profile_snapshot = snapshot
 
 
 def _safe_status(value: str | CheckStatus) -> CheckStatus:
@@ -268,6 +286,10 @@ def _merge_extra_env(*parts: dict[str, str] | None) -> dict[str, str] | None:
 
 
 def _host_inventory_entry(host: Host) -> dict:
+    """Build Ansible inventory metadata without embedding secrets.
+
+    Passwords/keys are supplied separately via ``credentials`` to ansible-runner.
+    """
     entry: dict = {
         "name": host.name.strip(),
         "hostname": host.hostname.strip(),
@@ -281,22 +303,13 @@ def _host_inventory_entry(host: Host) -> dict:
     cred = _primary_credential(host)
     if not cred:
         return entry
-    secret = _credential_secret(cred)
     if cred.username:
         entry["ansible_vars"]["ansible_user"] = cred.username
 
-    if cred.credential_type == CredentialType.SSH_PASSWORD:
-        entry["ansible_vars"]["ansible_password"] = secret
-    elif cred.credential_type == CredentialType.SSH_KEY:
-        entry["private_key"] = secret
-        key_passphrase = ssh_auth_from_credential(cred, secret, settings)[2]
-        if key_passphrase:
-            entry["key_passphrase"] = key_passphrase
-    elif cred.credential_type == CredentialType.WINRM:
+    if cred.credential_type == CredentialType.WINRM:
         from app.executors.winrm_exec import normalize_winrm_port
 
         entry["ansible_vars"]["ansible_connection"] = "winrm"
-        entry["ansible_vars"]["ansible_password"] = secret
         entry["ansible_vars"]["ansible_winrm_transport"] = "ntlm"
         entry["ansible_vars"]["ansible_winrm_server_cert_validation"] = (
             settings.winrm_server_cert_validation_effective
@@ -351,7 +364,6 @@ def _execute_check(
     job_run_id: int,
     *,
     extra_env: dict[str, str] | None = None,
-    package_root: Path | None = None,
 ) -> str:
     creds = linked_credentials(host)
     cred = creds[0] if creds else None
@@ -437,7 +449,6 @@ def _execute_check(
                     script_path=script_path,
                     extra_env=extra_env,
                     key_passphrase=key_passphrase,
-                    package_root=package_root,
                 )
             if not password and not private_key:
                 raise ValueError("Python checks require ssh_password or ssh_key credential")
@@ -485,10 +496,20 @@ def _execute_check(
 
 
 def _network_script_extra_env(db: Session, job: Job, host: Host) -> dict[str, str]:
-    """Inject uploaded config for Network Platform package scripts (file fallback)."""
+    """Inject uploaded config for Network Platform package scripts (same rules as remote).
+
+    Modes:
+    - remote: no config file env (live Netmiko only)
+    - config_upload: offline — vendor profile scripts + uploaded config, no device dial
+    - both: prefer uploaded config when present (offline collectors); otherwise remote
+    """
     mode = job.network_check_mode or NetworkCheckMode.BOTH
-    if mode not in {NetworkCheckMode.CONFIG_UPLOAD, NetworkCheckMode.BOTH}:
+    if mode == NetworkCheckMode.REMOTE:
         return {}
+
+    env: dict[str, str] = {
+        "SECAUDIT_NETWORK_CHECK_MODE": mode.value,
+    }
 
     configs = db.execute(
         select(NetworkDeviceConfig)
@@ -501,23 +522,29 @@ def _network_script_extra_env(db: Session, job: Job, host: Host) -> dict[str, st
         )
         .order_by(NetworkDeviceConfig.id.desc())
     ).scalars().all()
-    if not configs:
-        return {}
 
-    latest = next((c for c in configs if c.host_id == host.id), configs[0])
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        suffix=".cfg",
-        prefix=f"secaudit_netcfg_{host.id}_",
-        delete=False,
-    )
-    with tmp:
-        tmp.write(latest.content or "")
-    return {
-        "SECAUDIT_CONFIG_FILE": tmp.name,
-        "SECAUDIT_PREFER_CONFIG_FILE": "1",
-    }
+    if configs:
+        latest = next((c for c in configs if c.host_id == host.id), configs[0])
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            suffix=".cfg",
+            prefix=f"secaudit_netcfg_{host.id}_",
+            delete=False,
+        )
+        with tmp:
+            tmp.write(latest.content or "")
+        env["SECAUDIT_CONFIG_FILE"] = tmp.name
+        env["SECAUDIT_PREFER_CONFIG_FILE"] = "1"
+
+    # Pure offline for config_upload; for both, go offline when a config was uploaded
+    # so the same vendor profile rule IDs evaluate without dialing the device.
+    if mode == NetworkCheckMode.CONFIG_UPLOAD or (
+        mode == NetworkCheckMode.BOTH and "SECAUDIT_CONFIG_FILE" in env
+    ):
+        env["SECAUDIT_OFFLINE_MODE"] = "1"
+
+    return env
 
 
 def _host_ssh_credentials(host: Host) -> tuple[str, str | None, str | None, str | None]:
@@ -658,7 +685,6 @@ def _run_scap_profile_job(
                         audit_script.execution_type,
                         job_run_id,
                         extra_env=service_env or None,
-                        package_root=package_dir,
                     )
                     script_parsed = apply_interpreter_rules(output, rules)
                 except InterruptedError:
@@ -748,12 +774,14 @@ def _run_playbook_job(
     hosts: list[Host],
     *,
     connection_mode: str = "auto",
+    check_mode: bool = False,
 ) -> tuple[int, list[str]]:
     playbook = db.get(Playbook, job.playbook_id)
     if not playbook:
         raise ValueError("Playbook not found")
 
-    publish_job_log(job_run.id, f"Running Ansible playbook: {playbook.name}")
+    mode_label = " in check mode (--check --diff)" if check_mode else ""
+    publish_job_log(job_run.id, f"Running Ansible playbook{mode_label}: {playbook.name}")
     job_run_id = job_run.id
     playbook_content = upgrade_connectivity_check_content(playbook.content)
     raw_limit = _raw_output_limit()
@@ -803,7 +831,8 @@ def _run_playbook_job(
 
             publish_job_log(
                 job_run_id,
-                f"[{host.name}] Starting playbook (connection_mode={connection_mode})",
+                f"[{host.name}] Starting playbook (connection_mode={connection_mode}"
+                f"{', check_mode=true' if check_mode else ''})",
             )
             inventory = [_host_inventory_entry(host)]
             credentials = _playbook_credentials(host)
@@ -815,6 +844,7 @@ def _run_playbook_job(
                     credentials=credentials,
                     connection_mode=connection_mode,  # type: ignore[arg-type]
                     sidecar_files=sidecar_files,
+                    check_mode=check_mode,
                 )
                 publish_job_log(job_run_id, f"[{host.name}] Playbook finished successfully")
                 results_written = _persist_playbook_host_results(
@@ -957,7 +987,6 @@ def _run_profile_job(
                             script.execution_type,
                             job_run_id,
                             extra_env=merged_env,
-                            package_root=package_dir,
                         )
                     except InterruptedError:
                         raise
@@ -1109,10 +1138,12 @@ def heartbeat() -> str:
     **TASK_RETRY_KWARGS,
 )
 def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_kwargs) -> dict:
+    check_mode = bool(_kwargs.get("check_mode", False))
     set_current_span_attributes(
         {
             "secaudit.job_run_id": job_run_id,
             "secaudit.connection_mode": connection_mode,
+            "secaudit.check_mode": check_mode,
         }
     )
     job_run = None
@@ -1169,6 +1200,7 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
             )
             return {"error": "job not found"}
 
+        _remember_profile_snapshot(db, job, job_run)
         publish_job_log(job_run_id, f"Job run #{job_run_id} started")
 
         hosts = _resolve_hosts(db, job)
@@ -1200,14 +1232,29 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
                     profile = db.get(Profile, job.profile_id)
                     if not profile:
                         raise ValueError("Profile not found")
-                    # Network Platform packages run Python checks on the worker via
-                    # Netmiko/Paramiko (resource_* env), same as Juniper ONLINE scripts.
+                    # Network Platform packages: same vendor rule pack for remote and
+                    # config_upload (SECAUDIT_CONFIG_FILE + OFFLINE_MODE). Thin
+                    # network_config baseline is only for legacy jobs without a profile.
+                    publish_job_log(
+                        job_run_id,
+                        f"Network job via vendor profile «{profile.profile_name}» "
+                        f"(mode={(job.network_check_mode or NetworkCheckMode.BOTH).value})",
+                    )
                     results_count, errors = _run_profile_job(db, job, job_run, profile, hosts)
                 else:
+                    publish_job_log(
+                        job_run_id,
+                        "WARNING: network job has no vendor profile — using thin network_config baseline",
+                    )
                     results_count, errors = _run_network_compliance_job(db, job, job_run, hosts)
             elif job.playbook_id:
                 results_count, errors = _run_playbook_job(
-                    db, job, job_run, hosts, connection_mode=connection_mode
+                    db,
+                    job,
+                    job_run,
+                    hosts,
+                    connection_mode=connection_mode,
+                    check_mode=check_mode or bool(getattr(job_run, "check_mode", False)),
                 )
             elif job.profile_id:
                 profile = db.get(Profile, job.profile_id)

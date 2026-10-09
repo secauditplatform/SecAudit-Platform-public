@@ -36,6 +36,7 @@ celery_app = create_celery_app(
         "app.tasks.remediation",
         "app.tasks.maintenance",
         "app.tasks.inventory",
+        "app.tasks.directory",
         "app.tasks.audit_flow",
         "app.tasks.scheduled_reports",
     ],
@@ -58,6 +59,7 @@ celery_app.conf.update(
         "app.tasks.run_remediation_job": {"queue": "remediation"},
         "app.tasks.remediation.*": {"queue": "remediation"},
         "app.tasks.inventory.*": {"queue": "inventory"},
+        "app.tasks.directory.*": {"queue": "inventory"},
         "app.tasks.audit_flow.*": {"queue": "inventory"},
         "app.tasks.maintenance.*": {"queue": "maintenance"},
         "app.tasks.scheduled_reports.*": {"queue": "maintenance"},
@@ -72,6 +74,11 @@ celery_app.conf.update(
             "task": "app.tasks.compliance.run_scheduled_jobs",
             "schedule": 60.0,
             "options": {"queue": "compliance"},
+        },
+        "run-scheduled-audit-flow-templates": {
+            "task": "app.tasks.audit_flow.run_scheduled_audit_flow_templates",
+            "schedule": 60.0,
+            "options": {"queue": "inventory"},
         },
         "run-scheduled-remediation-jobs": {
             "task": "app.tasks.remediation.run_scheduled_remediation_jobs",

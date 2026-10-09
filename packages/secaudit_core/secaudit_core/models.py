@@ -162,6 +162,30 @@ class User(Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    mfa_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    totp_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    # Bcrypt hashes of single-use recovery codes; plaintext is shown once at enrollment.
+    mfa_recovery_codes_json: Mapped[list[str] | None] = mapped_column(JSON)
+
+
+class ApiKey(Base):
+    """Scoped service-account API keys for CI/CD (Bearer sa_<prefix>_<secret>)."""
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(16), unique=True, nullable=False, index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
 
 
 class AuditLog(Base):
@@ -214,6 +238,7 @@ class Credential(Base):
     encrypted_key_passphrase: Mapped[str | None] = mapped_column(Text)
     service_username: Mapped[str | None] = mapped_column(String(128))
     encrypted_service_secret: Mapped[str | None] = mapped_column(Text)
+    snmp_priv_protocol: Mapped[str | None] = mapped_column(String(32))
     description: Mapped[str | None] = mapped_column(Text)
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
     is_ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -228,6 +253,9 @@ class Host(Base):
     hostname: Mapped[str] = mapped_column(String(256), nullable=False)
     port: Mapped[int] = mapped_column(Integer, default=22)
     os_type: Mapped[str | None] = mapped_column(String(64))
+    site: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    environment: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    criticality: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     credential_id: Mapped[int | None] = mapped_column(ForeignKey("credentials.id", ondelete="SET NULL"))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_ephemeral: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -259,6 +287,9 @@ class InventoryScan(Base):
     hosts_found: Mapped[int] = mapped_column(Integer, default=0)
     hosts_created: Mapped[int] = mapped_column(Integer, default=0)
     nmap_flags: Mapped[str | None] = mapped_column(Text)
+    method: Mapped[str] = mapped_column(String(16), nullable=False, default="nmap", server_default="nmap")
+    credential_id: Mapped[int | None] = mapped_column(ForeignKey("credentials.id", ondelete="SET NULL"))
+    snmp_port: Mapped[int | None] = mapped_column(Integer)
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -277,11 +308,61 @@ class InventoryScanResult(Base):
     resolved_hostname: Mapped[str | None] = mapped_column(String(256))
     host_id: Mapped[int | None] = mapped_column(ForeignKey("hosts.id"))
     open_ports: Mapped[str | None] = mapped_column(Text)
+    platform_hint: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     scan: Mapped["InventoryScan"] = relationship(back_populates="results")
     host: Mapped["Host | None"] = relationship()
+
+
+class DirectorySource(Base):
+    """Read-only AD/LDAP connection used to import computer objects."""
+
+    __tablename__ = "directory_sources"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    server: Mapped[str] = mapped_column(String(256), nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False, default=389)
+    use_ssl: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    start_tls: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    verify_tls: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    base_dn: Mapped[str] = mapped_column(String(512), nullable=False)
+    bind_dn: Mapped[str] = mapped_column(String(512), nullable=False)
+    encrypted_bind_password: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    map_ou_to_site: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    syncs: Mapped[list["DirectorySync"]] = relationship(
+        back_populates="source", cascade="all, delete-orphan"
+    )
+
+
+class DirectorySync(Base):
+    __tablename__ = "directory_syncs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_id: Mapped[int] = mapped_column(
+        ForeignKey("directory_sources.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[JobStatus] = mapped_column(
+        Enum(JobStatus, name="jobstatus", **_PG_ENUM_KW), default=JobStatus.PENDING
+    )
+    hosts_found: Mapped[int] = mapped_column(Integer, default=0)
+    hosts_created: Mapped[int] = mapped_column(Integer, default=0)
+    hosts_updated: Mapped[int] = mapped_column(Integer, default=0)
+    hosts_matched: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    source: Mapped["DirectorySource"] = relationship(back_populates="syncs")
 
 
 class TaskOutbox(Base):
@@ -477,6 +558,8 @@ class JobRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     celery_task_id: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
+    check_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    profile_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped["Job"] = relationship(back_populates="runs", foreign_keys=[job_id])
@@ -518,6 +601,7 @@ class ComplianceWaiver(Base):
     host_id: Mapped[int | None] = mapped_column(ForeignKey("hosts.id"), nullable=True, index=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+    change_ticket: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[WaiverStatus] = mapped_column(
         Enum(WaiverStatus, name="waiverstatus", **_PG_ENUM_KW),
         nullable=False,
@@ -776,6 +860,29 @@ class JobTemplateHost(Base):
     host: Mapped["Host"] = relationship()
 
 
+class AuditFlowTemplate(Base):
+    """Saved AuditFlow session: targets + encrypted creds + optional cron."""
+
+    __tablename__ = "audit_flow_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    targets_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Encrypted credential snapshots (ciphertext), never returned as plaintext.
+    credentials_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    save_to_inventory: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    cron_expression: Mapped[str | None] = mapped_column(String(128))
+    is_scheduled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AuditFlowRun(Base):
     __tablename__ = "audit_flow_runs"
 
@@ -790,10 +897,14 @@ class AuditFlowRun(Base):
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
     hosts_found: Mapped[int] = mapped_column(Integer, default=0)
     save_to_inventory: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    template_id: Mapped[int | None] = mapped_column(
+        ForeignKey("audit_flow_templates.id", ondelete="SET NULL"), index=True
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+    template: Mapped["AuditFlowTemplate | None"] = relationship()
     credentials: Mapped[list["AuditFlowCredential"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
@@ -842,6 +953,7 @@ class AuditFlowHost(Base):
     profile_name: Mapped[str | None] = mapped_column(String(256))
     confidence: Mapped[int] = mapped_column(Integer, default=0)
     alternatives_json: Mapped[list | None] = mapped_column(JSON)
+    match_hints_json: Mapped[list | None] = mapped_column(JSON)
     extra_profiles_json: Mapped[list | None] = mapped_column(JSON)
     extra_runs_json: Mapped[list | None] = mapped_column(JSON)
     selected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

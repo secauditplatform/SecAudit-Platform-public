@@ -9,8 +9,11 @@ import shlex
 import xml.etree.ElementTree as ET
 from typing import TypedDict
 
-# Smallest allowed prefix length (largest network): /20 ≈ 4096 addresses.
+# Default smallest allowed prefix length (largest network): /20 ≈ 4096 addresses.
+# Callers may pass a wider limit (smaller prefix number) for privileged roles.
 MAX_CIDR_PREFIX_LEN = 20
+# Absolute floor even for admins — /8 would be ~16M hosts and is never allowed.
+MIN_CIDR_PREFIX_LEN_ABSOLUTE = 8
 
 # Phase 2 uses nmap -F (fast scan): top 100 TCP ports per nmap's frequency ranking,
 # including common services such as 22, 80, 443, 445, 3389, 8080, etc.
@@ -99,17 +102,25 @@ class ScanCancelledError(Exception):
     """Raised when a scan is cancelled via Redis flag."""
 
 
-def _validate_ipv4_network_prefix(net: ipaddress.IPv4Network) -> None:
-    if net.prefixlen < MAX_CIDR_PREFIX_LEN:
+def _validate_ipv4_network_prefix(
+    net: ipaddress.IPv4Network,
+    *,
+    max_prefix_len: int = MAX_CIDR_PREFIX_LEN,
+) -> None:
+    """Reject networks wider than ``max_prefix_len`` (smaller prefix number = larger net)."""
+    limit = max(int(max_prefix_len), MIN_CIDR_PREFIX_LEN_ABSOLUTE)
+    if net.prefixlen < limit:
         raise ValueError(
-            f"Network too large (/{net.prefixlen}); maximum allowed is /{MAX_CIDR_PREFIX_LEN}"
+            f"Network too large (/{net.prefixlen}); maximum allowed is /{limit}"
         )
 
 
-def validate_scan_target(target: str) -> str:
+def validate_scan_target(target: str, *, max_prefix_len: int | None = None) -> str:
     cleaned = target.strip()
     if not cleaned or len(cleaned) > 256:
         raise ValueError("Target must be 1–256 characters")
+
+    prefix_limit = MAX_CIDR_PREFIX_LEN if max_prefix_len is None else int(max_prefix_len)
 
     if "/" in cleaned:
         try:
@@ -117,23 +128,59 @@ def validate_scan_target(target: str) -> str:
         except ValueError as exc:
             raise ValueError("Invalid CIDR notation") from exc
         if isinstance(net, ipaddress.IPv4Network):
-            _validate_ipv4_network_prefix(net)
+            _validate_ipv4_network_prefix(net, max_prefix_len=prefix_limit)
+        _assert_network_not_blocked(net)
         return str(net)
 
     try:
-        return str(ipaddress.ip_address(cleaned))
+        addr = ipaddress.ip_address(cleaned)
     except ValueError:
         pass
+    else:
+        _assert_address_not_blocked(addr)
+        return str(addr)
 
     if NMAP_RANGE_PATTERN.fullmatch(cleaned):
+        _assert_nmap_range_not_blocked(cleaned)
         return cleaned
 
     if HOSTNAME_PATTERN.fullmatch(cleaned):
+        if cleaned.lower() in {"localhost", "metadata.google.internal"}:
+            raise ValueError(f"Scan target host is not allowed: {cleaned}")
         return cleaned
 
     raise ValueError(
         "Invalid target: use an IP, CIDR (e.g. 192.168.1.0/24), hostname, or nmap range"
     )
+
+
+def _assert_address_not_blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> None:
+    if addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr.is_multicast:
+        raise ValueError(f"Scan target address is not allowed: {addr}")
+    # Cloud metadata / APIPA
+    if addr in ipaddress.ip_network("169.254.0.0/16") or addr in ipaddress.ip_network("fe80::/10"):
+        raise ValueError(f"Scan target address is not allowed: {addr}")
+
+
+def _assert_network_not_blocked(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> None:
+    blocked = (
+        ipaddress.ip_network("127.0.0.0/8"),
+        ipaddress.ip_network("169.254.0.0/16"),
+        ipaddress.ip_network("::1/128"),
+        ipaddress.ip_network("fe80::/10"),
+    )
+    for item in blocked:
+        if net.version == item.version and (net.subnet_of(item) or item.subnet_of(net) or net == item):
+            raise ValueError(f"Scan target network is not allowed: {net}")
+    if net.is_loopback or getattr(net, "is_link_local", False):
+        raise ValueError(f"Scan target network is not allowed: {net}")
+
+
+def _assert_nmap_range_not_blocked(target: str) -> None:
+    # Conservative: reject obvious loopback / link-local prefixes in nmap ranges.
+    lowered = target.lower()
+    if lowered.startswith("127.") or lowered.startswith("169.254."):
+        raise ValueError(f"Scan target range is not allowed: {target}")
 
 
 def expand_scan_target(target: str) -> list[str] | None:

@@ -25,7 +25,6 @@ from app.schemas import (
 )
 from app.services.object_rbac import (
     assert_can_access,
-    assert_can_mutate,
     assign_owner,
 )
 from app.services.playbook_templates import list_playbook_templates
@@ -40,13 +39,10 @@ router = APIRouter()
 playbook_service = PlaybookService()
 
 
-def _assert_playbook_access(user: AuthUser, playbook: Playbook, *, mutate: bool = False) -> None:
+def _assert_playbook_access(user: AuthUser, playbook: Playbook) -> None:
     if playbook.kind == PlaybookKind.COMPLIANCE_TEMPLATE:
         return
-    if mutate:
-        assert_can_mutate(user, playbook.owner_sub, detail="Playbook not found")
-    else:
-        assert_can_access(user, playbook.owner_sub, detail="Playbook not found")
+    assert_can_access(user, playbook.owner_sub, detail="Playbook not found")
 
 
 def _playbook_read(playbook: Playbook) -> PlaybookRead:
@@ -175,7 +171,7 @@ async def update_playbook_content(
     playbook = result.scalar_one_or_none()
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook, mutate=True)
+    _assert_playbook_access(user, playbook)
 
     try:
         validation = await run_blocking(
@@ -319,13 +315,18 @@ async def run_playbook(
     playbook = await db.get(Playbook, playbook_id)
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook, mutate=True)
+    _assert_playbook_access(user, playbook)
     if not playbook.is_active:
         raise HTTPException(status_code=409, detail="Playbook is inactive")
 
     try:
         job_run = await playbook_service.run_playbook(
-            db, user, playbook, data.host_ids, connection_mode=data.connection_mode
+            db,
+            user,
+            playbook,
+            data.host_ids,
+            connection_mode=data.connection_mode,
+            check_mode=data.check_mode,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -341,7 +342,7 @@ async def run_playbook(
             resource_id=playbook_id,
             resource_name=playbook.name if playbook else None,
             outcome="failed",
-            metadata={"error": str(exc)},
+            metadata={"error": str(exc), "check_mode": data.check_mode},
         )
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -353,7 +354,7 @@ async def run_playbook(
         resource_type="playbook",
         resource_id=playbook.id,
         resource_name=playbook.name,
-        metadata={"run_id": job_run.id},
+        metadata={"run_id": job_run.id, "check_mode": data.check_mode},
     )
     return PlaybookRunRead(
         id=job_run.id,
@@ -366,6 +367,8 @@ async def run_playbook(
         error_message=job_run.error_message,
         created_at=job_run.created_at,
         host_count=len(data.host_ids),
+        host_ids=list(data.host_ids),
+        check_mode=data.check_mode,
     )
 
 
@@ -383,7 +386,7 @@ async def update_playbook(
     playbook = result.scalar_one_or_none()
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook, mutate=True)
+    _assert_playbook_access(user, playbook)
     updates = data.model_dump(exclude_unset=True)
     if playbook.kind == PlaybookKind.COMPLIANCE_TEMPLATE and "content" in updates:
         # Content edits for compliance templates must go through versioned endpoint.
@@ -414,7 +417,7 @@ async def delete_playbook(
     playbook = await db.get(Playbook, playbook_id)
     if not playbook:
         raise HTTPException(status_code=404, detail="Playbook not found")
-    _assert_playbook_access(user, playbook, mutate=True)
+    _assert_playbook_access(user, playbook)
     try:
         await playbook_service.delete_playbook(db, playbook)
     except ValueError as exc:

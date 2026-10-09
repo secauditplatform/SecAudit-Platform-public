@@ -772,6 +772,7 @@ def _apply_probe_result(
     row.profile_name = decision["profile_name"]
     row.confidence = decision["confidence"]
     row.alternatives_json = decision["alternatives"]
+    row.match_hints_json = decision.get("hints") or []
     row.extra_profiles_json = merge_extra_profiles(row.extra_profiles_json, apps)
     if fingerprint:
         row.ssh_host_key_fingerprint = fingerprint

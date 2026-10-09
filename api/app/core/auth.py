@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ from app.core.config import settings
 from secaudit_core.enums import UserRole
 from secaudit_core.rbac import normalize_roles
 
+logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
 
 _jwks_cache: dict | None = None
@@ -22,6 +24,7 @@ _JWKS_CACHE_TTL_SECONDS = 300
 WS_AUTH_TIMEOUT_SECONDS = 10.0
 LOCAL_TOKEN_TYPE = "local"
 LOCAL_REFRESH_TOKEN_TYPE = "local_refresh"
+LOCAL_MFA_CHALLENGE_TYPE = "local_mfa_challenge"
 
 
 @dataclass
@@ -37,10 +40,17 @@ class AuthUser:
     roles: list[str]
     auth_mode: str = "unknown"
     local_source: str | None = None
+    scopes: list[str] | None = None
 
     def has_role(self, *roles: UserRole | str) -> bool:
         allowed = {r.value if isinstance(r, UserRole) else r for r in roles}
         return bool(set(self.roles) & allowed) or UserRole.ADMIN.value in self.roles
+
+    def has_scope(self, *scopes: str) -> bool:
+        if not scopes:
+            return False
+        held = set(self.scopes or [])
+        return bool(held & set(scopes))
 
 
 def create_local_token(
@@ -48,20 +58,24 @@ def create_local_token(
     roles: list[str],
     *,
     local_source: str | None = None,
+    jti: str | None = None,
 ) -> str:
     now = datetime.now(UTC)
     ttl = settings.local_auth_token_ttl_seconds
+    payload: dict = {
+        "sub": f"local:{username}",
+        "preferred_username": username,
+        "realm_access": {"roles": roles},
+        "typ": LOCAL_TOKEN_TYPE,
+        "local_source": local_source,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
+    }
+    if jti:
+        payload["jti"] = jti
     return jwt.encode(
-        {
-            "sub": f"local:{username}",
-            "preferred_username": username,
-            "realm_access": {"roles": roles},
-            "typ": LOCAL_TOKEN_TYPE,
-            "local_source": local_source,
-            "iat": int(now.timestamp()),
-            "exp": int((now + timedelta(seconds=ttl)).timestamp()),
-        },
-        settings.local_jwt_signing_key_effective,
+        payload,
+        settings.secret_key,
         algorithm="HS256",
     )
 
@@ -71,20 +85,24 @@ def create_local_refresh_token(
     roles: list[str],
     *,
     local_source: str | None = None,
+    jti: str | None = None,
 ) -> str:
     now = datetime.now(UTC)
     ttl = settings.local_auth_refresh_token_ttl_seconds
+    payload: dict = {
+        "sub": f"local:{username}",
+        "preferred_username": username,
+        "realm_access": {"roles": roles},
+        "typ": LOCAL_REFRESH_TOKEN_TYPE,
+        "local_source": local_source,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=ttl)).timestamp()),
+    }
+    if jti:
+        payload["jti"] = jti
     return jwt.encode(
-        {
-            "sub": f"local:{username}",
-            "preferred_username": username,
-            "realm_access": {"roles": roles},
-            "typ": LOCAL_REFRESH_TOKEN_TYPE,
-            "local_source": local_source,
-            "iat": int(now.timestamp()),
-            "exp": int((now + timedelta(seconds=ttl)).timestamp()),
-        },
-        settings.local_jwt_signing_key_effective,
+        payload,
+        settings.secret_key,
         algorithm="HS256",
     )
 
@@ -94,18 +112,55 @@ def create_local_token_pair(
     roles: list[str],
     *,
     local_source: str | None = None,
+    jti: str | None = None,
 ) -> LocalTokenPair:
     return LocalTokenPair(
-        access_token=create_local_token(username, roles, local_source=local_source),
-        refresh_token=create_local_refresh_token(username, roles, local_source=local_source),
+        access_token=create_local_token(username, roles, local_source=local_source, jti=jti),
+        refresh_token=create_local_refresh_token(
+            username, roles, local_source=local_source, jti=jti
+        ),
     )
+
+
+def create_mfa_challenge_token(username: str) -> str:
+    """Short-lived proof that the password step succeeded; carries no roles."""
+    now = datetime.now(UTC)
+    ttl = settings.local_auth_mfa_challenge_ttl_seconds
+    payload = {
+        "sub": f"local:{username}",
+        "preferred_username": username,
+        "typ": LOCAL_MFA_CHALLENGE_TYPE,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=max(30, ttl))).timestamp()),
+    }
+    return jwt.encode(payload, settings.secret_key, algorithm="HS256")
+
+
+def decode_mfa_challenge_token(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+    except JWTError:
+        return None
+    if payload.get("typ") != LOCAL_MFA_CHALLENGE_TYPE:
+        return None
+    username = payload.get("preferred_username")
+    return username if isinstance(username, str) and username else None
+
+
+def extract_local_token_jti(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+    except JWTError:
+        return None
+    jti = payload.get("jti")
+    return jti if isinstance(jti, str) and jti else None
 
 
 def _decode_local_refresh_token(token: str) -> AuthUser | None:
     if not settings.local_auth_enabled:
         return None
     try:
-        payload = jwt.decode(token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
     except JWTError:
         return None
 
@@ -133,10 +188,12 @@ def refresh_local_tokens(
     user = _decode_local_refresh_token(refresh_token)
     if not user or not user.username:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    jti = extract_local_token_jti(refresh_token)
     return create_local_token_pair(
         user.username,
         current_roles,
         local_source=local_source or user.local_source,
+        jti=jti,
     )
 
 
@@ -144,7 +201,7 @@ def _decode_local_token(token: str) -> AuthUser | None:
     if not settings.local_auth_enabled:
         return None
     try:
-        payload = jwt.decode(token, settings.local_jwt_signing_key_effective, algorithms=["HS256"])
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
     except JWTError:
         return None
 
@@ -161,33 +218,6 @@ def _decode_local_token(token: str) -> AuthUser | None:
         auth_mode="local",
         local_source=payload.get("local_source"),
     )
-
-
-async def _revalidate_local_user_from_db(user: AuthUser) -> AuthUser:
-    """Reject disabled users and refresh roles from the local users table."""
-    if user.auth_mode != "local" or not settings.local_auth_revalidate_from_db:
-        return user
-    if user.local_source not in (None, "database"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-    from sqlalchemy import select
-
-    from app.core.database import async_session
-    from app.models import User
-
-    async with async_session() as db:
-        result = await db.execute(select(User).where(User.username == user.username))
-        db_user = result.scalar_one_or_none()
-        if not db_user or not db_user.is_active:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-        role = db_user.role.value
-        return AuthUser(
-            sub=f"local:{db_user.username}",
-            username=db_user.username,
-            roles=[role],
-            auth_mode="local",
-            local_source="database",
-        )
 
 
 async def _fetch_jwks() -> dict:
@@ -262,7 +292,7 @@ async def _decode_keycloak_token(token: str) -> AuthUser:
 async def _decode_token(token: str) -> AuthUser:
     local_user = _decode_local_token(token)
     if local_user:
-        return await _revalidate_local_user_from_db(local_user)
+        return local_user
 
     try:
         return await _decode_keycloak_token(token)
@@ -272,62 +302,177 @@ async def _decode_token(token: str) -> AuthUser:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
 
 
+def _synthetic_admin_when_auth_disabled() -> AuthUser:
+    if not settings.allow_auth_disabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "AUTH_ENABLED=false requires ALLOW_AUTH_DISABLED=true "
+                "(synthetic admin bypass is locked)"
+            ),
+        )
+    return AuthUser(
+        sub="anonymous",
+        username="anonymous",
+        roles=[UserRole.ADMIN.value],
+        auth_mode="disabled",
+    )
+
+
+async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
+    """Revocation + optional live DB revalidation for local access tokens."""
+    from app.services.auth_sessions import is_auth_token_revoked
+
+    jti = extract_local_token_jti(token)
+    if jti and await is_auth_token_revoked(jti):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
+
+    if not settings.local_auth_revalidate_user:
+        return user
+    if user.local_source not in (None, "database"):
+        return user
+
+    from sqlalchemy import select
+
+    try:
+        from app.core.database import async_session
+    except ImportError:
+        logger.warning("local user revalidation skipped: database driver unavailable")
+        return user
+    from app.models import User
+
+    async with async_session() as db:
+        result = await db.execute(select(User).where(User.username == user.username))
+        db_user = result.scalar_one_or_none()
+        if not db_user or not db_user.is_active:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User inactive")
+        role = db_user.role.value
+        return AuthUser(
+            sub=f"local:{db_user.username}",
+            username=db_user.username,
+            roles=[role],
+            auth_mode="local",
+            local_source="database",
+        )
+
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
 ) -> AuthUser:
     if not settings.auth_enabled:
-        return AuthUser(
-            sub="anonymous",
-            username="anonymous",
-            roles=[UserRole.ADMIN.value],
-            auth_mode="disabled",
-        )
+        return _synthetic_admin_when_auth_disabled()
 
     if not credentials:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
-    return await _decode_token(credentials.credentials)
+
+    raw = credentials.credentials
+    if raw.startswith("sa_"):
+        from app.core.database import async_session
+        from app.services.api_keys import resolve_api_key_user
+
+        async with async_session() as db:
+            user, _row = await resolve_api_key_user(db, raw)
+        return user
+
+    user = await _decode_token(raw)
+    if settings.demo_mode and user.auth_mode == "local":
+        from app.services.demo_sessions import touch_demo_session
+
+        jti = extract_local_token_jti(raw)
+        if jti:
+            await touch_demo_session(jti, ttl_seconds=settings.demo_session_idle_seconds)
+    elif user.auth_mode == "local":
+        from app.services.auth_sessions import auth_idle_enabled, touch_auth_session
+
+        user = await _enforce_local_access_token(raw, user)
+        jti = extract_local_token_jti(raw)
+        if jti and auth_idle_enabled():
+            await touch_auth_session(jti)
+    return user
 
 
 def require_roles(*roles: UserRole):
     async def checker(user: AuthUser = Depends(get_current_user)) -> AuthUser:
-        if not user.has_role(*roles, UserRole.ADMIN):
-            raise HTTPException(status_code=403, detail="Insufficient permissions")
-        return user
+        if user.has_role(*roles, UserRole.ADMIN):
+            return user
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
 
     return checker
 
 
-async def resolve_ws_user(token: str | None) -> AuthUser | None:
+def require_roles_or_scopes(*roles: UserRole, scopes: list[str]):
+    """Allow human roles or an API key that holds any of the given scopes."""
+
+    async def checker(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+        if user.has_role(*roles, UserRole.ADMIN):
+            return user
+        if user.auth_mode == "api_key" and user.has_scope(*scopes):
+            return user
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    return checker
+
+
+async def resolve_ws_user(
+    token: str | None,
+    *,
+    live_revalidate: bool = True,
+) -> AuthUser | None:
+    """Decode a WS bearer token.
+
+    ``live_revalidate=False`` is for the DB-less console sandbox: JWT signature
+    and expiry still apply, but Redis revocation / Postgres is_active checks are
+    skipped. The API already performed those before proxying.
+    """
     if not settings.auth_enabled:
-        return AuthUser(
-            sub="anonymous",
-            username="anonymous",
-            roles=[UserRole.ADMIN.value],
-            auth_mode="disabled",
-        )
+        try:
+            return _synthetic_admin_when_auth_disabled()
+        except HTTPException:
+            return None
 
     if not token:
         return None
 
     try:
-        return await _decode_token(token)
+        user = await _decode_token(token)
     except HTTPException:
         return None
 
+    if not live_revalidate:
+        return user
+
+    if settings.demo_mode and user.auth_mode == "local":
+        from app.services.demo_sessions import touch_demo_session
+
+        jti = extract_local_token_jti(token)
+        if jti:
+            try:
+                await touch_demo_session(jti, ttl_seconds=settings.demo_session_idle_seconds)
+            except HTTPException:
+                return None
+    elif user.auth_mode == "local":
+        from app.services.auth_sessions import auth_idle_enabled, touch_auth_session
+
+        try:
+            user = await _enforce_local_access_token(token, user)
+        except HTTPException:
+            return None
+        jti = extract_local_token_jti(token)
+        if jti and auth_idle_enabled():
+            try:
+                await touch_auth_session(jti)
+            except HTTPException:
+                return None
+    return user
 
 async def authenticate_websocket(websocket: WebSocket) -> tuple[AuthUser | None, str | None]:
     """Accept WebSocket and authenticate via first JSON auth frame (not query string)."""
     await websocket.accept()
     if not settings.auth_enabled:
-        return (
-            AuthUser(
-                sub="anonymous",
-                username="anonymous",
-                roles=[UserRole.ADMIN.value],
-                auth_mode="disabled",
-            ),
-            None,
-        )
+        try:
+            return _synthetic_admin_when_auth_disabled(), None
+        except HTTPException:
+            return None, None
 
     try:
         raw = await asyncio.wait_for(

@@ -11,6 +11,11 @@ import {
   profileRuleDisplayName,
 } from "../components/ProfileRuleDetail";
 import { ProfilesCatalogPanel } from "../components/ProfilesCatalogPanel";
+import {
+  monacoEditorOptionsForViewport,
+  useIsMobileViewport,
+} from "../components/PlaybookYamlEditor";
+import { scriptEditorLanguage } from "../components/ScriptCodeEditor";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
@@ -28,20 +33,6 @@ function parseProfileId(value: string | null): number | null {
   if (!value) return null;
   const id = Number(value);
   return Number.isInteger(id) && id > 0 ? id : null;
-}
-
-function scriptEditorLanguage(executionType: string): string {
-  switch (executionType.toUpperCase()) {
-    case "WINRM":
-    case "POWERSHELL":
-      return "powershell";
-    case "PYTHON":
-      return "python";
-    case "ANSIBLE":
-      return "yaml";
-    default:
-      return "shell";
-  }
 }
 
 function formatExecutionType(type: string): string {
@@ -109,6 +100,7 @@ export function ProfilesPage() {
   const { confirm } = useConfirm();
   const toast = useToast();
   const { isAdmin, canOperate } = useAuth();
+  const isMobile = useIsMobileViewport();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const detailPanelRef = useRef<HTMLElement>(null);
@@ -1608,12 +1600,7 @@ export function ProfilesPage() {
                     setSaveStatus(null);
                   }}
                   options={{
-                    minimap: { enabled: true },
-                    fontSize: 14,
-                    lineHeight: 22,
-                    wordWrap: "on",
-                    scrollBeyondLastLine: false,
-                    automaticLayout: true,
+                    ...monacoEditorOptionsForViewport(isMobile),
                   }}
                 />
               </div>

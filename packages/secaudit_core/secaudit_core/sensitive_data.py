@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -18,6 +20,21 @@ _SENSITIVE_PARTS = (
     "credential",
     "private_key",
     "webhook_url",
+)
+
+# Free-text patterns commonly leaked into executor logs / exceptions.
+# A match replaces the secret and keeps the surrounding line (nmap banners stay).
+_SENSITIVE_TEXT_PATTERNS = (
+    re.compile(r"(?i)(password|passwd|passphrase|secret|token|api[_-]?key)\s*[=:]\s*([^\s,;]+)"),
+    re.compile(r"(?i)(ansible_password|ansible_ssh_pass|resource_pass|db_pass)\s*[=:]\s*([^\s,;]+)"),
+    re.compile(r"(?i)(-software_password|--password|--passphrase)\s+(\S+)"),
+    re.compile(r"(?i)\b(password|passwd|passphrase)\s+\d+\s+(\S+)"),
+    re.compile(r"(?i)\b(authorization)\s*[:=]\s*((?:bearer\s+|basic\s+)?\S+)"),
+    re.compile(
+        r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+    re.compile(r"\d{6,16}:[A-Za-z0-9_-]{30,64}(?![A-Za-z0-9_-])"),
 )
 
 
@@ -49,6 +66,33 @@ def _redact_url(value: str) -> str:
     return redacted
 
 
+def _redact_text(value: str) -> str:
+    text = _redact_url(value)
+    for pattern in _SENSITIVE_TEXT_PATTERNS:
+        if pattern.groups == 0:
+            text = pattern.sub(REDACTED, text)
+        elif pattern.groups >= 2:
+            text = pattern.sub(lambda m: f"{m.group(1)}={REDACTED}", text)
+        else:
+            text = pattern.sub(REDACTED, text)
+    return text
+
+
+def redact_live_log_frame(raw: str) -> str:
+    """Redact secrets in a live-log frame before it is stored or sent on a socket."""
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        redacted = redact_sensitive(raw)
+        return redacted if isinstance(redacted, str) else raw
+    if isinstance(data, dict) and isinstance(data.get("message"), str):
+        cleaned = redact_sensitive(data["message"])
+        data["message"] = cleaned if isinstance(cleaned, str) else data["message"]
+        return json.dumps(data, ensure_ascii=False)
+    redacted = redact_sensitive(raw)
+    return redacted if isinstance(redacted, str) else raw
+
+
 def redact_sensitive(value: Any) -> Any:
     """Return a recursively redacted copy suitable for responses, logs and audit."""
     if isinstance(value, Mapping):
@@ -61,7 +105,7 @@ def redact_sensitive(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_sensitive(item) for item in value)
     if isinstance(value, str):
-        return _redact_url(value)
+        return _redact_text(value)
     return value
 
 

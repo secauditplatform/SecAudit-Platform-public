@@ -136,26 +136,33 @@ def validate_production_runtime_config(
     app_env: str,
     auth_enabled: bool,
     api_debug: bool,
-    object_rbac_enabled: bool = True,
+    allow_auth_disabled: bool = False,
 ) -> None:
-    """Refuse unsafe auth/debug settings in production."""
-    if app_env.strip().lower() != "production":
-        return
+    """Refuse unsafe auth/debug settings.
+
+    Production always forbids ``AUTH_ENABLED=false``. Non-production requires an
+    explicit ``ALLOW_AUTH_DISABLED=true`` before the synthetic-admin bypass is
+    accepted, so a mis-set env on a reachable staging host fails closed.
+    """
+    env = app_env.strip().lower()
 
     if not auth_enabled:
-        raise RuntimeError(
-            "AUTH_ENABLED=false is forbidden in production (synthetic admin bypass)."
-        )
+        if env == "production":
+            raise RuntimeError(
+                "AUTH_ENABLED=false is forbidden in production (synthetic admin bypass)."
+            )
+        if not allow_auth_disabled:
+            raise RuntimeError(
+                "AUTH_ENABLED=false requires ALLOW_AUTH_DISABLED=true "
+                "(synthetic admin bypass). Use only on loopback/lab networks."
+            )
+
+    if env != "production":
+        return
 
     if api_debug:
         raise RuntimeError(
             "API_DEBUG=true is forbidden in production. Set API_DEBUG=false."
-        )
-
-    if not object_rbac_enabled:
-        raise RuntimeError(
-            "OBJECT_RBAC_ENABLED=false is forbidden in production "
-            "(disables object ownership scoping)."
         )
 
 

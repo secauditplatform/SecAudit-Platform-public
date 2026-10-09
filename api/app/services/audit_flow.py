@@ -66,7 +66,7 @@ _CLEARABLE_SKIP = {
 }
 
 
-def validate_targets(targets: list[str]) -> list[str]:
+def validate_targets(targets: list[str], *, max_prefix_len: int | None = None) -> list[str]:
     flattened: list[str] = []
     for item in targets or []:
         for part in re.split(r"[\s,;\r\n]+", str(item).strip()):
@@ -77,7 +77,7 @@ def validate_targets(targets: list[str]) -> list[str]:
         raise ValueError("At least one network range is required")
     if len(flattened) > 16:
         raise ValueError("At most 16 scan targets are allowed")
-    return [validate_scan_target(item) for item in flattened]
+    return [validate_scan_target(item, max_prefix_len=max_prefix_len) for item in flattened]
 
 
 def validate_credentials(items: list[dict]) -> list[dict]:
@@ -474,15 +474,40 @@ async def sweep_orphaned_ephemeral_credentials(db: AsyncSession) -> None:
     await _delete_ephemeral_credentials(db, orphans)
 
 
-async def _find_inventory_host(db: AsyncSession, owner_sub: str | None, ip: str, hostname: str | None) -> Host | None:
-    keys = [value.strip().lower() for value in (ip, hostname) if value and value.strip()]
-    if not keys:
-        return None
-    identity = or_(func.lower(Host.hostname).in_(keys), func.lower(Host.name).in_(keys))
+async def _find_inventory_host(
+    db: AsyncSession,
+    owner_sub: str | None,
+    ip: str,
+    hostname: str | None,
+    ssh_host_key_fingerprint: str | None = None,
+) -> Host | None:
+    from secaudit_core.audit_flow_inventory import _fingerprint_variants
+
     if owner_sub is None:
         owner_match = Host.owner_sub.is_(None)
     else:
         owner_match = or_(Host.owner_sub == owner_sub, Host.owner_sub.is_(None))
+
+    fingerprints = _fingerprint_variants(ssh_host_key_fingerprint)
+    if fingerprints:
+        fp_result = await db.execute(
+            select(Host)
+            .where(
+                Host.ssh_host_key_fingerprint.in_(fingerprints),
+                owner_match,
+                Host.is_ephemeral.is_(False),
+            )
+            .limit(20)
+        )
+        fp_candidates = list(fp_result.scalars().all())
+        if fp_candidates:
+            same_owner = [host for host in fp_candidates if host.owner_sub == owner_sub]
+            return same_owner[0] if same_owner else fp_candidates[0]
+
+    keys = [value.strip().lower() for value in (ip, hostname) if value and value.strip()]
+    if not keys:
+        return None
+    identity = or_(func.lower(Host.hostname).in_(keys), func.lower(Host.name).in_(keys))
     result = await db.execute(
         select(Host).where(identity, owner_match, Host.is_ephemeral.is_(False)).limit(20)
     )
@@ -591,7 +616,13 @@ async def _ensure_job_target(
             await db.flush()
             return host, cred
 
-    existing = await _find_inventory_host(db, run.owner_sub, row.ip_address, row.hostname)
+    existing = await _find_inventory_host(
+        db,
+        run.owner_sub,
+        row.ip_address,
+        row.hostname,
+        row.ssh_host_key_fingerprint,
+    )
     inventory_cred = None
     if existing and existing.credential_id:
         inventory_cred = await db.get(Credential, existing.credential_id)
@@ -734,3 +765,94 @@ async def _launch_host_checks(
 
 def encrypt_flow_secret(secret: str) -> str:
     return encrypt_secret(secret, settings)
+
+
+def snapshot_credentials(items: list[dict]) -> list[dict]:
+    """Encrypt validated credential dicts for AuditFlowTemplate.credentials_json."""
+    snapshots: list[dict] = []
+    for item in items:
+        cred_type = item["credential_type"]
+        cred_value = cred_type.value if hasattr(cred_type, "value") else str(cred_type)
+        snapshots.append(
+            {
+                "label": item["label"],
+                "credential_type": cred_value,
+                "username": item["username"],
+                "encrypted_secret": encrypt_flow_secret(item["secret"]),
+                "encrypted_key_passphrase": (
+                    encrypt_flow_secret(item["key_passphrase"])
+                    if item.get("key_passphrase")
+                    else None
+                ),
+                "service_username": item.get("service_username"),
+                "encrypted_service_secret": (
+                    encrypt_flow_secret(item["service_secret"])
+                    if item.get("service_secret")
+                    else None
+                ),
+            }
+        )
+    return snapshots
+
+
+def attach_snapshot_credentials(run_id: int, snapshots: list[dict]) -> list[AuditFlowCredential]:
+    rows: list[AuditFlowCredential] = []
+    for item in snapshots or []:
+        cred_type = item.get("credential_type")
+        if isinstance(cred_type, str):
+            cred_type = CredentialType(cred_type)
+        rows.append(
+            AuditFlowCredential(
+                run_id=run_id,
+                label=str(item.get("label") or "pair")[:128],
+                credential_type=cred_type,
+                username=str(item.get("username") or "")[:128],
+                encrypted_secret=str(item["encrypted_secret"]),
+                encrypted_key_passphrase=item.get("encrypted_key_passphrase"),
+                service_username=(
+                    str(item["service_username"])[:128] if item.get("service_username") else None
+                ),
+                encrypted_service_secret=item.get("encrypted_service_secret"),
+            )
+        )
+    return rows
+
+
+def template_credentials_public(snapshots: list[dict]) -> list[dict]:
+    public: list[dict] = []
+    for item in snapshots or []:
+        cred_type = item.get("credential_type")
+        if isinstance(cred_type, str):
+            try:
+                cred_type = CredentialType(cred_type)
+            except ValueError:
+                continue
+        public.append(
+            {
+                "label": item.get("label") or "",
+                "credential_type": cred_type,
+                "username": item.get("username") or "",
+                "service_username": item.get("service_username"),
+                "has_secret": bool(item.get("encrypted_secret")),
+                "has_service_secret": bool(item.get("encrypted_service_secret")),
+            }
+        )
+    return public
+
+
+def template_to_read(template) -> dict:
+    return {
+        "id": template.id,
+        "name": template.name,
+        "description": template.description,
+        "targets": list(template.targets_json or []),
+        "credentials": template_credentials_public(template.credentials_json or []),
+        "save_to_inventory": bool(template.save_to_inventory),
+        "cron_expression": template.cron_expression,
+        "is_scheduled": bool(template.is_scheduled),
+        "last_scheduled_at": template.last_scheduled_at,
+        "is_active": bool(template.is_active),
+        "owner_sub": template.owner_sub,
+        "created_at": template.created_at,
+        "updated_at": template.updated_at,
+    }

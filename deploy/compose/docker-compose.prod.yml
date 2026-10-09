@@ -26,11 +26,13 @@ x-app-env: &app-env
   REDIS_SENTINEL_HOSTS: ""
   REDIS_PASSWORD: ${REDIS_PASSWORD}
   AUTH_ENABLED: ${AUTH_ENABLED:-true}
+  ALLOW_AUTH_DISABLED: ${ALLOW_AUTH_DISABLED:-false}
   LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+  AUTH_IDLE_TIMEOUT_SECONDS: ${AUTH_IDLE_TIMEOUT_SECONDS:-14400}
   DEMO_MODE: ${DEMO_MODE:-false}
   CONSOLE_ENABLED: "false"
   CONSOLE_ALLOW_IN_PRODUCTION: "false"
-# Keycloak can be omitted when LOCAL_AUTH_ENABLED=true (placeholders satisfy env substitution).
+# Also make Keycloak optional when LOCAL_AUTH-only demo uses placeholders.
   KEYCLOAK_URL: ${KEYCLOAK_URL:-http://127.0.0.1:9}
   KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER:-http://127.0.0.1:9/realms/secaudit}
   KEYCLOAK_REALM: ${KEYCLOAK_REALM:-secaudit}
@@ -181,7 +183,7 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info"]
+    command: ["celery", "-A", "app.celery_app", "beat", "--loglevel=info", "--schedule=/tmp/celerybeat-schedule"]
     restart: unless-stopped
     networks: [internal]
 
@@ -193,6 +195,7 @@ services:
       args:
         VITE_AUTH_ENABLED: ${AUTH_ENABLED:-true}
         VITE_LOCAL_AUTH_ENABLED: ${LOCAL_AUTH_ENABLED:-false}
+        VITE_AUTH_IDLE_TIMEOUT_SECONDS: ${AUTH_IDLE_TIMEOUT_SECONDS:-14400}
         VITE_DEMO_MODE: ${DEMO_MODE:-false}
         VITE_SSO_ENABLED: ${VITE_SSO_ENABLED:-true}
         VITE_SHOW_SSO_BUTTON: ${VITE_SHOW_SSO_BUTTON:-true}

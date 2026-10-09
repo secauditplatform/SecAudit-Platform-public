@@ -1,4 +1,26 @@
 import Editor from "@monaco-editor/react";
+import { useSyncExternalStore } from "react";
+
+const MOBILE_MQ = "(max-width: 768px)";
+
+function subscribeMobile(onChange: () => void) {
+  const mq = window.matchMedia(MOBILE_MQ);
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+}
+
+function getMobileSnapshot() {
+  return window.matchMedia(MOBILE_MQ).matches;
+}
+
+function getServerSnapshot() {
+  return false;
+}
+
+/** True when viewport is phone-width (shared Monaco / layout helpers). */
+export function useIsMobileViewport() {
+  return useSyncExternalStore(subscribeMobile, getMobileSnapshot, getServerSnapshot);
+}
 
 export const PLAYBOOK_EDITOR_OPTIONS = {
   minimap: { enabled: true },
@@ -15,6 +37,14 @@ export const PLAYBOOK_EDITOR_OPTIONS = {
   },
 };
 
+export function monacoEditorOptionsForViewport(isMobile: boolean) {
+  return {
+    ...PLAYBOOK_EDITOR_OPTIONS,
+    wordWrap: (isMobile ? "off" : "on") as "off" | "on",
+    minimap: { enabled: !isMobile },
+  };
+}
+
 type PlaybookYamlEditorProps = {
   value: string;
   onChange: (value: string) => void;
@@ -22,6 +52,7 @@ type PlaybookYamlEditorProps = {
 };
 
 export function PlaybookYamlEditor({ value, onChange, height }: PlaybookYamlEditorProps) {
+  const isMobile = useIsMobileViewport();
   return (
     <Editor
       height={height}
@@ -29,7 +60,7 @@ export function PlaybookYamlEditor({ value, onChange, height }: PlaybookYamlEdit
       theme="vs-dark"
       value={value}
       onChange={(next) => onChange(next ?? "")}
-      options={PLAYBOOK_EDITOR_OPTIONS}
+      options={monacoEditorOptionsForViewport(isMobile)}
     />
   );
 }

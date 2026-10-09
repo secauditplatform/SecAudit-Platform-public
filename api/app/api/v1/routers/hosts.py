@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import delete, distinct, select
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from sqlalchemy import delete, distinct, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -36,6 +36,8 @@ from app.schemas import (
     HostBulkDeleteResponse,
     HostCreate,
     HostCredentialLinkRequest,
+    HostCsvImportResult,
+    HostCsvRejectedRow,
     HostTagAssignRequest,
     HostTagRead,
     HostRead,
@@ -53,10 +55,15 @@ from app.services.host_credentials import (
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
-    assert_can_mutate,
     assert_credential_attachable,
     assert_hosts_accessible,
     assign_owner,
+)
+from secaudit_core.host_csv_import import (
+    CsvHostRecord,
+    CsvImportError,
+    CsvImportPlan,
+    plan_host_csv,
 )
 
 router = APIRouter()
@@ -125,7 +132,7 @@ async def _delete_host_if_allowed(host_id: int, db: AsyncSession, user: AuthUser
         return _HOST_NOT_FOUND
 
     try:
-        assert_can_mutate(user, host.owner_sub, detail=_HOST_NOT_FOUND)
+        assert_can_access(user, host.owner_sub, detail=_HOST_NOT_FOUND)
     except HTTPException:
         return _HOST_NOT_FOUND
 
@@ -172,6 +179,9 @@ def _host_to_read(host: Host) -> HostRead:
         hostname=host.hostname,
         port=host.port,
         os_type=host.os_type,
+        site=host.site,
+        environment=host.environment,
+        criticality=host.criticality,
         credential_id=host.credential_id,
         credential_ids=credential_ids,
         linked_credentials=linked_credentials,
@@ -198,6 +208,10 @@ async def list_hosts(
     tag: list[str] = Query(default=[]),
     active_only: bool = Query(default=False),
     search: str | None = Query(default=None),
+    os_type: str | None = Query(default=None),
+    site: str | None = Query(default=None),
+    environment: str | None = Query(default=None),
+    criticality: str | None = Query(default=None),
 ) -> PaginatedResponse[HostRead]:
     offset, limit = page
     stmt = select(Host).options(*_HOST_LOAD_OPTIONS)
@@ -207,7 +221,20 @@ async def list_hosts(
         stmt = stmt.where(Host.is_active.is_(True))
     if search:
         q = f"%{search.strip()}%"
-        stmt = stmt.where((Host.name.ilike(q)) | (Host.hostname.ilike(q)))
+        stmt = stmt.where(
+            (Host.name.ilike(q))
+            | (Host.hostname.ilike(q))
+            | (Host.site.ilike(q))
+            | (Host.environment.ilike(q))
+        )
+    if os_type and os_type.strip():
+        stmt = stmt.where(Host.os_type == os_type.strip())
+    if site and site.strip():
+        stmt = stmt.where(Host.site == site.strip())
+    if environment and environment.strip():
+        stmt = stmt.where(Host.environment == environment.strip())
+    if criticality and criticality.strip():
+        stmt = stmt.where(Host.criticality == criticality.strip().lower())
     if tag:
         tag_stmt = (
             select(distinct(HostTagLink.host_id))
@@ -223,6 +250,156 @@ async def list_hosts(
         offset=offset,
         limit=limit,
     )
+
+
+_CSV_MAX_BYTES = 1_000_000
+
+
+async def _load_csv_inventory(db: AsyncSession, user: AuthUser) -> tuple[list[CsvHostRecord], dict[str, int]]:
+    """Hosts this import may match: own rows and ownerless rows, plus nmap aliases."""
+    result = await db.execute(
+        select(Host)
+        .options(selectinload(Host.tags).selectinload(HostTagLink.tag))
+        .where(
+            Host.is_ephemeral.is_(False),
+            or_(Host.owner_sub == user.sub, Host.owner_sub.is_(None)),
+        )
+    )
+    hosts = list(result.scalars().all())
+    records = [
+        CsvHostRecord(
+            id=host.id,
+            name=host.name,
+            hostname=host.hostname,
+            port=host.port,
+            os_type=host.os_type,
+            site=host.site,
+            environment=host.environment,
+            criticality=host.criticality,
+            tags=tuple(sorted(link.tag.name for link in host.tags if link.tag is not None)),
+        )
+        for host in hosts
+    ]
+    visible = {host.id for host in hosts}
+    alias_rows = await db.execute(
+        select(InventoryScanResult.resolved_hostname, InventoryScanResult.host_id).where(
+            InventoryScanResult.host_id.is_not(None),
+            InventoryScanResult.resolved_hostname.is_not(None),
+        )
+    )
+    aliases: dict[str, int] = {}
+    for resolved, host_id in alias_rows.all():
+        if host_id in visible and resolved:
+            aliases.setdefault(str(resolved).strip().lower(), int(host_id))
+    return records, aliases
+
+
+async def _replace_host_tags(db: AsyncSession, host_id: int, names: tuple[str, ...] | list[str]) -> None:
+    await db.execute(delete(HostTagLink).where(HostTagLink.host_id == host_id))
+    for name in names:
+        cleaned = name.strip()
+        if not cleaned:
+            continue
+        tag_result = await db.execute(select(HostTag).where(HostTag.name == cleaned))
+        tag = tag_result.scalar_one_or_none()
+        if tag is None:
+            tag = HostTag(name=cleaned)
+            db.add(tag)
+            await db.flush()
+        db.add(HostTagLink(host_id=host_id, tag_id=tag.id))
+
+
+async def _apply_csv_plan(db: AsyncSession, plan: CsvImportPlan, user: AuthUser) -> None:
+    """Write the plan. Credentials stay untouched and no scan is queued."""
+    for item in plan.creates:
+        host = Host(
+            name=item.name,
+            hostname=item.hostname,
+            port=item.port,
+            os_type=item.os_type,
+            site=item.site,
+            environment=item.environment,
+            criticality=item.criticality,
+            is_active=True,
+            is_ephemeral=False,
+        )
+        assign_owner(host, user)
+        db.add(host)
+        await db.flush()
+        if item.tags:
+            await _replace_host_tags(db, host.id, item.tags)
+
+    if not plan.updates:
+        return
+    rows = await db.execute(select(Host).where(Host.id.in_([item.host_id for item in plan.updates])))
+    by_id = {host.id: host for host in rows.scalars().all()}
+    for item in plan.updates:
+        host = by_id.get(item.host_id)
+        if host is None or host.is_ephemeral or host.owner_sub not in (None, user.sub):
+            continue
+        if item.name is not None:
+            host.name = item.name
+        if item.hostname is not None:
+            host.hostname = item.hostname
+        if item.port is not None:
+            host.port = item.port
+        if item.os_type is not None:
+            host.os_type = item.os_type
+        if item.site is not None:
+            host.site = item.site
+        if item.environment is not None:
+            host.environment = item.environment
+        if item.criticality is not None:
+            host.criticality = item.criticality
+        if host.owner_sub is None:
+            host.owner_sub = user.sub
+        if item.tags is not None:
+            await _replace_host_tags(db, host.id, item.tags)
+    await db.flush()
+
+
+def _csv_result(plan: CsvImportPlan, *, apply: bool) -> HostCsvImportResult:
+    return HostCsvImportResult(
+        apply=apply,
+        created=len(plan.creates),
+        updated=len(plan.updates),
+        unchanged=plan.unchanged,
+        truncated=plan.truncated,
+        rejected=[HostCsvRejectedRow(row=item.row, reason=item.reason) for item in plan.rejected],
+    )
+
+
+@router.post("/import/csv", response_model=HostCsvImportResult)
+async def import_hosts_csv(
+    request: Request,
+    apply: bool = Query(False),
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> HostCsvImportResult:
+    raw = await file.read(_CSV_MAX_BYTES + 1)
+    if len(raw) > _CSV_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="CSV is too large")
+    try:
+        known, aliases = await _load_csv_inventory(db, user)
+        plan = plan_host_csv(raw, known, aliases=aliases)
+    except CsvImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if apply and (plan.creates or plan.updates):
+        await _apply_csv_plan(db, plan, user)
+        await log_audit_event(
+            db,
+            request,
+            user,
+            action="host.csv_import",
+            resource_type="host",
+            metadata={
+                "created": len(plan.creates),
+                "updated": len(plan.updates),
+                "rejected": len(plan.rejected),
+            },
+        )
+    return _csv_result(plan, apply=apply)
 
 
 @router.post("", response_model=HostRead, status_code=201)
@@ -340,7 +517,7 @@ async def update_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_mutate(user, host.owner_sub, detail="Host not found")
+    assert_can_access(user, host.owner_sub, detail="Host not found")
 
     updates = data.model_dump(exclude_unset=True)
     clear_ssh = updates.pop("clear_ssh_host_key", False)
@@ -388,7 +565,7 @@ async def link_credential_to_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_mutate(user, host.owner_sub, detail="Host not found")
+    assert_can_access(user, host.owner_sub, detail="Host not found")
     await link_host_credential(db, host, user, data.credential_id)
     await db.flush()
     host = await _load_host(db, host.id)
@@ -416,7 +593,7 @@ async def unlink_credential_from_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_mutate(user, host.owner_sub, detail="Host not found")
+    assert_can_access(user, host.owner_sub, detail="Host not found")
     await unlink_host_credential(db, host, user, credential_id)
     await db.flush()
     host = await _load_host(db, host.id)
@@ -445,7 +622,7 @@ async def scan_host_ssh_fingerprint(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_mutate(user, host.owner_sub, detail="Host not found")
+    assert_can_access(user, host.owner_sub, detail="Host not found")
 
     os_type = (host.os_type or "linux").strip().lower()
     if os_type != "linux":
@@ -493,7 +670,7 @@ async def delete_host(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail=_HOST_NOT_FOUND)
-    assert_can_mutate(user, host.owner_sub, detail=_HOST_NOT_FOUND)
+    assert_can_access(user, host.owner_sub, detail=_HOST_NOT_FOUND)
     try:
         error = await _delete_host_if_allowed(host_id, db, user)
     except IntegrityError as exc:
@@ -521,7 +698,7 @@ async def set_host_tags(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_mutate(user, host.owner_sub, detail="Host not found")
+    assert_can_access(user, host.owner_sub, detail="Host not found")
 
     names = sorted(set(name.strip() for name in data.tag_names if name.strip()))
     await db.execute(delete(HostTagLink).where(HostTagLink.host_id == host_id))
