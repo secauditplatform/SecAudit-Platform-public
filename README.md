@@ -26,6 +26,21 @@ It is built for security and infrastructure teams that need a controlled, audita
 - **Security built in** — Keycloak OIDC or local users, object-level RBAC, encrypted credentials, audit trail, and SIEM export.
 - **Production-ready packaging** — develop on lab Compose; deploy with hardened Compose or Helm on your infrastructure.
 
+# What's new in v1.4.0
+
+- **Local MFA and API keys** — TOTP on local login, and scoped service-account API keys for automation.
+- **Richer discovery** — AD/LDAP computer sync, SNMP probes, AuditFlow templates, and profile match hints.
+- **Inventory context** — site, environment, and criticality on hosts, plus CSV import.
+- **Safer change** — waiver change tickets, and Ansible check mode before a live playbook run.
+- **Telegram notifications** — a delivery channel next to webhook and email.
+- **Run evidence** — each job run keeps a snapshot of the profile that actually executed.
+
+# What's new in v1.0.0
+
+- **First public release** — on-prem compliance cycle: profiles, AuditFlow, jobs, reports, remediation, and playbooks.
+- **Linux, Windows, and network** — SSH, WinRM, Ansible, OpenSCAP, and Netmiko from one control plane.
+- **Identity and deploy** — Keycloak or local users, object RBAC, encrypted credentials; lab Compose, production Compose, and Helm.
+
 # Architecture
 
 SecAudit separates the **control plane** (API, UI, identity) from **execution** (Celery workers). The API accepts work, persists state, and enqueues tasks; workers reach managed hosts and write results back. Shared domain logic lives in `secaudit_core` so API and workers stay consistent.
