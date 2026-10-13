@@ -5,6 +5,7 @@ from sqlalchemy import select
 from app.celery_app import celery_app, settings
 from app.audit_flow_runner import run_audit_flow_reprobe_sync, run_audit_flow_scan_sync
 from app.logging_pub import publish_audit_flow_log
+from secaudit_core.audit_flow_scope import compose_template_targets, load_inventory_scope_hosts, normalize_inventory_scope
 from secaudit_core.beat_lock import acquire_beat_lock, release_beat_lock
 from secaudit_core.celery_reliability import TASK_RETRY_KWARGS
 from secaudit_core.enums import AuditFlowStatus, CredentialType
@@ -91,6 +92,7 @@ def _run_scheduled_audit_flow_templates_locked() -> dict:
 
     now = datetime.now(UTC)
     triggered: list[int] = []
+    skipped: list[int] = []
 
     with SessionLocal() as db:
         templates = (
@@ -115,9 +117,25 @@ def _run_scheduled_audit_flow_templates_locked() -> dict:
             if template.last_scheduled_at and prev_run <= template.last_scheduled_at.replace(tzinfo=UTC):
                 continue
 
+            scope = normalize_inventory_scope(template.inventory_scope_json)
+            try:
+                hosts = (
+                    load_inventory_scope_hosts(db, scope, owner_sub=template.owner_sub)
+                    if scope is not None
+                    else []
+                )
+                targets = compose_template_targets(
+                    list(template.targets_json or []),
+                    hosts,
+                    scope_active=scope is not None,
+                )
+            except ValueError:
+                skipped.append(template.id)
+                continue
+
             run = AuditFlowRun(
                 status=AuditFlowStatus.PENDING,
-                targets_json=list(template.targets_json or []),
+                targets_json=targets,
                 save_to_inventory=bool(template.save_to_inventory),
                 template_id=template.id,
                 owner_sub=template.owner_sub,
@@ -143,4 +161,4 @@ def _run_scheduled_audit_flow_templates_locked() -> dict:
 
         db.commit()
 
-    return {"triggered_runs": triggered, "count": len(triggered)}
+    return {"triggered_runs": triggered, "count": len(triggered), "skipped_templates": skipped}

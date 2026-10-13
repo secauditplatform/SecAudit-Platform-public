@@ -1,7 +1,7 @@
 {
   "name": "secaudit-frontend",
   "private": true,
-  "version": "1.4.0",
+  "version": "1.6.0",
   "license": "PolyForm-Noncommercial-1.0.0",
   "author": "secauditplatform@proton.me",
   "type": "module",
@@ -28,6 +28,8 @@
   "devDependencies": {
     "@eslint/js": "^9.22.0",
     "@playwright/test": "1.50.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
@@ -36,6 +38,7 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.19",
     "globals": "^15.15.0",
+    "happy-dom": "^21.0.1",
     "typescript": "~5.6.3",
     "typescript-eslint": "^8.26.1",
     "vite": "^6.0.3",

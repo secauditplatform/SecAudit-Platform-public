@@ -20,6 +20,8 @@ from secaudit_core.inventory_scan import (
     decode_nmap_flags,
     host_name_for_ip,
     infer_host_defaults,
+    nmap_address_groups,
+    nmap_calls_for_target,
     parse_nmap_discovery_xml,
     parse_nmap_port_scan_xml,
 )
@@ -30,7 +32,12 @@ from secaudit_core.inventory_scan_state import (
     set_scan_pid,
 )
 from secaudit_core.models import Credential, Host, InventoryScan, InventoryScanResult, JobStatus
-from secaudit_core.run_state import claim_pending_run, transition_running_run
+from secaudit_core.run_state import (
+    claim_pending_run,
+    release_running_run_for_retry,
+    transition_running_run,
+)
+from secaudit_core.transient import is_transient_error, reraise_if_transient
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.snmp_discovery import platform_hint, safe_snmp_error, snmp_addresses
@@ -39,6 +46,36 @@ from app.snmp_probe import probe_snmp_addresses
 
 # Small chunks so the UI sees hosts/ports after each batch instead of only at the end.
 PORT_SCAN_CHUNK_SIZE = 8
+
+
+class InventoryScanFailed(RuntimeError):
+    """Permanent inventory-scan failure. Celery records it in the dead-letter queue."""
+
+
+def _surface_inventory_scan_failure(session_factory, scan_id: int, exc: BaseException, *, error_message: str) -> None:
+    """Persist the scan outcome, then let Celery see the error.
+
+    A transient failure goes back to PENDING and is re-raised so autoretry can
+    claim the same scan. A permanent failure is stored as FAILED and re-raised
+    so the task lands in the dead-letter queue. Cancellation is left untouched.
+    """
+    message = (error_message or str(exc) or "Inventory scan failed")[:2000]
+    if is_transient_error(exc):
+        with session_factory() as db:
+            released = release_running_run_for_retry(db, InventoryScan, scan_id)
+        if released:
+            reraise_if_transient(exc)
+        return
+    with session_factory() as db:
+        recorded = transition_running_run(
+            db,
+            InventoryScan,
+            scan_id,
+            JobStatus.FAILED,
+            error_message=message,
+        )
+    if recorded:
+        raise InventoryScanFailed(message) from None
 
 
 def _is_scan_active(db: Session, scan_id: int) -> bool:
@@ -394,17 +431,12 @@ def _run_snmp_scan_sync(scan_id: int, *, database_url: str, redis_url: str) -> N
                     error_message="Cancelled by user",
                 )
     except Exception as exc:
-        with SessionLocal() as db:
-            scan = db.get(InventoryScan, scan_id)
-            if not scan:
-                return
-            transition_running_run(
-                db,
-                InventoryScan,
-                scan_id,
-                JobStatus.FAILED,
-                error_message=safe_snmp_error(str(exc), *secrets),
-            )
+        _surface_inventory_scan_failure(
+            SessionLocal,
+            scan_id,
+            exc,
+            error_message=safe_snmp_error(str(exc), *secrets),
+        )
     finally:
         clear_scan_state(redis_url, scan_id)
 
@@ -430,16 +462,30 @@ def run_inventory_scan_sync(scan_id: int, *, database_url: str, redis_url: str) 
     try:
         flags_data = decode_nmap_flags(nmap_flags)
 
+        calls = nmap_calls_for_target(target)
         if flags_data.get("mode") == "custom":
             custom_args = flags_data.get("flags", [])
-            scan_out, scan_err = _run_nmap_sync([*custom_args, target], scan_id, redis_url)
-            with SessionLocal() as db:
-                if not _is_scan_active(db, scan_id):
-                    return
-            if not scan_out.strip():
-                raise RuntimeError(scan_err.strip() or "nmap scan produced no output")
-            discovered = parse_nmap_discovery_xml(scan_out)
-            port_info_by_ip = parse_nmap_port_scan_xml(scan_out)
+            discovered: list[dict] = []
+            port_info_by_ip: dict = {}
+            seen_ips: set[str] = set()
+            errors: list[str] = []
+            for flags, concrete in calls:
+                scan_out, scan_err = _run_nmap_sync(
+                    [*custom_args, *flags, *concrete], scan_id, redis_url
+                )
+                with SessionLocal() as db:
+                    if not _is_scan_active(db, scan_id):
+                        return
+                if not scan_out.strip():
+                    errors.append(scan_err.strip() or "nmap scan produced no output")
+                    continue
+                for entry in parse_nmap_discovery_xml(scan_out):
+                    if entry["ip"] not in seen_ips:
+                        seen_ips.add(entry["ip"])
+                        discovered.append(entry)
+                port_info_by_ip.update(parse_nmap_port_scan_xml(scan_out))
+            if not discovered and not port_info_by_ip and errors:
+                raise RuntimeError(errors[0])
             if not discovered and port_info_by_ip:
                 discovered = [
                     {"ip": info["ip"], "hostname": info["hostname"]}
@@ -465,16 +511,25 @@ def run_inventory_scan_sync(scan_id: int, *, database_url: str, redis_url: str) 
         discovery_args = flags_data.get("discovery", ["-sn"])
         port_scan_args = flags_data.get("port_scan", list(NMAP_PORT_SCAN_ARGS))
 
-        discovery_out, discovery_err = _run_nmap_sync(
-            [*discovery_args, target], scan_id, redis_url
-        )
-        with SessionLocal() as db:
-            if not _is_scan_active(db, scan_id):
-                return
-        if not discovery_out.strip():
-            raise RuntimeError(discovery_err.strip() or "nmap discovery produced no output")
-
-        discovered = parse_nmap_discovery_xml(discovery_out)
+        discovered = []
+        seen_ips = set()
+        errors = []
+        for flags, concrete in calls:
+            discovery_out, discovery_err = _run_nmap_sync(
+                [*discovery_args, *flags, *concrete], scan_id, redis_url
+            )
+            with SessionLocal() as db:
+                if not _is_scan_active(db, scan_id):
+                    return
+            if not discovery_out.strip():
+                errors.append(discovery_err.strip() or "nmap discovery produced no output")
+                continue
+            for entry in parse_nmap_discovery_xml(discovery_out):
+                if entry["ip"] not in seen_ips:
+                    seen_ips.add(entry["ip"])
+                    discovered.append(entry)
+        if not discovered and errors:
+            raise RuntimeError(errors[0])
 
         with SessionLocal() as db:
             scan = db.get(InventoryScan, scan_id)
@@ -484,24 +539,25 @@ def run_inventory_scan_sync(scan_id: int, *, database_url: str, redis_url: str) 
 
         if discovered:
             port_targets = [entry["ip"] for entry in discovered]
-            for offset in range(0, len(port_targets), PORT_SCAN_CHUNK_SIZE):
-                chunk = port_targets[offset : offset + PORT_SCAN_CHUNK_SIZE]
-                port_out, port_err = _run_nmap_sync(
-                    [*port_scan_args, *chunk],
-                    scan_id,
-                    redis_url,
-                )
-                with SessionLocal() as db:
-                    if not _is_scan_active(db, scan_id):
-                        return
-                if not port_out.strip():
-                    raise RuntimeError(port_err.strip() or "nmap port scan produced no output")
-                chunk_ports = parse_nmap_port_scan_xml(port_out)
-                with SessionLocal() as db:
-                    scan = db.get(InventoryScan, scan_id)
-                    if not scan or scan.status == JobStatus.CANCELLED:
-                        return
-                    _apply_port_info_chunk(db, scan, chunk, chunk_ports)
+            for family_flags, family_targets in nmap_address_groups(port_targets):
+                for offset in range(0, len(family_targets), PORT_SCAN_CHUNK_SIZE):
+                    chunk = family_targets[offset : offset + PORT_SCAN_CHUNK_SIZE]
+                    port_out, port_err = _run_nmap_sync(
+                        [*port_scan_args, *family_flags, *chunk],
+                        scan_id,
+                        redis_url,
+                    )
+                    with SessionLocal() as db:
+                        if not _is_scan_active(db, scan_id):
+                            return
+                    if not port_out.strip():
+                        raise RuntimeError(port_err.strip() or "nmap port scan produced no output")
+                    chunk_ports = parse_nmap_port_scan_xml(port_out)
+                    with SessionLocal() as db:
+                        scan = db.get(InventoryScan, scan_id)
+                        if not scan or scan.status == JobStatus.CANCELLED:
+                            return
+                        _apply_port_info_chunk(db, scan, chunk, chunk_ports)
 
         with SessionLocal() as db:
             scan = db.get(InventoryScan, scan_id)
@@ -520,16 +576,6 @@ def run_inventory_scan_sync(scan_id: int, *, database_url: str, redis_url: str) 
                     error_message="Cancelled by user",
                 )
     except Exception as exc:
-        with SessionLocal() as db:
-            scan = db.get(InventoryScan, scan_id)
-            if not scan:
-                return
-            transition_running_run(
-                db,
-                InventoryScan,
-                scan_id,
-                JobStatus.FAILED,
-                error_message=str(exc),
-            )
+        _surface_inventory_scan_failure(SessionLocal, scan_id, exc, error_message=str(exc))
     finally:
         clear_scan_state(redis_url, scan_id)

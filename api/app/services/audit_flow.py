@@ -43,6 +43,12 @@ from secaudit_core.audit_flow_present import (
     reprobe_target_ids,
     run_to_read,
 )
+from secaudit_core.audit_flow_scope import (
+    compose_template_targets,
+    host_rows_to_targets,
+    inventory_scope_host_stmt,
+    normalize_inventory_scope,
+)
 from secaudit_core.inventory_scan import validate_scan_target
 from secaudit_core.reports import build_report_summary_dict
 
@@ -840,12 +846,29 @@ def template_credentials_public(snapshots: list[dict]) -> list[dict]:
     return public
 
 
+async def resolve_template_run_targets(db: AsyncSession, template) -> list[str]:
+    """Expand a saved tag/site rule against the inventory as it is now."""
+    scope = normalize_inventory_scope(getattr(template, "inventory_scope_json", None))
+    hosts: list[dict] = []
+    if scope is not None:
+        stmt = inventory_scope_host_stmt(scope, owner_sub=template.owner_sub)
+        if stmt is not None:
+            rows = (await db.execute(stmt)).all()
+            hosts = host_rows_to_targets(rows)
+    return compose_template_targets(
+        list(template.targets_json or []),
+        hosts,
+        scope_active=scope is not None,
+    )
+
+
 def template_to_read(template) -> dict:
     return {
         "id": template.id,
         "name": template.name,
         "description": template.description,
         "targets": list(template.targets_json or []),
+        "inventory_scope": normalize_inventory_scope(getattr(template, "inventory_scope_json", None)),
         "credentials": template_credentials_public(template.credentials_json or []),
         "save_to_inventory": bool(template.save_to_inventory),
         "cron_expression": template.cron_expression,

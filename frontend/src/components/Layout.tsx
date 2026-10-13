@@ -17,6 +17,7 @@ import {
 import {
   IconAudit,
   IconAuditFlow,
+  IconAuditMap,
   IconBars,
   IconConsole,
   IconCredentials,
@@ -51,6 +52,7 @@ const NAV_ICONS: Record<NavRouteId, typeof IconDashboard> = {
   waivers: IconWaivers,
   auditLogs: IconAudit,
   overview: IconPlatformOverview,
+  auditMap: IconAuditMap,
 };
 
 function readSidebarCollapsed(): boolean {
@@ -177,7 +179,7 @@ export function Layout() {
                           setMobileNavOpen(false);
                         }}
                       >
-                        <Icon />
+                        {Icon ? <Icon /> : null}
                         <span className="pf-nav-item__label">{label}</span>
                       </NavLink>
                     );

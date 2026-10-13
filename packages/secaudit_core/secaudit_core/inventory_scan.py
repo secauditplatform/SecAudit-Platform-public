@@ -6,6 +6,7 @@ import ipaddress
 import json
 import re
 import shlex
+import socket
 import xml.etree.ElementTree as ET
 from typing import TypedDict
 
@@ -14,6 +15,12 @@ from typing import TypedDict
 MAX_CIDR_PREFIX_LEN = 20
 # Absolute floor even for admins — /8 would be ~16M hosts and is never allowed.
 MIN_CIDR_PREFIX_LEN_ABSOLUTE = 8
+# A hostname is one target, not a subnet. More addresses than an AuditFlow
+# target list would let one name stand in for a v4 prefix.
+MAX_HOSTNAME_ADDRESSES = 16
+IPV6_PREFIX_ERROR = (
+    "IPv6 prefixes are not supported. Enter one IPv6 address or a hostname."
+)
 
 # Phase 2 uses nmap -F (fast scan): top 100 TCP ports per nmap's frequency ranking,
 # including common services such as 22, 80, 443, 445, 3389, 8080, etc.
@@ -127,6 +134,9 @@ def validate_scan_target(target: str, *, max_prefix_len: int | None = None) -> s
             net = ipaddress.ip_network(cleaned, strict=False)
         except ValueError as exc:
             raise ValueError("Invalid CIDR notation") from exc
+        if isinstance(net, ipaddress.IPv6Network):
+            # A /64 is not another /24. Reject it before nmap starts.
+            raise ValueError(IPV6_PREFIX_ERROR)
         if isinstance(net, ipaddress.IPv4Network):
             _validate_ipv4_network_prefix(net, max_prefix_len=prefix_limit)
         _assert_network_not_blocked(net)
@@ -191,6 +201,8 @@ def expand_scan_target(target: str) -> list[str] | None:
             net = ipaddress.ip_network(cleaned, strict=False)
         except ValueError:
             return None
+        if isinstance(net, ipaddress.IPv6Network):
+            raise ValueError(IPV6_PREFIX_ERROR)
         if isinstance(net, ipaddress.IPv4Network):
             return [str(ip) for ip in net.hosts()]
         return None
@@ -308,11 +320,8 @@ def parse_nmap_discovery_xml(xml_text: str, *, skip_unreliable: bool = False) ->
         reason = (status.get("reason") or "").strip().lower()
         if skip_unreliable and reason not in ALIVE_DISCOVERY_REASONS:
             continue
-        ip: str | None = None
+        ip = _ip_from_address_elements(host)
         hostname: str | None = None
-        for addr in host.findall("address"):
-            if addr.get("addrtype") == "ipv4":
-                ip = addr.get("addr")
         hostnames = host.find("hostnames")
         if hostnames is not None:
             hn = hostnames.find("hostname")
@@ -331,11 +340,8 @@ def parse_nmap_port_scan_xml(xml_text: str) -> dict[str, HostPortInfo]:
         status = host.find("status")
         if status is None or status.get("state") != "up":
             continue
-        ip: str | None = None
+        ip = _ip_from_address_elements(host)
         hostname: str | None = None
-        for addr in host.findall("address"):
-            if addr.get("addrtype") == "ipv4":
-                ip = addr.get("addr")
         hostnames = host.find("hostnames")
         if hostnames is not None:
             hn = hostnames.find("hostname")
@@ -365,7 +371,119 @@ def parse_nmap_port_scan_xml(xml_text: str) -> dict[str, HostPortInfo]:
 def host_name_for_ip(ip: str, resolved_hostname: str | None) -> str:
     if resolved_hostname:
         return resolved_hostname[:128]
-    return f"discovered-{ip.replace('.', '-')}"[:128]
+    label = ip.replace(":", "-").replace(".", "-")
+    return f"discovered-{label}"[:128]
+
+
+def bracket_ipv6_host(host: str) -> str:
+    """Wrap an IPv6 address so a URL does not treat its colons as a port."""
+    text = host.strip()
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return text
+    if addr.version == 6:
+        return f"[{addr}]"
+    return str(addr)
+
+
+def nmap_calls_for_target(target: str) -> list[tuple[list[str], list[str]]]:
+    """Split one scan target into nmap invocations.
+
+    Each item is ``(extra_flags, targets)``. IPv4 and IPv6 cannot share one
+    nmap process. A single IPv6 address is passed with ``-6``. A hostname that
+    resolves to AAAA is passed as those addresses, not left as an unparsed
+    name. An IPv6 prefix is rejected. A name that resolves to more addresses
+    than the target-list ceiling is rejected so it cannot stand in for a v4 subnet.
+    """
+    cleaned = target.strip()
+    if "/" in cleaned or NMAP_RANGE_PATTERN.fullmatch(cleaned):
+        if "/" in cleaned:
+            try:
+                net = ipaddress.ip_network(cleaned, strict=False)
+            except ValueError:
+                return [([], [cleaned])]
+            if isinstance(net, ipaddress.IPv6Network):
+                raise ValueError(IPV6_PREFIX_ERROR)
+            return [([], [str(net)])]
+        return [([], [cleaned])]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return _calls_for_hostname(cleaned)
+    if addr.version == 6:
+        return [(["-6"], [str(addr)])]
+    return [([], [str(addr)])]
+
+
+def nmap_address_groups(addresses: list[str]) -> list[tuple[list[str], list[str]]]:
+    """Group concrete addresses so a later port scan uses ``-6`` only for IPv6."""
+    v4: list[str] = []
+    v6: list[str] = []
+    for item in addresses:
+        try:
+            addr = ipaddress.ip_address(item)
+        except ValueError:
+            v4.append(item)
+            continue
+        if addr.version == 6:
+            v6.append(str(addr))
+        else:
+            v4.append(str(addr))
+    groups: list[tuple[list[str], list[str]]] = []
+    if v4:
+        groups.append(([], v4))
+    if v6:
+        groups.append((["-6"], v6))
+    return groups
+
+
+def _calls_for_hostname(hostname: str) -> list[tuple[list[str], list[str]]]:
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return [([], [hostname])]
+    v4: list[str] = []
+    v6: list[str] = []
+    for info in infos:
+        raw = str(info[4][0]).split("%", 1)[0]
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            continue
+        bucket = v6 if addr.version == 6 else v4
+        text = str(addr)
+        if text not in bucket:
+            try:
+                _assert_address_not_blocked(addr)
+            except ValueError:
+                continue
+            bucket.append(text)
+    if not v6:
+        # IPv4-only names stay a single nmap target, as before.
+        return [([], [hostname])]
+    if len(v4) + len(v6) > MAX_HOSTNAME_ADDRESSES:
+        raise ValueError(
+            "Hostname resolves to too many addresses; enter one address instead of a network"
+        )
+    if not v4 and not v6:
+        raise ValueError(f"Scan target host is not allowed: {hostname}")
+    calls: list[tuple[list[str], list[str]]] = []
+    if v4:
+        calls.append(([], v4))
+    if v6:
+        calls.append((["-6"], v6))
+    return calls
+
+
+def _ip_from_address_elements(host: ET.Element) -> str | None:
+    for addr in host.findall("address"):
+        if addr.get("addrtype") not in {"ipv4", "ipv6"}:
+            continue
+        value = (addr.get("addr") or "").strip()
+        if value:
+            return value
+    return None
 
 
 def infer_host_defaults(open_ports: list[int]) -> tuple[int, str]:

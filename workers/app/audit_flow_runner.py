@@ -44,6 +44,9 @@ from secaudit_core.audit_flow_nmap import (
 )
 from secaudit_core.inventory_scan import (
     ScanCancelledError,
+    bracket_ipv6_host,
+    nmap_address_groups,
+    nmap_calls_for_target,
     parse_nmap_discovery_xml,
 )
 from secaudit_core.audit_flow_state import (
@@ -131,16 +134,23 @@ def _apply_nmap_identity(db: Session, run_id: int, discovered_ips: dict[str, str
             row.os_guess = str(pretty)[:256]
 
 
-def _identify_live_chunk(chunk: list[str], run_id: int, redis_url: str) -> dict:
+def _identify_live_chunk(
+    chunk: list[str],
+    run_id: int,
+    redis_url: str,
+    *,
+    family_args: list[str] | None = None,
+) -> dict:
     """OS/service nmap on hosts that already answered ping."""
+    extra = family_args or []
     try:
-        xml = _run_nmap([*NMAP_AUDITFLOW_IDENTITY, *chunk], run_id, redis_url)
+        xml = _run_nmap([*NMAP_AUDITFLOW_IDENTITY, *extra, *chunk], run_id, redis_url)
         parsed = parse_nmap_service_xml(xml)
         if parsed:
             return parsed
     except RuntimeError as exc:
         _log(run_id, f"OS fingerprint unavailable, retrying services only: {exc}", "warning")
-    xml = _run_nmap([*NMAP_AUDITFLOW_IDENTITY_NO_OS, *chunk], run_id, redis_url)
+    xml = _run_nmap([*NMAP_AUDITFLOW_IDENTITY_NO_OS, *extra, *chunk], run_id, redis_url)
     return parse_nmap_service_xml(xml)
 
 
@@ -595,12 +605,13 @@ def _probe_winrm(ip: str, username: str, secret: str, *, ports: set[int] | None 
         return None
     endpoints: list[str] = []
     open_ports = ports or set()
+    host = bracket_ipv6_host(ip)
     if 5986 in open_ports:
-        endpoints.append(f"https://{ip}:5986/wsman")
+        endpoints.append(f"https://{host}:5986/wsman")
     if 5985 in open_ports or not open_ports:
-        endpoints.append(f"http://{ip}:5985/wsman")
+        endpoints.append(f"http://{host}:5985/wsman")
     if not endpoints:
-        endpoints.append(f"http://{ip}:5985/wsman")
+        endpoints.append(f"http://{host}:5985/wsman")
     for endpoint in endpoints:
         try:
             session = winrm.Session(
@@ -846,8 +857,12 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                         redis_url, run_id, phase="discovery", target=target, address=target
                     )
                     _log(run_id, f"Ping sweep {target}")
-                    xml = _run_nmap([*NMAP_AUDITFLOW_DISCOVERY, target], run_id, redis_url)
-                    ping_live = parse_nmap_discovery_xml(xml, skip_unreliable=True)
+                    ping_live: list[dict] = []
+                    for flags, concrete in nmap_calls_for_target(target):
+                        xml = _run_nmap(
+                            [*NMAP_AUDITFLOW_DISCOVERY, *flags, *concrete], run_id, redis_url
+                        )
+                        ping_live.extend(parse_nmap_discovery_xml(xml, skip_unreliable=True))
                     _log(run_id, f"Ping replies: {len(ping_live)} host(s) in {target}")
                     for host in ping_live:
                         ip = host["ip"]
@@ -864,17 +879,22 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                 if live_ips:
                     _cancelled(redis_url, run_id)
                     _log(run_id, f"OS/service scan on {len(live_ips)} live host(s)")
-                    for index in range(0, len(live_ips), PORT_SCAN_CHUNK_SIZE):
-                        chunk = live_ips[index : index + PORT_SCAN_CHUNK_SIZE]
-                        set_audit_flow_progress(
-                            redis_url, run_id, phase="services", target=None, address=chunk[0]
-                        )
-                        _log(run_id, f"Identifying {', '.join(chunk)}")
-                        parsed = _identify_live_chunk(chunk, run_id, redis_url)
-                        for ip, nmap_host in parsed.items():
-                            service_hosts[ip] = merge_auditflow_hosts(service_hosts.get(ip), nmap_host)
-                            if nmap_host.get("hostname"):
-                                discovered_ips[ip] = nmap_host["hostname"]
+                    for family_flags, family_targets in nmap_address_groups(live_ips):
+                        for index in range(0, len(family_targets), PORT_SCAN_CHUNK_SIZE):
+                            chunk = family_targets[index : index + PORT_SCAN_CHUNK_SIZE]
+                            set_audit_flow_progress(
+                                redis_url, run_id, phase="services", target=None, address=chunk[0]
+                            )
+                            _log(run_id, f"Identifying {', '.join(chunk)}")
+                            parsed = _identify_live_chunk(
+                                chunk, run_id, redis_url, family_args=family_flags
+                            )
+                            for ip, nmap_host in parsed.items():
+                                service_hosts[ip] = merge_auditflow_hosts(
+                                    service_hosts.get(ip), nmap_host
+                                )
+                                if nmap_host.get("hostname"):
+                                    discovered_ips[ip] = nmap_host["hostname"]
 
                 _apply_nmap_identity(db, run_id, discovered_ips, service_hosts)
                 _refresh_hosts_found(db, run)

@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-
-from urllib.parse import urlencode
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect
@@ -15,7 +14,8 @@ from websockets.exceptions import ConnectionClosed
 logger = logging.getLogger(__name__)
 
 
-def sandbox_console_ws_url(base_url: str, *, token: str | None = None) -> str:
+def sandbox_console_ws_url(base_url: str) -> str:
+    """Upstream console URL. The bearer token is never placed in the query string."""
     base = base_url.rstrip("/")
     if base.startswith("http://"):
         base = "ws://" + base[len("http://") :]
@@ -23,10 +23,23 @@ def sandbox_console_ws_url(base_url: str, *, token: str | None = None) -> str:
         base = "wss://" + base[len("https://") :]
     elif not base.startswith(("ws://", "wss://")):
         base = "ws://" + base
-    url = f"{base}/api/v1/ws/console"
-    if token:
-        url = f"{url}?{urlencode({'token': token})}"
-    return url
+    return f"{base}/api/v1/ws/console"
+
+
+def sandbox_console_auth_headers(token: str | None) -> dict[str, str] | None:
+    """Authorization header for the sandbox hop. Empty when auth is disabled."""
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _connect_header_kwargs(headers: dict[str, str] | None) -> dict[str, object]:
+    if not headers:
+        return {}
+    params = inspect.signature(ws_connect).parameters
+    if "additional_headers" in params:
+        return {"additional_headers": headers}
+    return {"extra_headers": headers}
 
 
 async def proxy_console_websocket(
@@ -36,10 +49,11 @@ async def proxy_console_websocket(
     token: str | None = None,
 ) -> None:
     """Bridge bytes/text to the sandbox service (client already authenticated)."""
-    upstream_url = sandbox_console_ws_url(sandbox_url, token=token)
+    upstream_url = sandbox_console_ws_url(sandbox_url)
+    connect_kwargs = _connect_header_kwargs(sandbox_console_auth_headers(token))
 
     try:
-        async with ws_connect(upstream_url, open_timeout=10) as upstream:
+        async with ws_connect(upstream_url, open_timeout=10, **connect_kwargs) as upstream:
             async def client_to_upstream() -> None:
                 try:
                     while True:

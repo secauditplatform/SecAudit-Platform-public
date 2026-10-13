@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models import AuditLog, CheckResult, CheckStatus, ComplianceWaiver, Host, JobRun, Rule
+from app.models import AuditLog, CheckResult, CheckStatus, ComplianceWaiver, Host, JobRun, Profile, Rule
 from app.schemas import (
     MultiRunCompareCell,
     MultiRunCompareReport,
@@ -23,6 +23,7 @@ from app.schemas import (
     MultiRunCompareRunSummary,
     ReportSummary,
 )
+from app.services.cve_feed import load_feed_entries, references_for_check
 from app.services.reports import build_report_summary
 from secaudit_core.sensitive_data import redact_sensitive
 
@@ -69,23 +70,25 @@ def render_check_results_csv(
     severity_filter: str | None = None,
     host_id_filter: int | None = None,
     rule_filter: str | None = None,
+    cve_ids_by_check_id: dict[int, list[str]] | None = None,
 ) -> str:
     status_norm = status_filter.strip().lower() if status_filter else None
     severity_norm = _normalize_severity(severity_filter)
     rule_query = rule_filter.strip().lower() if rule_filter else None
 
-    rows: list[list[str]] = [
-        [
-            "run_id",
-            "host_id",
-            "host_name",
-            "rule_tech_name",
-            "severity",
-            "status",
-            "message",
-            "created_at",
-        ]
+    header = [
+        "run_id",
+        "host_id",
+        "host_name",
+        "rule_tech_name",
+        "severity",
+        "status",
+        "message",
+        "created_at",
     ]
+    if cve_ids_by_check_id is not None:
+        header.append("cve_ids")
+    rows: list[list[str]] = [header]
 
     for check in sorted(checks, key=lambda c: (c.host_id, c.rule_tech_name, c.id)):
         status_value = check.status.value if isinstance(check.status, CheckStatus) else str(check.status)
@@ -100,20 +103,21 @@ def render_check_results_csv(
             continue
 
         host = hosts.get(check.host_id)
-        rows.append(
-            _csv_escape_row(
-                [
-                    run_id,
-                    check.host_id,
-                    host.name if host else "",
-                    check.rule_tech_name,
-                    severity or "",
-                    status_value,
-                    check.message or "",
-                    check.created_at.isoformat() if check.created_at else "",
-                ]
-            )
-        )
+        values: list[object] = [
+            run_id,
+            check.host_id,
+            host.name if host else "",
+            check.rule_tech_name,
+            severity or "",
+            status_value,
+            check.message or "",
+            check.created_at.isoformat() if check.created_at else "",
+        ]
+        if cve_ids_by_check_id is not None:
+            # Advisory column only. The status cell stays the check result.
+            ids = cve_ids_by_check_id.get(check.id, []) if status_value.lower() == "fail" else []
+            values.append(" ".join(ids))
+        rows.append(_csv_escape_row(values))
 
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -173,6 +177,23 @@ async def fetch_run_csv(
 
     profile_id = job_run.job.profile_id if job_run.job else None
     severity_by_rule = await _severity_by_tech_name(db, profile_id)
+    feed_entries = await load_feed_entries(db)
+    cve_ids_by_check_id: dict[int, list[str]] | None = None
+    if feed_entries:
+        profile_name = None
+        if profile_id is not None:
+            profile = await db.get(Profile, profile_id)
+            profile_name = profile.profile_name if profile is not None else None
+        cve_ids_by_check_id = {}
+        for check in job_run.check_results:
+            status_value = check.status.value if isinstance(check.status, CheckStatus) else str(check.status)
+            refs = references_for_check(
+                feed_entries,
+                status=status_value,
+                rule_tech_name=check.rule_tech_name,
+                profile_name=profile_name,
+            )
+            cve_ids_by_check_id[check.id] = [ref.cve_id for ref in refs]
     content = render_check_results_csv(
         run_id=run_id,
         checks=list(job_run.check_results),
@@ -182,6 +203,7 @@ async def fetch_run_csv(
         severity_filter=severity,
         host_id_filter=host_id,
         rule_filter=rule,
+        cve_ids_by_check_id=cve_ids_by_check_id,
     )
     filename = f"report-{run_id}.csv"
     return content, filename

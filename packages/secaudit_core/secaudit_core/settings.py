@@ -7,7 +7,7 @@ class SecAuditSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
-    app_version: str = "1.4.0"
+    app_version: str = "1.6.0"
     secret_key: str = "dev-secret-key"
 
     # Data-at-rest encryption backend: fernet (dev), vault (Transit), aws_kms (BYO-KMS).

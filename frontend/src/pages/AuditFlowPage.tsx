@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Fragment, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { api, type AuditFlowHost, type AuditFlowInventoryChange, type AuditFlowRun, type Profile } from "../api/client";
 import { AuditFlowLogs } from "../components/AuditFlowLogs";
 import { AuditFlowInventoryImport } from "../components/AuditFlowInventoryImport";
@@ -18,6 +18,7 @@ import { useTranslation } from "../i18n/I18nProvider";
 import { useAuth } from "../auth/AuthProvider";
 import { applyAuditFlowHostPatch, hostReviewReason } from "../utils/auditFlowHostState";
 import { buildAuditFlowReportHref } from "../utils/reportDeepLink";
+import { detectTargetType, findIpv6Prefix } from "./scanTargets";
 
 type CredType = "ssh_password" | "ssh_key" | "winrm";
 
@@ -145,31 +146,6 @@ function platformTone(platform: string | null | undefined): string {
   return "unknown";
 }
 
-function detectTargetType(raw: string): "cidr" | "ip" | "range" | "hostname" | "invalid" | null {
-  const v = raw.trim();
-  if (!v) return null;
-  if (v.includes("/")) {
-    const parts = v.split("/");
-    if (parts.length === 2 && /^\d+$/.test(parts[1])) {
-      const prefix = parseInt(parts[1], 10);
-      if (prefix >= 0 && prefix <= 32) return "cidr";
-    }
-    return "invalid";
-  }
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(v)) {
-    const octets = v.split(".").map(Number);
-    if (octets.every((o) => o >= 0 && o <= 255)) return "ip";
-    return "invalid";
-  }
-  if (/^[\d.-]+$/.test(v) && v.includes("-")) {
-    return "range";
-  }
-  if (/^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(v)) {
-    return "hostname";
-  }
-  return "invalid";
-}
-
 function getTargetTypeLabel(type: ReturnType<typeof detectTargetType>, t: (key: string) => string): string | null {
   switch (type) {
     case "cidr":
@@ -180,6 +156,8 @@ function getTargetTypeLabel(type: ReturnType<typeof detectTargetType>, t: (key: 
       return t("auditFlow.targetTypeRange");
     case "hostname":
       return t("auditFlow.targetTypeHost");
+    case "ipv6prefix":
+      return t("auditFlow.targetTypeIpv6Prefix");
     case "invalid":
       return t("auditFlow.targetTypeInvalid");
     default:
@@ -236,8 +214,19 @@ export function AuditFlowPage() {
   const toast = useToast();
   const { confirm } = useConfirm();
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
   const [targets, setTargets] = useState<string[]>(["192.168.1.0/24"]);
   const [targetMode, setTargetMode] = useState<"list" | "text">("list");
+
+  useEffect(() => {
+    const raw = searchParams.get("targets");
+    if (!raw) return;
+    const next = raw
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (next.length > 0) setTargets(next);
+  }, [searchParams]);
   const [creds, setCreds] = useState<CredDraft[]>([]);
   const [saveToInventory, setSaveToInventory] = useState(false);
   const [viewedStep, setViewedStep] = useState<"setup" | "scan" | null>(null);
@@ -845,7 +834,7 @@ export function AuditFlowPage() {
                               <input
                                 type="text"
                                 className={`pf-input pf-audit-flow-target-row__input${
-                                  detected === "invalid" ? " is-invalid" : ""
+                                  detected === "invalid" || detected === "ipv6prefix" ? " is-invalid" : ""
                                 }`}
                                 placeholder={t("auditFlow.targetPlaceholder")}
                                 value={target}
@@ -857,7 +846,9 @@ export function AuditFlowPage() {
                               {badgeLabel && (
                                 <span
                                   className={`pf-audit-flow-target-row__badge${
-                                    detected === "invalid" ? " pf-audit-flow-target-row__badge--invalid" : ""
+                                    detected === "invalid" || detected === "ipv6prefix"
+                                      ? " pf-audit-flow-target-row__badge--invalid"
+                                      : ""
                                   }`}
                                 >
                                   {badgeLabel}
@@ -1161,6 +1152,9 @@ export function AuditFlowPage() {
               {run?.status === "ready" ? (
                 <p className="pf-form__hint pf-audit-flow-setup__reenter">{t("auditFlow.reenterSecrets")}</p>
               ) : null}
+              {findIpv6Prefix(targets) ? (
+                <div className="pf-alert pf-alert--error">{t("auditFlow.ipv6PrefixRejected")}</div>
+              ) : null}
           </div>
           <div className="pf-audit-flow-footer">
             {run?.status === "ready" ? (
@@ -1172,10 +1166,17 @@ export function AuditFlowPage() {
             )}
             <div className="pf-audit-flow-footer__actions">
               <Button
-                onClick={() => startMutation.mutate()}
+                onClick={() => {
+                  if (findIpv6Prefix(targets)) {
+                    toast.error(t("auditFlow.ipv6PrefixRejected"));
+                    return;
+                  }
+                  startMutation.mutate();
+                }}
                 disabled={
                   !canExecute ||
                   startMutation.isPending ||
+                  findIpv6Prefix(targets) != null ||
                   targets.flatMap((item) => item.split(/[\s,;\r\n]+/)).filter((t) => t.trim()).length === 0
                 }
                 title={!canExecute ? t("common.demoActionDisabled") : undefined}

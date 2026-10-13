@@ -97,6 +97,8 @@ export function RemediationPage({
     setSearchParams(next, { replace: true });
   }, [isNetwork, operationsPlatform, searchParams, setSearchParams]);
 
+  const presetHosts = searchParams.get("hosts");
+
   useEffect(() => {
     setHostIds([]);
     setProfileId("");
@@ -106,6 +108,15 @@ export function RemediationPage({
     else if (operationsPlatform === "network") setJobType("python");
     else setJobType("ssh");
   }, [operationsPlatform]);
+
+  useEffect(() => {
+    if (!presetHosts) return;
+    const ids = presetHosts
+      .split(",")
+      .map((part) => Number(part))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (ids.length > 0) setHostIds(ids);
+  }, [presetHosts, operationsPlatform]);
 
   useEffect(() => {
     if (operationsPlatform === "linux" && jobType !== "ssh" && jobType !== "ansible") {

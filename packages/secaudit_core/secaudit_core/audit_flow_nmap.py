@@ -345,7 +345,7 @@ def _parse_host(host: Element) -> AuditFlowNmapHost | None:
     mac_vendor: str | None = None
     for addr in host.findall("address"):
         kind = addr.get("addrtype")
-        if kind == "ipv4":
+        if kind in {"ipv4", "ipv6"} and not ip:
             ip = addr.get("addr")
         elif kind == "mac":
             mac_vendor = addr.get("vendor") or mac_vendor

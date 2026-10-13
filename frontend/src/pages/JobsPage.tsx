@@ -145,6 +145,8 @@ export function JobsPage({
     setSearchParams(next, { replace: true });
   }, [isNetwork, operationsPlatform, searchParams, setSearchParams]);
 
+  const presetHosts = searchParams.get("hosts");
+
   useEffect(() => {
     setHostIds([]);
     setProfileId("");
@@ -154,6 +156,15 @@ export function JobsPage({
     else if (operationsPlatform === "network") setJobType("python");
     else setJobType("ssh");
   }, [operationsPlatform]);
+
+  useEffect(() => {
+    if (!presetHosts) return;
+    const ids = presetHosts
+      .split(",")
+      .map((part) => Number(part))
+      .filter((id) => Number.isInteger(id) && id > 0);
+    if (ids.length > 0) setHostIds(ids);
+  }, [presetHosts, operationsPlatform]);
 
   useEffect(() => {
     if (operationsPlatform === "linux" && jobType !== "ssh" && jobType !== "playbook") {
@@ -207,6 +218,8 @@ export function JobsPage({
     setRunsListExpanded(false);
   }, [operationsPlatform]);
 
+  const presetJobId = Number(searchParams.get("job") ?? "");
+
   const jobList = useMemo(() => {
     const all = jobs.data ?? [];
     const profileCategoryById = new Map(
@@ -219,6 +232,15 @@ export function JobsPage({
       jobMatchesOperationsPlatform(job, operationsPlatform, { profileCategoryById, hostOsById })
     );
   }, [jobs.data, profiles.data, hosts.data, operationsPlatform]);
+
+  useEffect(() => {
+    if (!Number.isInteger(presetJobId) || presetJobId <= 0 || !jobs.data) return;
+    const job = jobList.find((item) => item.id === presetJobId);
+    if (!job || selectedJobId === job.id) return;
+    setSelectedJobId(job.id);
+    pendingScrollToJobIdRef.current = job.id;
+  }, [presetJobId, jobs.data, jobList, selectedJobId]);
+
   const jobById = useMemo(() => new Map(jobList.map((job) => [job.id, job])), [jobList]);
   type JobSortKey = "id" | "name" | "profile_id" | "is_scheduled";
   const jobAccessor = useCallback((job: Job, key: JobSortKey) => {

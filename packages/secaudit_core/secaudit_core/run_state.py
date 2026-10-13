@@ -27,6 +27,18 @@ def claim_pending_run(db: Session, model: Any, run_id: int) -> bool:
     return result.rowcount == 1
 
 
+def release_running_run_for_retry(db: Session, model: Any, run_id: int) -> bool:
+    """Return a RUNNING scan to PENDING so a Celery retry can claim it again."""
+    result = db.execute(
+        update(model)
+        .where(model.id == run_id, model.status == JobStatus.RUNNING)
+        .values(status=JobStatus.PENDING, started_at=None, finished_at=None, error_message=None)
+    )
+    db.commit()
+    db.expire_all()
+    return result.rowcount == 1
+
+
 def transition_running_run(
     db: Session,
     model: Any,

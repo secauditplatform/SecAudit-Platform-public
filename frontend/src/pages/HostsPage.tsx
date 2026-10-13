@@ -5,6 +5,7 @@ import { api, type Host, type HostCriticality, type InventoryScan } from "../api
 import { HostCredentialPopover } from "../components/HostCredentialPopover";
 import { DirectoryDiscoveryPanel } from "../components/DirectoryDiscoveryPanel";
 import { HostCsvImportPanel } from "../components/HostCsvImportPanel";
+import { HostSelectionToolbar } from "../components/HostSelectionToolbar";
 import { OpsListExpandFooter } from "../components/OpsListExpandFooter";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
@@ -17,6 +18,7 @@ import { Spinner } from "../components/ui/Spinner";
 import { useConfirm } from "../components/ui/ConfirmDialog";
 import { useToast } from "../components/ui/Toast";
 import { useTranslation } from "../i18n/I18nProvider";
+import { detectTargetType } from "./scanTargets";
 import { useAuth } from "../auth/AuthProvider";
 import { ObjectOwnerCell } from "../components/ObjectOwnerCell";
 import { useTableSort } from "../hooks/useTableSort";
@@ -343,6 +345,10 @@ export function HostsPage() {
   const [hostEnvironmentFilter, setHostEnvironmentFilter] = useState("all");
   const [hostCriticalityFilter, setHostCriticalityFilter] = useState<HostCriticality | "all">("all");
   const [hostListExpanded, setHostListExpanded] = useState(false);
+  const [selectedHostIds, setSelectedHostIds] = useState<number[]>([]);
+  const [bulkSite, setBulkSite] = useState("");
+  const [bulkEnvironment, setBulkEnvironment] = useState("");
+  const [bulkCriticality, setBulkCriticality] = useState<HostCriticality | "">("");
   const hostFormPanelRef = useRef<HTMLDivElement | null>(null);
   const urlEditHostId = parseHostEditId(searchParams.get("edit"));
 
@@ -444,6 +450,22 @@ export function HostsPage() {
         setSearchParams({}, { replace: true });
       }
       toast.success(t("toast.hostUpdated"));
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const bulkClassifyMutation = useMutation({
+    mutationFn: api.bulkClassifyHosts,
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      setBulkSite("");
+      setBulkEnvironment("");
+      setBulkCriticality("");
+      setSelectedHostIds([]);
+      toast.success(t("hosts.bulkClassifyDone", { count: result.updated.length }));
+      if (result.skipped.length > 0) {
+        toast.error(t("hosts.bulkClassifySkipped", { count: result.skipped.length }));
+      }
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -616,6 +638,20 @@ export function HostsPage() {
     [sortedHosts, hostListExpanded]
   );
 
+  const filteredHostIdKey = sortedHosts.map((host) => host.id).join(",");
+  useEffect(() => {
+    const allowed = new Set(
+      filteredHostIdKey
+        .split(",")
+        .filter(Boolean)
+        .map((value) => Number(value))
+    );
+    setSelectedHostIds((prev) => {
+      const next = prev.filter((id) => allowed.has(id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [filteredHostIdKey]);
+
   const clearScanFilters = () => {
     setScanSearch("");
     setScanStatusFilter("all");
@@ -646,6 +682,30 @@ export function HostsPage() {
     deleteScanMutation.mutate(id);
   };
 
+  const allFilteredSelected =
+    sortedHosts.length > 0 && sortedHosts.every((host) => selectedHostIds.includes(host.id));
+
+  const toggleHostSelected = (hostId: number) => {
+    setSelectedHostIds((prev) =>
+      prev.includes(hostId) ? prev.filter((id) => id !== hostId) : [...prev, hostId]
+    );
+  };
+
+  const applyBulkClassify = () => {
+    const site = bulkSite.trim();
+    const environment = bulkEnvironment.trim();
+    if (!site && !environment && !bulkCriticality) {
+      toast.error(t("hosts.bulkClassifyNeedField"));
+      return;
+    }
+    bulkClassifyMutation.mutate({
+      host_ids: selectedHostIds,
+      ...(site ? { site } : {}),
+      ...(environment ? { environment } : {}),
+      ...(bulkCriticality ? { criticality: bulkCriticality } : {}),
+    });
+  };
+
   return (
     <>
       <PageHeader title={t("hosts.title")} description={t("hosts.description")} />
@@ -665,6 +725,9 @@ export function HostsPage() {
                 placeholder="192.168.1.0/24"
               />
               <p className="pf-form__hint">{t("hosts.scanTargetHint")}</p>
+              {detectTargetType(scanTarget) === "ipv6prefix" ? (
+                <div className="pf-alert pf-alert--error">{t("hosts.ipv6PrefixRejected")}</div>
+              ) : null}
             </div>
             <div className="pf-form__group">
               <label htmlFor="scan-method">{t("hosts.scanMethod")}</label>
@@ -726,7 +789,11 @@ export function HostsPage() {
           </div>
           <div className="pf-form__actions">
             <Button
-              onClick={() =>
+              onClick={() => {
+                if (detectTargetType(scanTarget) === "ipv6prefix") {
+                  toast.error(t("hosts.ipv6PrefixRejected"));
+                  return;
+                }
                 scanMutation.mutate(
                   scanMethod === "snmp"
                     ? {
@@ -742,11 +809,12 @@ export function HostsPage() {
                         method: "nmap",
                         ...(scanNmapFlags.trim() ? { nmap_flags: scanNmapFlags.trim() } : {}),
                       },
-                )
-              }
+                );
+              }}
               disabled={
                 !canExecute ||
                 !scanTarget.trim() ||
+                detectTargetType(scanTarget) === "ipv6prefix" ||
                 scanMutation.isPending ||
                 (scanMethod === "snmp" && scanCredentialId === "")
               }
@@ -1180,6 +1248,70 @@ export function HostsPage() {
                 ) : null}
               </div>
             </div>
+            {canOperate && sortedHosts.length > 0 ? (
+              <div className="pf-host-bulk">
+                <HostSelectionToolbar
+                  selectedCount={selectedHostIds.length}
+                  onSelectAll={() => setSelectedHostIds(sortedHosts.map((host) => host.id))}
+                  onClear={() => setSelectedHostIds([])}
+                  emptyHintKey="hostSelection.listHint"
+                  variant="panel"
+                />
+                {selectedHostIds.length > 0 ? (
+                  <div className="pf-form pf-host-bulk__form">
+                    <p className="pf-host-bulk__hint">{t("hosts.bulkClassifyHint")}</p>
+                    <div className="pf-host-bulk__fields">
+                      <div className="pf-form__group">
+                        <label htmlFor="host-bulk-site">{t("hosts.site")}</label>
+                        <input
+                          id="host-bulk-site"
+                          className="pf-input"
+                          value={bulkSite}
+                          onChange={(e) => setBulkSite(e.target.value)}
+                          placeholder={t("hosts.bulkClassifyKeep")}
+                        />
+                      </div>
+                      <div className="pf-form__group">
+                        <label htmlFor="host-bulk-environment">{t("hosts.environment")}</label>
+                        <input
+                          id="host-bulk-environment"
+                          className="pf-input"
+                          value={bulkEnvironment}
+                          onChange={(e) => setBulkEnvironment(e.target.value)}
+                          placeholder={t("hosts.bulkClassifyKeep")}
+                        />
+                      </div>
+                      <div className="pf-form__group">
+                        <label htmlFor="host-bulk-criticality">{t("hosts.criticality")}</label>
+                        <select
+                          id="host-bulk-criticality"
+                          className="pf-select"
+                          value={bulkCriticality}
+                          onChange={(e) =>
+                            setBulkCriticality(e.target.value as HostCriticality | "")
+                          }
+                        >
+                          <option value="">{t("hosts.bulkClassifyKeep")}</option>
+                          <option value="low">{t("hosts.criticalityLabel.low")}</option>
+                          <option value="medium">{t("hosts.criticalityLabel.medium")}</option>
+                          <option value="high">{t("hosts.criticalityLabel.high")}</option>
+                          <option value="critical">{t("hosts.criticalityLabel.critical")}</option>
+                        </select>
+                      </div>
+                      <div className="pf-host-bulk__apply">
+                        <Button
+                          type="button"
+                          onClick={applyBulkClassify}
+                          disabled={bulkClassifyMutation.isPending}
+                        >
+                          {t("hosts.bulkClassifyApply")}
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {filteredHostRows.length === 0 ? (
               <EmptyState title={t("jobs.noFilterResults")} description={t("jobs.noFilterResultsDesc")} />
             ) : (
@@ -1188,6 +1320,27 @@ export function HostsPage() {
               <table className="pf-table pf-hosts-table">
                 <thead>
                   <tr>
+                    {canOperate ? (
+                      <th className="pf-hosts-table__check">
+                        <input
+                          type="checkbox"
+                          className="pf-checkbox-control"
+                          checked={allFilteredSelected}
+                          ref={(element) => {
+                            if (element) {
+                              element.indeterminate =
+                                selectedHostIds.length > 0 && !allFilteredSelected;
+                            }
+                          }}
+                          onChange={() =>
+                            setSelectedHostIds(
+                              allFilteredSelected ? [] : sortedHosts.map((host) => host.id)
+                            )
+                          }
+                          aria-label={t("hostSelection.selectAll")}
+                        />
+                      </th>
+                    ) : null}
                     <SortableTh<HostSortKey>
                       label={t("hosts.name")}
                       sortKey="name"
@@ -1254,8 +1407,23 @@ export function HostsPage() {
                   {visibleHosts.map((host) => (
                     <tr
                       key={host.id}
-                      className={editingId === host.id ? "pf-table__row--selected" : undefined}
+                      className={
+                        editingId === host.id || selectedHostIds.includes(host.id)
+                          ? "pf-table__row--selected"
+                          : undefined
+                      }
                     >
+                      {canOperate ? (
+                        <td className="pf-hosts-table__check">
+                          <input
+                            type="checkbox"
+                            className="pf-checkbox-control"
+                            checked={selectedHostIds.includes(host.id)}
+                            onChange={() => toggleHostSelected(host.id)}
+                            aria-label={host.name}
+                          />
+                        </td>
+                      ) : null}
                       <td>{host.name}</td>
                       <td className="pf-table__mono">{host.hostname}</td>
                       <td>{host.port}</td>

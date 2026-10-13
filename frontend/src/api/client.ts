@@ -594,11 +594,17 @@ export interface AuditFlowTemplateCredential {
   has_service_secret?: boolean;
 }
 
+export interface AuditFlowInventoryScope {
+  tags: string[];
+  site?: string | null;
+}
+
 export interface AuditFlowTemplate {
   id: number;
   name: string;
   description?: string | null;
   targets: string[];
+  inventory_scope?: AuditFlowInventoryScope | null;
   credentials: AuditFlowTemplateCredential[];
   save_to_inventory: boolean;
   cron_expression?: string | null;
@@ -796,6 +802,34 @@ export interface JobRun {
   check_mode?: boolean;
 }
 
+export interface CveRef {
+  cve_id: string;
+  summary?: string | null;
+  matched_by: "rule" | "package" | "rule_and_package";
+}
+
+export interface CveFeedEntry {
+  id: number;
+  cve_id: string;
+  requirement_id: string;
+  profile_name: string;
+  summary?: string | null;
+}
+
+export interface CveFeedEntryInput {
+  cve_id: string;
+  requirement_id: string;
+  profile_name: string;
+  summary?: string | null;
+}
+
+export interface CveFeedStatus {
+  loaded: boolean;
+  entry_count: number;
+  imported_at?: string | null;
+  entries?: CveFeedEntry[];
+}
+
 export interface CheckResult {
   id: number;
   host_id: number;
@@ -806,6 +840,7 @@ export interface CheckResult {
   raw_output?: string;
   is_waived?: boolean;
   waiver_id?: number | null;
+  cve_refs?: CveRef[];
 }
 
 export type WaiverStatus = "pending" | "approved" | "rejected" | "expired" | "revoked";
@@ -1197,6 +1232,59 @@ export interface SearchResponse {
   items: SearchResultItem[];
   query: string;
 }
+
+export type AuditMapService = {
+  id: number | null;
+  port: number;
+  protocol: string;
+  source: "connection" | "scan" | "manual" | string;
+  confirmed: boolean;
+  status: "pass" | "fail" | "error" | "unchecked" | string;
+  coverage_reason: "unchecked" | "no_profile" | null;
+};
+
+export type AuditMapViewName = "network" | "service" | "platform" | "profile";
+
+export type AuditMapNode = {
+  host_id: number;
+  name: string;
+  hostname: string;
+  ip: string | null;
+  dns: string | null;
+  port: number;
+  os_type: string | null;
+  site: string | null;
+  environment: string | null;
+  criticality: string | null;
+  tags: string[];
+  status: "pass" | "fail" | "error" | "unchecked";
+  last_job_run_id: number | null;
+  profile_id: number | null;
+  profile_name: string | null;
+  checks: { pass: number; fail: number; error: number } | null;
+  x: number | null;
+  y: number | null;
+  subnet: string | null;
+  services: AuditMapService[];
+};
+
+export type AuditMapPayload = {
+  site: string | null;
+  sites: string[];
+  has_unassigned: boolean;
+  truncated: boolean;
+  groups: { subnet: string | null; nodes: AuditMapNode[] }[];
+  views: Record<AuditMapViewName, { key: string | null; status: AuditMapNode["status"]; nodes: AuditMapNode[] }[]>;
+  layouts: Partial<Record<AuditMapViewName, { host_id: number; x: number; y: number }[]>>;
+  edges: {
+    id: number;
+    source_host_id: number;
+    source_port: number;
+    target_host_id: number;
+    target_port: number;
+  }[];
+  profiles: { id: number; name: string }[];
+};
 
 export const api = {
   health: () => request<{ status: string; app_name: string }>("/health"),
@@ -1660,6 +1748,33 @@ export const api = {
       "/hosts/bulk-delete",
       { method: "POST", body: JSON.stringify({ host_ids: hostIds }) }
     ),
+  bulkClassifyHosts: (data: {
+    host_ids: number[];
+    site?: string;
+    environment?: string;
+    criticality?: HostCriticality;
+  }) =>
+    request<{ updated: number[]; skipped: { host_id: number; detail: string }[] }>(
+      "/hosts/bulk-classify",
+      { method: "POST", body: JSON.stringify(data) }
+    ),
+  auditMap: (params?: { site?: string; environment?: string; criticality?: string; tag?: string; profile?: string }) =>
+    request<AuditMapPayload>(`/audit-map${buildQuery(params)}`),
+  confirmAuditMapService: (hostId: number, port: number) =>
+    request<AuditMapService>("/audit-map/services", {
+      method: "POST",
+      body: JSON.stringify({ host_id: hostId, port }),
+    }),
+  deleteAuditMapService: (serviceId: number) =>
+    request<void>(`/audit-map/services/${serviceId}`, { method: "DELETE" }),
+  createAuditMapEdge: (data: {
+    source_host_id: number;
+    source_port: number;
+    target_host_id: number;
+    target_port: number;
+  }) => request<AuditMapPayload["edges"][number]>("/audit-map/edges", { method: "POST", body: JSON.stringify(data) }),
+  deleteAuditMapEdge: (edgeId: number) =>
+    request<void>(`/audit-map/edges/${edgeId}`, { method: "DELETE" }),
   inventoryScans: () => request<InventoryScan[]>("/inventory/scans"),
   startInventoryScan: (data: {
     target: string;
@@ -1854,6 +1969,16 @@ export const api = {
       `report-${runId}.pdf`,
       locale
     ),
+  cveFeedStatus: () => request<CveFeedStatus>("/cve-feed"),
+  replaceCveFeed: (payload: unknown) =>
+    request<CveFeedStatus>("/cve-feed", { method: "PUT", body: JSON.stringify(payload) }),
+  clearCveFeed: () => request<CveFeedStatus>("/cve-feed", { method: "DELETE" }),
+  createCveFeedEntry: (payload: CveFeedEntryInput) =>
+    request<CveFeedStatus>("/cve-feed/entries", { method: "POST", body: JSON.stringify(payload) }),
+  updateCveFeedEntry: (id: number, payload: CveFeedEntryInput) =>
+    request<CveFeedStatus>(`/cve-feed/entries/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  deleteCveFeedEntry: (id: number) =>
+    request<CveFeedStatus>(`/cve-feed/entries/${id}`, { method: "DELETE" }),
   downloadReportCsv: (
     runId: number,
     filters?: { status?: string; severity?: string; host_id?: number | string; rule?: string }
@@ -2055,6 +2180,7 @@ export const api = {
       service_secret?: string;
     }>;
     save_to_inventory?: boolean;
+    inventory_scope?: { tags: string[]; site?: string | null } | null;
     cron_expression?: string;
     is_scheduled?: boolean;
     is_active?: boolean;
@@ -2075,6 +2201,7 @@ export const api = {
         service_secret?: string;
       }>;
       save_to_inventory?: boolean;
+      inventory_scope?: { tags: string[]; site?: string | null } | null;
       cron_expression?: string | null;
       is_scheduled?: boolean;
       is_active?: boolean;

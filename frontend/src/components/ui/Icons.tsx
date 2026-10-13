@@ -490,6 +490,16 @@ export function IconNetworkCompliance({ className }: IconProps) {
   );
 }
 
+/** Two group frames on a map — same stroke weight as the other navigation icons. */
+export function IconAuditMap({ className }: IconProps) {
+  return (
+    <StrokeIcon className={className}>
+      <rect x="3" y="4" width="11" height="8" rx="1.75" />
+      <rect x="10" y="12" width="11" height="8" rx="1.75" />
+    </StrokeIcon>
+  );
+}
+
 /** Network topology with wrench — remediation config generation. */
 export function IconNetworkRemediation({ className }: IconProps) {
   return (

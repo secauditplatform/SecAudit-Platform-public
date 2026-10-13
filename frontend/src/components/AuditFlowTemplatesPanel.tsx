@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, type AuditFlowRun, type AuditFlowTemplate } from "../api/client";
+import { api, type AuditFlowInventoryScope, type AuditFlowRun, type AuditFlowTemplate } from "../api/client";
 import { JobSchedulePicker, useScheduleLabels } from "./JobSchedulePicker";
 import { Badge } from "./ui/Badge";
 import { Button } from "./ui/Button";
@@ -21,6 +21,8 @@ import {
 type SaveDraft = {
   name: string;
   description: string;
+  tags: string[];
+  site: string;
   isScheduled: boolean;
   scheduleConfig: ScheduleConfig;
   isActive: boolean;
@@ -45,10 +47,77 @@ type AuditFlowTemplatesPanelProps = {
 const emptySave = (): SaveDraft => ({
   name: "",
   description: "",
+  tags: [],
+  site: "",
   isScheduled: false,
   scheduleConfig: { ...DEFAULT_SCHEDULE },
   isActive: true,
 });
+
+function scopeFromDraft(draft: SaveDraft): { tags: string[]; site: string | null } | null {
+  const tags = draft.tags.map((tag) => tag.trim()).filter(Boolean);
+  const site = draft.site.trim();
+  if (tags.length === 0 && !site) return null;
+  return { tags, site: site || null };
+}
+
+function draftFromScope(scope: AuditFlowInventoryScope | null | undefined): Pick<SaveDraft, "tags" | "site"> {
+  return {
+    tags: scope?.tags ?? [],
+    site: scope?.site ?? "",
+  };
+}
+
+function InventoryScopeFields({
+  idPrefix,
+  draft,
+  tags,
+  onChange,
+}: {
+  idPrefix: string;
+  draft: SaveDraft;
+  tags: Array<{ id: number; name: string }>;
+  onChange: (patch: Pick<SaveDraft, "tags" | "site">) => void;
+}) {
+  const { t } = useTranslation();
+  const toggleTag = (name: string) => {
+    const selected = draft.tags.includes(name);
+    onChange({
+      tags: selected ? draft.tags.filter((tag) => tag !== name) : [...draft.tags, name],
+      site: draft.site,
+    });
+  };
+  return (
+    <div className="pf-form__group">
+      <label>{t("auditFlow.inventoryScopeLabel")}</label>
+      <p className="pf-form__hint">{t("auditFlow.inventoryScopeHint")}</p>
+      {tags.length > 0 ? (
+        <div className="pf-audit-flow-inventory-import__tags" role="group" aria-label={t("auditFlow.inventoryScopeTags")}>
+          {tags.map((tag) => (
+            <button
+              key={tag.id}
+              type="button"
+              className={`pf-audit-flow-inventory-import__tag${draft.tags.includes(tag.name) ? " is-active" : ""}`}
+              onClick={() => toggleTag(tag.name)}
+            >
+              {tag.name}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <p className="pf-form__hint">{t("auditFlow.inventoryScopeNoTags")}</p>
+      )}
+      <label htmlFor={`${idPrefix}-site`}>{t("auditFlow.inventoryScopeSite")}</label>
+      <input
+        id={`${idPrefix}-site`}
+        className="pf-input"
+        value={draft.site}
+        placeholder={t("auditFlow.inventoryScopeAnySite")}
+        onChange={(event) => onChange({ tags: draft.tags, site: event.target.value })}
+      />
+    </div>
+  );
+}
 
 export function AuditFlowTemplatesPanel({
   canManage,
@@ -70,6 +139,11 @@ export function AuditFlowTemplatesPanel({
   const templates = useQuery({
     queryKey: ["audit-flow-templates"],
     queryFn: api.listAuditFlowTemplates,
+  });
+  const tagsQuery = useQuery({
+    queryKey: ["host-tags"],
+    queryFn: api.hostTags,
+    enabled: canManage,
   });
 
   const createMutation = useMutation({
@@ -95,6 +169,7 @@ export function AuditFlowTemplatesPanel({
         is_scheduled?: boolean;
         cron_expression?: string | null;
         is_active?: boolean;
+        inventory_scope?: { tags: string[]; site?: string | null } | null;
       };
     }) => api.updateAuditFlowTemplate(id, data),
     onSuccess: () => {
@@ -133,6 +208,9 @@ export function AuditFlowTemplatesPanel({
   const hasTemplates = items.length > 0;
   const targetsReady =
     draftTargets.flatMap((item) => item.split(/[\s,;\r\n]+/)).filter((item) => item.trim()).length > 0;
+  const saveScope = scopeFromDraft(saveForm);
+  const editScope = scopeFromDraft(editForm);
+  const canSave = targetsReady || saveScope != null;
   const targetCount = draftTargets.flatMap((item) => item.split(/[\s,;\r\n]+/)).filter((item) => item.trim())
     .length;
   const cronPreview = formatScheduleLabel(buildCronExpression(saveForm.scheduleConfig), scheduleLabels);
@@ -151,11 +229,13 @@ export function AuditFlowTemplatesPanel({
   };
 
   const submitSave = () => {
-    if (!saveForm.name.trim() || !targetsReady) return;
+    if (!saveForm.name.trim() || !canSave) return;
+    const written = draftTargets.flatMap((item) => item.split(/[\s,;\r\n]+/)).map((item) => item.trim()).filter(Boolean);
     createMutation.mutate({
       name: saveForm.name.trim(),
       description: saveForm.description.trim() || undefined,
-      targets: draftTargets,
+      targets: written,
+      inventory_scope: saveScope,
       credentials: draftCredentials,
       save_to_inventory: saveToInventory,
       is_scheduled: saveForm.isScheduled,
@@ -173,6 +253,7 @@ export function AuditFlowTemplatesPanel({
     setEditForm({
       name: template.name,
       description: template.description ?? "",
+      ...draftFromScope(template.inventory_scope),
       isScheduled: template.is_scheduled,
       scheduleConfig: parseCronExpression(template.cron_expression),
       isActive: template.is_active,
@@ -196,6 +277,7 @@ export function AuditFlowTemplatesPanel({
           ? buildCronExpression(editForm.scheduleConfig)
           : null,
         is_active: editForm.isActive,
+        inventory_scope: editScope,
       },
     });
   };
@@ -247,6 +329,13 @@ export function AuditFlowTemplatesPanel({
               </div>
             </div>
 
+            <InventoryScopeFields
+              idPrefix="af-template-scope"
+              draft={saveForm}
+              tags={tagsQuery.data ?? []}
+              onChange={(patch) => setSaveForm((prev) => ({ ...prev, ...patch }))}
+            />
+
             <JobSchedulePicker
               enabled={saveForm.isScheduled}
               config={saveForm.scheduleConfig}
@@ -275,8 +364,8 @@ export function AuditFlowTemplatesPanel({
             <Button
               type="button"
               className="pf-btn--sm"
-              disabled={!saveForm.name.trim() || !targetsReady || createMutation.isPending}
-              title={!targetsReady ? t("auditFlow.templatesNeedTargets") : undefined}
+              disabled={!saveForm.name.trim() || !canSave || createMutation.isPending}
+              title={!canSave ? t("auditFlow.templatesNeedTargets") : undefined}
               onClick={submitSave}
             >
               {t("auditFlow.saveTemplate")}
@@ -291,8 +380,6 @@ export function AuditFlowTemplatesPanel({
               <Button
                 type="button"
                 className="pf-btn--sm"
-                disabled={!targetsReady}
-                title={!targetsReady ? t("auditFlow.templatesNeedTargets") : undefined}
                 onClick={openSave}
               >
                 {t("auditFlow.saveAsTemplate")}
@@ -312,12 +399,7 @@ export function AuditFlowTemplatesPanel({
               />
               {canManage ? (
                 <div className="pf-audit-flow-templates__empty-action">
-                  <Button
-                    type="button"
-                    disabled={!targetsReady}
-                    title={!targetsReady ? t("auditFlow.templatesNeedTargets") : undefined}
-                    onClick={openSave}
-                  >
+                  <Button type="button" onClick={openSave}>
                     {t("auditFlow.saveAsTemplate")}
                   </Button>
                 </div>
@@ -347,8 +429,18 @@ export function AuditFlowTemplatesPanel({
                           <p className="pf-audit-flow-templates__description">{template.description}</p>
                         ) : null}
                         <p className="pf-audit-flow-templates__targets">
-                          {(template.targets || []).join(", ")}
+                          {(template.targets || []).join(", ") || t("auditFlow.inventoryScopeOnly")}
                         </p>
+                        {template.inventory_scope ? (
+                          <p className="pf-audit-flow-templates__targets">
+                            {t("auditFlow.inventoryScopeSummary", {
+                              tags: template.inventory_scope.tags.length
+                                ? template.inventory_scope.tags.join(", ")
+                                : t("auditFlow.inventoryScopeAnyTag"),
+                              site: template.inventory_scope.site || t("auditFlow.inventoryScopeAnySite"),
+                            })}
+                          </p>
+                        ) : null}
                         <div className="pf-audit-flow-templates__badges">
                           <Badge variant={template.is_active ? "success" : "neutral"}>
                             {template.is_active ? t("common.active") : t("common.inactive")}
@@ -428,6 +520,12 @@ export function AuditFlowTemplatesPanel({
                             />
                           </div>
                         </div>
+                        <InventoryScopeFields
+                          idPrefix={`af-template-scope-${template.id}`}
+                          draft={editForm}
+                          tags={tagsQuery.data ?? []}
+                          onChange={(patch) => setEditForm((prev) => ({ ...prev, ...patch }))}
+                        />
                         <JobSchedulePicker
                           enabled={editForm.isScheduled}
                           config={editForm.scheduleConfig}
@@ -459,7 +557,11 @@ export function AuditFlowTemplatesPanel({
                           <Button
                             type="button"
                             className="pf-btn--sm"
-                            disabled={!editForm.name.trim() || updateMutation.isPending}
+                            disabled={
+                              !editForm.name.trim() ||
+                              updateMutation.isPending ||
+                              ((template.targets || []).length === 0 && editScope == null)
+                            }
                             onClick={submitEdit}
                           >
                             {t("common.save")}

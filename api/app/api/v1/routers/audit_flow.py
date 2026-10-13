@@ -32,6 +32,7 @@ from app.services.audit_flow import (
     execute_run,
     load_run,
     present_run,
+    resolve_template_run_targets,
     snapshot_credentials,
     template_to_read,
     validate_credentials,
@@ -42,6 +43,7 @@ from app.services.dispatch import commit_and_try_dispatch, enqueue_run_dispatch
 from app.services.task_outbox import try_dispatch_outbox_immediate
 from app.services.object_rbac import apply_owner_scope, assert_can_access, assign_owner
 from app.services.scan_limits import resolve_max_cidr_prefix_len
+from secaudit_core.audit_flow_scope import normalize_inventory_scope
 from secaudit_core.audit_flow_state import (
     append_audit_flow_log,
     get_audit_flow_progress,
@@ -439,7 +441,11 @@ async def create_audit_flow_template(
     user: AuthUser = Depends(_OPERATE),
 ) -> AuditFlowTemplateRead:
     try:
-        targets = validate_targets(data.targets, max_prefix_len=resolve_max_cidr_prefix_len(user))
+        targets = (
+            validate_targets(data.targets, max_prefix_len=resolve_max_cidr_prefix_len(user))
+            if data.targets
+            else []
+        )
         creds = validate_credentials([item.model_dump() for item in data.credentials])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -448,10 +454,16 @@ async def create_audit_flow_template(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="AuditFlow template with this name already exists")
 
+    scope = (
+        normalize_inventory_scope(data.inventory_scope.model_dump())
+        if data.inventory_scope is not None
+        else None
+    )
     template = AuditFlowTemplate(
         name=data.name,
         description=(data.description or "").strip() or None,
         targets_json=targets,
+        inventory_scope_json=scope,
         credentials_json=snapshot_credentials(creds),
         save_to_inventory=bool(data.save_to_inventory),
         cron_expression=data.cron_expression if data.is_scheduled else None,
@@ -521,12 +533,28 @@ async def update_audit_flow_template(
         template.is_active = bool(payload["is_active"])
 
     if "targets" in payload:
+        written = [item for item in payload["targets"] or [] if str(item).strip()]
         try:
-            template.targets_json = validate_targets(
-                payload["targets"], max_prefix_len=resolve_max_cidr_prefix_len(user)
+            template.targets_json = (
+                validate_targets(written, max_prefix_len=resolve_max_cidr_prefix_len(user))
+                if written
+                else []
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if "inventory_scope" in payload:
+        raw_scope = payload["inventory_scope"]
+        template.inventory_scope_json = (
+            normalize_inventory_scope(raw_scope) if raw_scope else None
+        )
+    if not list(template.targets_json or []) and not normalize_inventory_scope(
+        template.inventory_scope_json
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="targets or inventory_scope is required",
+        )
 
     if "credentials" in payload:
         try:
@@ -597,9 +625,14 @@ async def run_audit_flow_template(
     if not template.is_active:
         raise HTTPException(status_code=400, detail="AuditFlow template is inactive")
 
+    try:
+        targets = await resolve_template_run_targets(db, template)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     run = AuditFlowRun(
         status=AuditFlowStatus.PENDING,
-        targets_json=list(template.targets_json or []),
+        targets_json=targets,
         save_to_inventory=bool(template.save_to_inventory),
         template_id=template.id,
     )

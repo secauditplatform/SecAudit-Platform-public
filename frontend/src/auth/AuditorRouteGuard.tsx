@@ -3,7 +3,7 @@ import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "./AuthProvider";
 
 const AUDITOR_ALLOWED_EXACT = new Set(["/"]);
-const AUDITOR_ALLOWED_PREFIXES = ["/overview", "/trends", "/reports"];
+const AUDITOR_ALLOWED_PREFIXES = ["/overview", "/trends", "/reports", "/audit-map"];
 
 const OPERATOR_ONLY_PATHS = new Set(["/console", "/credentials", "/audit-flow", "/playbooks"]);
 

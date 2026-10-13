@@ -2,8 +2,10 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -869,6 +871,8 @@ class AuditFlowTemplate(Base):
     name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     targets_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    # Tag and site rule. Resolved to hosts when a run starts, not stored as IPs.
+    inventory_scope_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Encrypted credential snapshots (ciphertext), never returned as plaintext.
     credentials_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     save_to_inventory: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -971,3 +975,80 @@ class AuditFlowHost(Base):
     run: Mapped["AuditFlowRun"] = relationship(back_populates="hosts")
     credential: Mapped["AuditFlowCredential | None"] = relationship()
     profile: Mapped["Profile | None"] = relationship()
+
+
+class AuditMapLayout(Base):
+    """Per-user node positions. A layout never creates a host."""
+
+    __tablename__ = "audit_map_layouts"
+    __table_args__ = (
+        UniqueConstraint("owner_sub", "host_id", "view", name="uq_audit_map_layout_owner_host_view"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_sub: Mapped[str] = mapped_column(String(256), nullable=False, index=True)
+    host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True)
+    view: Mapped[str] = mapped_column(String(32), nullable=False, default="network", server_default="network")
+    x: Mapped[float] = mapped_column(Float, nullable=False)
+    y: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class AuditMapService(Base):
+    """Operator-confirmed service on an existing host. Scan ports are not copied here."""
+
+    __tablename__ = "audit_map_services"
+    __table_args__ = (UniqueConstraint("host_id", "port", name="uq_audit_map_service_host_port"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class CveFeedEntry(Base):
+    """Customer-supplied CVE reference for a rule or profile package.
+
+    This is not a vulnerability scan result and does not affect check status.
+    """
+
+    __tablename__ = "cve_feed_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "cve_id",
+            "requirement_id",
+            "profile_name",
+            name="uq_cve_feed_entry",
+        ),
+        CheckConstraint(
+            "requirement_id <> '' OR profile_name <> ''",
+            name="ck_cve_feed_entry_target",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cve_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    requirement_id: Mapped[str] = mapped_column(String(128), nullable=False, default="", server_default="")
+    profile_name: Mapped[str] = mapped_column(String(256), nullable=False, default="", server_default="")
+    summary: Mapped[str | None] = mapped_column(Text)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class AuditMapEdge(Base):
+    """Manual 'checked together' link between two services. Not a host and not a cable."""
+
+    __tablename__ = "audit_map_edges"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_host_id",
+            "source_port",
+            "target_host_id",
+            "target_port",
+            name="uq_audit_map_edge_endpoints",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True)
+    source_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True)
+    target_port: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(256))

@@ -3,10 +3,12 @@ from fastapi import APIRouter
 from app.api.v1.routers import (
     api_keys,
     audit_flow,
+    audit_map,
     audit_logs,
     auth,
     categories,
     credentials,
+    cve_feed,
     dead_letters,
     directory,
     health,
@@ -44,12 +46,14 @@ api_router.include_router(hosts.router, prefix="/hosts", tags=["hosts"])
 api_router.include_router(inventory.router, prefix="/inventory", tags=["inventory"])
 api_router.include_router(directory.router, prefix="/directory", tags=["directory"])
 api_router.include_router(audit_flow.router, prefix="/audit-flow", tags=["audit-flow"])
+api_router.include_router(audit_map.router, prefix="/audit-map", tags=["audit-map"])
 api_router.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 api_router.include_router(network_operations.router, prefix="/network", tags=["network"])
 api_router.include_router(job_templates.router, prefix="/job-templates", tags=["job-templates"])
 api_router.include_router(remediations.router, prefix="/remediations", tags=["remediations"])
 api_router.include_router(playbooks.router, prefix="/playbooks", tags=["playbooks"])
 api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
+api_router.include_router(cve_feed.router, prefix="/cve-feed", tags=["cve-feed"])
 api_router.include_router(waivers.router, prefix="/waivers", tags=["waivers"])
 api_router.include_router(dead_letters.router, prefix="/dead-letters", tags=["dead-letters"])
 api_router.include_router(

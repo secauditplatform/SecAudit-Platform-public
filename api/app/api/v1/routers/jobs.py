@@ -17,9 +17,19 @@ from app.core.auth import AuthUser
 from app.core.roles import require_jobs_run, require_reports
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Host, Job, JobHost, JobRun, JobScope, JobStatus
+from app.models import Host, Job, JobHost, JobRun, JobScope, JobStatus, Profile
 from app.pagination import paginate_scalars, pagination_params
-from app.schemas import CheckResultRead, JobCreate, JobRead, JobRunDetail, JobRunRead, JobUpdate, PaginatedResponse
+from app.schemas import (
+    CheckResultRead,
+    CveRefRead,
+    JobCreate,
+    JobRead,
+    JobRunDetail,
+    JobRunRead,
+    JobUpdate,
+    PaginatedResponse,
+)
+from app.services.cve_feed import load_feed_entries, references_for_check
 from app.services.audit_log import log_audit_event
 from app.services.job_webhooks import apply_webhook_fields, webhook_read_fields
 from app.services.network_jobs import validate_job_scope
@@ -322,6 +332,12 @@ async def get_job_run(
         hosts_result = await db.execute(select(Host).where(Host.id.in_(host_ids)))
         hosts_by_id = {host.id: host for host in hosts_result.scalars().all()}
 
+    feed_entries = await load_feed_entries(db)
+    profile_name = None
+    if feed_entries and job_run.job and job_run.job.profile_id is not None:
+        profile = await db.get(Profile, job_run.job.profile_id)
+        profile_name = profile.profile_name if profile is not None else None
+
     check_results = []
     for check in job_run.check_results:
         host = hosts_by_id.get(check.host_id)
@@ -332,6 +348,22 @@ async def get_job_run(
         waiver = waived_map.get(check.id)
         if waiver is not None:
             payload = payload.model_copy(update={"is_waived": True, "waiver_id": waiver.id})
+        status_value = check.status.value if hasattr(check.status, "value") else str(check.status)
+        cve_refs = references_for_check(
+            feed_entries,
+            status=status_value,
+            rule_tech_name=check.rule_tech_name,
+            profile_name=profile_name,
+        )
+        if cve_refs:
+            payload = payload.model_copy(
+                update={
+                    "cve_refs": [
+                        CveRefRead(cve_id=ref.cve_id, summary=ref.summary, matched_by=ref.matched_by)
+                        for ref in cve_refs
+                    ]
+                }
+            )
         check_results.append(payload)
 
     return JobRunDetail(

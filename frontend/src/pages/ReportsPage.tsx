@@ -1,31 +1,26 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, type DiffRow, type DriftChange, type CheckResult, type JobRun } from "../api/client";
+import { CveFeedPanel } from "../components/CveFeedPanel";
 import { ScheduledReportsPanel } from "../components/ScheduledReportsPanel";
 import { ReportsRunsPanel } from "../components/ReportsRunsPanel";
 import { RemediationWorkflowPanel } from "../components/RemediationWorkflowPanel";
 import { CheckDistributionInsight, ComplianceSummaryInsight } from "../components/InsightSummary";
-import {
-  findProfileRule,
-  hasProfileRuleMetadata,
-  ProfileRuleMetadata,
-} from "../components/ProfileRuleDetail";
+import { ReportCheckDetails, type CheckResultFilterState } from "../components/ReportCheckDetails";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
 import { IconCheck } from "../components/ui/Icons";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Panel } from "../components/ui/Panel";
-import { SortableTh } from "../components/ui/SortableTh";
 import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
 import { useAuth } from "../auth/AuthProvider";
 import { useTranslation } from "../i18n/I18nProvider";
 import { useConfirm } from "../components/ui/ConfirmDialog";
-import { useTableSort } from "../hooks/useTableSort";
 
-import { checkStatusVariant, driftChangeVariant, severityVariant } from "../utils/statusVariant";
+import { checkStatusVariant, driftChangeVariant } from "../utils/statusVariant";
 import { findCheckResultHostId, parseRunId } from "../utils/reportDeepLink";
 
 function defaultBaselineRunId(
@@ -44,8 +39,6 @@ function defaultBaselineRunId(
 }
 
 const DRIFT_CHANGE_KEYS: DriftChange[] = ["improved", "regressed", "unchanged", "new", "removed"];
-
-type CheckSortKey = "host" | "rule" | "severity" | "status" | "message";
 
 function runStatusLabel(t: (key: string) => string, status: string): string {
   const key = `runStatus.${status}` as const;
@@ -81,7 +74,6 @@ export function ReportsPage() {
   const [checkMessageFilter, setCheckMessageFilter] = useState("");
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [downloading, setDownloading] = useState<"html" | "pdf" | "csv" | "pack" | null>(null);
-  const [expandedCheckId, setExpandedCheckId] = useState<number | null>(null);
   const [compareBaselineRunId, setCompareBaselineRunId] = useState<number | null>(null);
   const [driftChangeFilter, setDriftChangeFilter] = useState("all");
   const [driftHostFilter, setDriftHostFilter] = useState("all");
@@ -272,7 +264,6 @@ export function ReportsPage() {
   });
 
   useEffect(() => {
-    setExpandedCheckId(null);
     if (!urlHost && !urlHostId) {
       setCheckHostFilter("all");
     }
@@ -316,98 +307,21 @@ export function ReportsPage() {
     });
   }, [urlRunId, activeRunId, urlFocusChecks, detail.data, checkHostFilter]);
 
-  const toggleCheckDetails = (checkId: number) => {
-    setExpandedCheckId((current) => (current === checkId ? null : checkId));
+  const checkFilters: CheckResultFilterState = {
+    host: checkHostFilter,
+    rule: checkRuleFilter,
+    status: checkStatusFilter,
+    severity: checkSeverityFilter,
+    message: checkMessageFilter,
   };
 
-  const ruleLabels = useMemo(
-    () => ({
-      description: t("profiles.ruleDescription"),
-      risk: t("profiles.ruleRisk"),
-      location: t("profiles.ruleLocation"),
-      scapRuleId: t("profiles.scapRuleId"),
-    }),
-    [t]
-  );
-
-  const checkHostOptions = useMemo(() => {
-    if (!detail.data) return [];
-    return [...new Set(detail.data.check_results.map((row) => row.host_id))]
-      .sort((a, b) => hostLabel(a).localeCompare(hostLabel(b), undefined, { sensitivity: "base" }));
-  }, [detail.data, hostLabelById]);
-
-  const checkStatusOptions = useMemo(() => {
-    if (!detail.data) return [];
-    return [...new Set(detail.data.check_results.map((row) => row.status.toLowerCase()))].sort();
-  }, [detail.data]);
-
-  const checkSeverityOf = (ruleTechName: string): string => {
-    const rule = findProfileRule(profileRules.data, ruleTechName);
-    return (rule?.criticality || rule?.impact || "unknown").trim().toLowerCase();
+  const patchCheckFilters = (patch: Partial<CheckResultFilterState>) => {
+    if (patch.host !== undefined) setCheckHostFilter(patch.host);
+    if (patch.rule !== undefined) setCheckRuleFilter(patch.rule);
+    if (patch.status !== undefined) setCheckStatusFilter(patch.status);
+    if (patch.severity !== undefined) setCheckSeverityFilter(patch.severity);
+    if (patch.message !== undefined) setCheckMessageFilter(patch.message);
   };
-
-  const filteredCheckResults = useMemo(() => {
-    if (!detail.data) return [];
-    const ruleQuery = checkRuleFilter.trim().toLowerCase();
-    const messageQuery = checkMessageFilter.trim().toLowerCase();
-
-    return detail.data.check_results.filter((row) => {
-      if (checkHostFilter !== "all" && String(row.host_id) !== checkHostFilter) return false;
-      if (ruleQuery && !row.rule_tech_name.toLowerCase().includes(ruleQuery)) return false;
-      if (checkStatusFilter !== "all" && row.status.toLowerCase() !== checkStatusFilter) return false;
-      if (checkSeverityFilter !== "all" && checkSeverityOf(row.rule_tech_name) !== checkSeverityFilter.toLowerCase()) {
-        return false;
-      }
-      if (messageQuery && !(row.message ?? "").toLowerCase().includes(messageQuery)) return false;
-      return true;
-    });
-  }, [
-    detail.data,
-    checkHostFilter,
-    checkRuleFilter,
-    checkStatusFilter,
-    checkSeverityFilter,
-    checkMessageFilter,
-    profileRules.data,
-  ]);
-
-  const checkSortAccessor = useCallback(
-    (row: CheckResult, key: CheckSortKey) => {
-      if (key === "host") return hostLabel(row.host_id);
-      if (key === "rule") return row.rule_tech_name;
-      if (key === "severity") return checkSeverityOf(row.rule_tech_name);
-      if (key === "status") return row.status.toLowerCase();
-      return row.message ?? "";
-    },
-    [hostLabelById, profileRules.data]
-  );
-
-  const {
-    sortedRows: sortedCheckResults,
-    sort: checkSort,
-    toggleSort: toggleCheckSort,
-  } = useTableSort<CheckResult, CheckSortKey>(
-    filteredCheckResults,
-    { key: "host", direction: "asc" },
-    checkSortAccessor
-  );
-
-  const severityOptions = useMemo(() => {
-    if (!detail.data) return [];
-    const set = new Set<string>();
-    for (const row of detail.data.check_results) {
-      const sev = checkSeverityOf(row.rule_tech_name);
-      if (sev) set.add(sev);
-    }
-    return Array.from(set).sort();
-  }, [detail.data, profileRules.data]);
-
-  const hasActiveCheckFilters =
-    checkHostFilter !== "all" ||
-    checkRuleFilter.trim() !== "" ||
-    checkStatusFilter !== "all" ||
-    checkSeverityFilter !== "all" ||
-    checkMessageFilter.trim() !== "";
 
   const clearCheckFilters = () => {
     setCheckHostFilter("all");
@@ -415,6 +329,46 @@ export function ReportsPage() {
     setCheckStatusFilter("all");
     setCheckSeverityFilter("all");
     setCheckMessageFilter("");
+  };
+
+  const requestWaiver = (row: CheckResult) => {
+    if (profileId == null || selectedRun == null) return;
+    void (async () => {
+      const reason = await prompt({
+        title: t("waivers.requestTitle"),
+        subtitle: row.rule_tech_name,
+        message: t("waivers.requestMessage"),
+        label: t("waivers.reason"),
+        placeholder: t("waivers.reasonPlaceholder"),
+        confirmLabel: t("reports.requestWaiver"),
+      });
+      if (!reason) return;
+      const changeTicket = await prompt({
+        title: t("waivers.changeTicketPrompt"),
+        subtitle: row.rule_tech_name,
+        message: t("waivers.changeTicketMessage"),
+        label: t("waivers.changeTicket"),
+        placeholder: t("waivers.changeTicketPlaceholder"),
+        confirmLabel: t("common.save"),
+        required: false,
+      });
+      try {
+        await api.createWaiver({
+          profile_id: profileId,
+          rule_tech_name: row.rule_tech_name,
+          host_id: row.host_id,
+          job_id: selectedRun.job_id,
+          reason,
+          change_ticket: changeTicket?.trim() || null,
+        });
+        toast.success(t("waivers.requested"));
+        queryClient.invalidateQueries({ queryKey: ["waivers"] });
+        queryClient.invalidateQueries({ queryKey: ["run-detail", activeRunId] });
+        queryClient.invalidateQueries({ queryKey: ["summary", activeRunId] });
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : t("toast.genericError"));
+      }
+    })();
   };
 
   const multiCompareCandidates = useMemo(
@@ -518,6 +472,8 @@ export function ReportsPage() {
   return (
     <>
       <PageHeader title={t("reports.title")} description={t("reports.description")} />
+
+      <CveFeedPanel />
 
       {(canManageScheduledReports || canOperate) && (
         <Panel title={t("scheduledReports.title")} description={t("scheduledReports.description")} noPadding>
@@ -907,368 +863,21 @@ export function ReportsPage() {
 
       {activeRunId && detail.data && detail.data.check_results.length > 0 && (
         <div ref={checkDetailsRef}>
-        <Panel title={t("reports.checkDetails")} noPadding>
-          <div className="pf-check-details__filters">
-            <div className="pf-check-details__filters-grid">
-              <label className="pf-check-details__field" htmlFor="check-filter-host">
-                <span className="pf-check-details__field-label">{t("reports.host")}</span>
-                <select
-                  id="check-filter-host"
-                  className={`pf-select${checkHostFilter !== "all" ? " is-filtered" : ""}`}
-                  value={checkHostFilter}
-                  onChange={(event) => setCheckHostFilter(event.target.value)}
-                >
-                  <option value="all">{t("reports.allHosts")}</option>
-                  {checkHostOptions.map((hostId) => (
-                    <option key={hostId} value={String(hostId)}>
-                      {hostLabel(hostId)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="pf-check-details__field pf-check-details__field--grow" htmlFor="check-filter-rule">
-                <span className="pf-check-details__field-label">{t("reports.rule")}</span>
-                <input
-                  id="check-filter-rule"
-                  className={`pf-input${checkRuleFilter.trim() ? " is-filtered" : ""}`}
-                  type="search"
-                  value={checkRuleFilter}
-                  onChange={(event) => setCheckRuleFilter(event.target.value)}
-                  placeholder={t("reports.filterRulePlaceholder")}
-                />
-              </label>
-
-              <label className="pf-check-details__field" htmlFor="check-filter-severity">
-                <span className="pf-check-details__field-label">{t("reports.severity")}</span>
-                <select
-                  id="check-filter-severity"
-                  className={`pf-select${checkSeverityFilter !== "all" ? " is-filtered" : ""}`}
-                  value={checkSeverityFilter}
-                  onChange={(event) => setCheckSeverityFilter(event.target.value)}
-                >
-                  <option value="all">{t("reports.allSeverities")}</option>
-                  {severityOptions.map((severity) => (
-                    <option key={severity} value={severity}>
-                      {severity}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="pf-check-details__field" htmlFor="check-filter-status">
-                <span className="pf-check-details__field-label">{t("common.status")}</span>
-                <select
-                  id="check-filter-status"
-                  className={`pf-select${checkStatusFilter !== "all" ? " is-filtered" : ""}`}
-                  value={checkStatusFilter}
-                  onChange={(event) => setCheckStatusFilter(event.target.value)}
-                >
-                  <option value="all">{t("reports.allStatuses")}</option>
-                  {checkStatusOptions.map((status) => (
-                    <option key={status} value={status}>
-                      {status}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="pf-check-details__field pf-check-details__field--grow" htmlFor="check-filter-message">
-                <span className="pf-check-details__field-label">{t("reports.message")}</span>
-                <input
-                  id="check-filter-message"
-                  className={`pf-input${checkMessageFilter.trim() ? " is-filtered" : ""}`}
-                  type="search"
-                  value={checkMessageFilter}
-                  onChange={(event) => setCheckMessageFilter(event.target.value)}
-                  placeholder={t("reports.filterMessagePlaceholder")}
-                />
-              </label>
-            </div>
-
-            <div className="pf-check-details__filters-meta">
-              <p className="pf-filters__summary">
-                {hasActiveCheckFilters
-                  ? t("reports.filterResultsActive", {
-                      count: filteredCheckResults.length,
-                      total: detail.data.check_results.length,
-                    })
-                  : t("reports.filterShown", {
-                      count: filteredCheckResults.length,
-                      total: detail.data.check_results.length,
-                    })}
-              </p>
-
-              {hasActiveCheckFilters ? (
-                <div className="pf-check-details__chips" aria-label={t("profiles.clearFilters")}>
-                  {checkHostFilter !== "all" ? (
-                    <button
-                      type="button"
-                      className="pf-check-details__chip"
-                      onClick={() => setCheckHostFilter("all")}
-                    >
-                      <span className="pf-check-details__chip-key">{t("reports.host")}</span>
-                      <span className="pf-check-details__chip-val">
-                        {hostLabel(Number(checkHostFilter))}
-                      </span>
-                      <span className="pf-check-details__chip-x" aria-hidden>
-                        ×
-                      </span>
-                    </button>
-                  ) : null}
-                  {checkRuleFilter.trim() ? (
-                    <button
-                      type="button"
-                      className="pf-check-details__chip"
-                      onClick={() => setCheckRuleFilter("")}
-                    >
-                      <span className="pf-check-details__chip-key">{t("reports.rule")}</span>
-                      <span className="pf-check-details__chip-val">{checkRuleFilter.trim()}</span>
-                      <span className="pf-check-details__chip-x" aria-hidden>
-                        ×
-                      </span>
-                    </button>
-                  ) : null}
-                  {checkSeverityFilter !== "all" ? (
-                    <button
-                      type="button"
-                      className="pf-check-details__chip"
-                      onClick={() => setCheckSeverityFilter("all")}
-                    >
-                      <span className="pf-check-details__chip-key">{t("reports.severity")}</span>
-                      <span className="pf-check-details__chip-val">{checkSeverityFilter}</span>
-                      <span className="pf-check-details__chip-x" aria-hidden>
-                        ×
-                      </span>
-                    </button>
-                  ) : null}
-                  {checkStatusFilter !== "all" ? (
-                    <button
-                      type="button"
-                      className="pf-check-details__chip"
-                      onClick={() => setCheckStatusFilter("all")}
-                    >
-                      <span className="pf-check-details__chip-key">{t("common.status")}</span>
-                      <span className="pf-check-details__chip-val">{checkStatusFilter}</span>
-                      <span className="pf-check-details__chip-x" aria-hidden>
-                        ×
-                      </span>
-                    </button>
-                  ) : null}
-                  {checkMessageFilter.trim() ? (
-                    <button
-                      type="button"
-                      className="pf-check-details__chip"
-                      onClick={() => setCheckMessageFilter("")}
-                    >
-                      <span className="pf-check-details__chip-key">{t("reports.message")}</span>
-                      <span className="pf-check-details__chip-val">{checkMessageFilter.trim()}</span>
-                      <span className="pf-check-details__chip-x" aria-hidden>
-                        ×
-                      </span>
-                    </button>
-                  ) : null}
-                  <button type="button" className="pf-check-details__clear" onClick={clearCheckFilters}>
-                    {t("profiles.clearFilters")}
-                  </button>
-                </div>
-              ) : null}
-            </div>
-          </div>
-
-          <div className="pf-table-wrap">
-            <table className="pf-table pf-table--check-details">
-              <thead>
-                <tr>
-                  <SortableTh<CheckSortKey>
-                    label={t("reports.host")}
-                    sortKey="host"
-                    activeKey={checkSort.key}
-                    direction={checkSort.direction}
-                    onSort={toggleCheckSort}
-                  />
-                  <SortableTh<CheckSortKey>
-                    label={t("reports.rule")}
-                    sortKey="rule"
-                    activeKey={checkSort.key}
-                    direction={checkSort.direction}
-                    onSort={toggleCheckSort}
-                  />
-                  <SortableTh<CheckSortKey>
-                    label={t("reports.severity")}
-                    sortKey="severity"
-                    activeKey={checkSort.key}
-                    direction={checkSort.direction}
-                    onSort={toggleCheckSort}
-                  />
-                  <SortableTh<CheckSortKey>
-                    label={t("common.status")}
-                    sortKey="status"
-                    activeKey={checkSort.key}
-                    direction={checkSort.direction}
-                    onSort={toggleCheckSort}
-                  />
-                  <SortableTh<CheckSortKey>
-                    label={t("reports.message")}
-                    sortKey="message"
-                    activeKey={checkSort.key}
-                    direction={checkSort.direction}
-                    onSort={toggleCheckSort}
-                  />
-                  <th scope="col" />
-                </tr>
-              </thead>
-              <tbody>
-                {sortedCheckResults.length === 0 ? (
-                  <tr>
-                    <td colSpan={6}>
-                      <div className="pf-check-details__empty">
-                        <strong>{t("reports.noFilterResults")}</strong>
-                        <p>{t("reports.noFilterResultsDesc")}</p>
-                      </div>
-                    </td>
-                  </tr>
-                ) : (
-                sortedCheckResults.map((row) => {
-                  const ruleMeta = findProfileRule(profileRules.data, row.rule_tech_name);
-                  const hasDetails = hasProfileRuleMetadata(ruleMeta);
-                  const expanded = expandedCheckId === row.id;
-                  const severityLabel = (ruleMeta?.criticality || ruleMeta?.impact || "").toString().trim();
-                  const canRequestWaiver =
-                    canOperate &&
-                    profileId != null &&
-                    row.status.toLowerCase() === "fail" &&
-                    !row.is_waived;
-
-                  return (
-                    <Fragment key={row.id}>
-                      <tr>
-                        <td>
-                          <div className="pf-check-details__host">
-                            <span className="pf-check-details__host-name">{hostLabel(row.host_id)}</span>
-                            {hostLabel(row.host_id) !== `#${row.host_id}` ? (
-                              <span className="pf-table__mono pf-table__muted pf-check-details__host-id">
-                                #{row.host_id}
-                              </span>
-                            ) : null}
-                          </div>
-                        </td>
-                        <td
-                          className={`pf-table__mono${hasDetails ? " pf-table__rule-cell" : ""}`}
-                          onClick={hasDetails ? () => toggleCheckDetails(row.id) : undefined}
-                          onKeyDown={
-                            hasDetails
-                              ? (event) => {
-                                  if (event.key === "Enter" || event.key === " ") {
-                                    event.preventDefault();
-                                    toggleCheckDetails(row.id);
-                                  }
-                                }
-                              : undefined
-                          }
-                          role={hasDetails ? "button" : undefined}
-                          tabIndex={hasDetails ? 0 : undefined}
-                          aria-expanded={hasDetails ? expanded : undefined}
-                        >
-                          <span
-                            className={
-                              hasDetails
-                                ? `pf-table__rule-link${expanded ? " pf-table__rule-link--active" : ""}`
-                                : undefined
-                            }
-                          >
-                            {row.rule_tech_name}
-                          </span>
-                        </td>
-                        <td className="pf-check-details__severity">
-                          {severityLabel ? (
-                            <Badge variant={severityVariant(severityLabel)} literal>
-                              {severityLabel}
-                            </Badge>
-                          ) : (
-                            t("common.dash")
-                          )}
-                        </td>
-                        <td>
-                          <div className="pf-table__actions" style={{ justifyContent: "flex-start" }}>
-                            <Badge variant={checkStatusVariant(row.status)}>{row.status}</Badge>
-                            {row.is_waived ? (
-                              <Badge variant="info">{t("reports.waivedBadge")}</Badge>
-                            ) : null}
-                          </div>
-                        </td>
-                        <td>{row.message || t("common.dash")}</td>
-                        <td onClick={(e) => e.stopPropagation()}>
-                          {canRequestWaiver ? (
-                            <Button
-                              variant="secondary"
-                              className="pf-btn--sm"
-                              onClick={() => {
-                                if (profileId == null || selectedRun == null) return;
-                                void (async () => {
-                                  const reason = await prompt({
-                                    title: t("waivers.requestTitle"),
-                                    subtitle: row.rule_tech_name,
-                                    message: t("waivers.requestMessage"),
-                                    label: t("waivers.reason"),
-                                    placeholder: t("waivers.reasonPlaceholder"),
-                                    confirmLabel: t("reports.requestWaiver"),
-                                  });
-                                  if (!reason) return;
-                                  const changeTicket = await prompt({
-                                    title: t("waivers.changeTicketPrompt"),
-                                    subtitle: row.rule_tech_name,
-                                    message: t("waivers.changeTicketMessage"),
-                                    label: t("waivers.changeTicket"),
-                                    placeholder: t("waivers.changeTicketPlaceholder"),
-                                    confirmLabel: t("common.save"),
-                                    required: false,
-                                  });
-                                  try {
-                                    await api.createWaiver({
-                                      profile_id: profileId,
-                                      rule_tech_name: row.rule_tech_name,
-                                      host_id: row.host_id,
-                                      job_id: selectedRun.job_id,
-                                      reason,
-                                      change_ticket: changeTicket?.trim() || null,
-                                    });
-                                    toast.success(t("waivers.requested"));
-                                    queryClient.invalidateQueries({ queryKey: ["waivers"] });
-                                    queryClient.invalidateQueries({ queryKey: ["run-detail", activeRunId] });
-                                    queryClient.invalidateQueries({ queryKey: ["summary", activeRunId] });
-                                  } catch (err) {
-                                    toast.error(
-                                      err instanceof Error ? err.message : t("toast.genericError")
-                                    );
-                                  }
-                                })();
-                              }}
-                            >
-                              {t("reports.requestWaiver")}
-                            </Button>
-                          ) : null}
-                        </td>
-                      </tr>
-                      {expanded && ruleMeta && hasDetails && (
-                        <tr className="pf-table__detail-row">
-                          <td colSpan={6}>
-                            <div className="pf-profile-rule__body pf-profile-rule__body--table">
-                              <ProfileRuleMetadata rule={ruleMeta} labels={ruleLabels} />
-                            </div>
-                          </td>
-                        </tr>
-                      )}
-                    </Fragment>
-                  );
-                })
-                )}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
+          <ReportCheckDetails
+            rows={detail.data.check_results}
+            profileRules={profileRules.data}
+            hostLabel={hostLabel}
+            filters={checkFilters}
+            onFiltersChange={patchCheckFilters}
+            onClearFilters={clearCheckFilters}
+            resetKey={activeRunId}
+            canOperate={canOperate}
+            profileId={profileId}
+            onRequestWaiver={requestWaiver}
+          />
         </div>
       )}
+
 
       {activeRunId && detail.data && detail.data.check_results.length === 0 && !detail.isLoading && (
         <Panel title={t("reports.checkDetails")}>

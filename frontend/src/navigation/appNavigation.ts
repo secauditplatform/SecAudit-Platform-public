@@ -13,7 +13,8 @@ export type NavRouteId =
   | "waivers"
   | "auditLogs"
   | "overview"
-  | "auditFlow";
+  | "auditFlow"
+  | "auditMap";
 
 export type NavGroupId = "overview" | "audit" | "infrastructure" | "reports";
 
@@ -78,6 +79,7 @@ export const NAV_GROUPS: NavGroupConfig[] = [
       { id: "profiles", to: "/profiles", labelKey: "nav.profiles" },
       { id: "playbooks", to: "/playbooks", labelKey: "nav.playbooks", requiresOperate: true },
       { id: "auditFlow", to: "/audit-flow", labelKey: "nav.auditFlow", requiresOperate: true },
+      { id: "auditMap", to: "/audit-map", labelKey: "nav.auditMap", end: true },
       { id: "console", to: "/console", labelKey: "nav.console", requiresOperate: true },
       { id: "jobs", to: "/jobs", labelKey: "nav.operations" },
       { id: "waivers", to: "/waivers", labelKey: "nav.waivers" },
@@ -118,6 +120,11 @@ export const AUDITOR_NAV_GROUPS: NavGroupConfig[] = [
     ],
   },
   {
+    id: "audit",
+    labelKey: "nav.groups.audit",
+    items: [{ id: "auditMap", to: "/audit-map", labelKey: "nav.auditMap", end: true }],
+  },
+  {
     id: "reports",
     labelKey: "nav.groups.reports",
     items: [
@@ -145,6 +152,7 @@ export const ROUTE_BREADCRUMBS: Record<string, BreadcrumbConfig> = {
   "/network/remediation": { groupKey: "nav.groups.audit", pageKey: "operations.title" },
   "/waivers": { groupKey: "nav.groups.audit", pageKey: "nav.waivers" },
   "/hosts": { groupKey: "nav.groups.infrastructure", pageKey: "nav.hosts" },
+  "/audit-map": { groupKey: "nav.groups.audit", pageKey: "nav.auditMap" },
   "/credentials": { groupKey: "nav.groups.infrastructure", pageKey: "nav.credentials" },
   "/users": { groupKey: "nav.groups.infrastructure", pageKey: "nav.users" },
   "/trends": { groupKey: "nav.groups.reports", pageKey: "nav.trends" },

@@ -31,6 +31,9 @@ from app.models import (
 )
 from app.pagination import paginate_scalars, pagination_params
 from app.schemas import (
+    HostBulkClassifyRequest,
+    HostBulkClassifyResponse,
+    HostBulkClassifySkip,
     HostBulkDeleteConflict,
     HostBulkDeleteRequest,
     HostBulkDeleteResponse,
@@ -475,6 +478,64 @@ async def bulk_delete_hosts(
         )
 
     return HostBulkDeleteResponse(deleted=deleted, conflicts=conflicts)
+
+
+def _bulk_classify_changes(data: HostBulkClassifyRequest) -> dict[str, str]:
+    """Only fields the client sent with a non-blank value. Blank keeps the stored value."""
+    raw = data.model_dump(exclude_unset=True)
+    raw.pop("host_ids", None)
+    return {key: value for key, value in raw.items() if isinstance(value, str) and value}
+
+
+@router.post("/bulk-classify", response_model=HostBulkClassifyResponse)
+async def bulk_classify_hosts(
+    data: HostBulkClassifyRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> HostBulkClassifyResponse:
+    changes = _bulk_classify_changes(data)
+    if not changes:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    ids = list(dict.fromkeys(data.host_ids))
+    rows = await db.execute(select(Host).where(Host.id.in_(ids)))
+    by_id = {host.id: host for host in rows.scalars().all()}
+    updated: list[int] = []
+    skipped: list[HostBulkClassifySkip] = []
+
+    for host_id in ids:
+        host = by_id.get(host_id)
+        if host is None:
+            skipped.append(HostBulkClassifySkip(host_id=host_id, detail="Host not found"))
+            continue
+        try:
+            assert_can_access(user, host.owner_sub, detail="Host not found")
+        except HTTPException as exc:
+            skipped.append(HostBulkClassifySkip(host_id=host_id, detail=str(exc.detail)))
+            continue
+        for field, value in changes.items():
+            setattr(host, field, value)
+        updated.append(host_id)
+
+    if updated:
+        await db.flush()
+    if updated or skipped:
+        await log_audit_event(
+            db,
+            request,
+            user,
+            action="host.bulk_classify",
+            resource_type="host",
+            outcome="failed" if skipped and not updated else "success",
+            metadata={
+                "updated_count": len(updated),
+                "skipped_count": len(skipped),
+                "fields": sorted(changes),
+            },
+        )
+
+    return HostBulkClassifyResponse(updated=updated, skipped=skipped)
 
 
 @router.get("/tags", response_model=list[HostTagRead])

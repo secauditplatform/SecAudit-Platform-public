@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 
 import winrm
+from secaudit_core.inventory_scan import bracket_ipv6_host
 from secaudit_core.service_credentials import powershell_env_prefix
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.tracing import start_span
@@ -347,7 +348,7 @@ def _run_winrm_once(
     cancel_event: threading.Event | None,
 ) -> str:
     scheme = "https" if use_ssl else "http"
-    endpoint = f"{scheme}://{hostname}:{port}/wsman"
+    endpoint = f"{scheme}://{bracket_ipv6_host(hostname)}:{port}/wsman"
     span_attrs = {
         "secaudit.executor": "winrm",
         "net.peer.name": hostname,
@@ -426,7 +427,7 @@ def run_script_over_winrm(
         except Exception as exc:
             if not _is_connectivity_error(exc) or len(targets) == 1:
                 raise
-            errors.append(f"{scheme}://{hostname}:{target_port}/wsman: {exc}")
+            errors.append(f"{scheme}://{bracket_ipv6_host(hostname)}:{target_port}/wsman: {exc}")
 
     details = "\n".join(errors) if errors else "no WinRM endpoints attempted"
     endpoint_labels = ", ".join(f"{p}/{'https' if ssl else 'http'}" for p, ssl in targets)

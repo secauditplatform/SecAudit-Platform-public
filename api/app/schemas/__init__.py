@@ -515,6 +515,48 @@ class HostBulkDeleteRequest(BaseModel):
     host_ids: list[int] = Field(..., min_length=1)
 
 
+class HostBulkClassifyRequest(BaseModel):
+    """Set site, environment, and criticality on many hosts.
+
+    Omitted or blank fields are not written, so an empty input keeps the stored value.
+    """
+
+    host_ids: list[int] = Field(..., min_length=1, max_length=500)
+    site: str | None = None
+    environment: str | None = None
+    criticality: HostCriticality | None = None
+
+    @field_validator("site", "environment", mode="before")
+    @classmethod
+    def _normalize_site_environment(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        return _normalize_host_label(str(value), max_len=64)
+
+    @field_validator("criticality", mode="before")
+    @classmethod
+    def _normalize_criticality(cls, value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        cleaned = str(value).strip().lower()
+        if not cleaned:
+            return None
+        allowed = {"low", "medium", "high", "critical"}
+        if cleaned not in allowed:
+            raise ValueError("criticality must be one of: low, medium, high, critical")
+        return cleaned
+
+
+class HostBulkClassifySkip(BaseModel):
+    host_id: int
+    detail: str
+
+
+class HostBulkClassifyResponse(BaseModel):
+    updated: list[int]
+    skipped: list[HostBulkClassifySkip]
+
+
 class HostBulkDeleteConflict(BaseModel):
     host_id: int
     detail: str
@@ -958,15 +1000,15 @@ class JobTemplateBase(BaseModel):
     def validate_cron(cls, value: str | None) -> str | None:
         return validate_cron_expression(value)
 
-    @model_validator(mode="after")
-    def require_profile_or_playbook(self) -> "JobTemplateBase":
-        if not self.profile_id and not self.playbook_id:
-            raise ValueError("profile_id or playbook_id is required")
-        return self
-
 
 class JobTemplateCreate(JobTemplateBase):
     host_ids: list[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_profile_or_playbook(self) -> "JobTemplateCreate":
+        if not self.profile_id and not self.playbook_id:
+            raise ValueError("profile_id or playbook_id is required")
+        return self
 
 
 class JobTemplateUpdate(BaseModel):
@@ -1126,6 +1168,14 @@ class JobRunRead(BaseModel):
     check_mode: bool = False
 
 
+class CveRefRead(BaseModel):
+    """Advisory CVE note. It is not a check status."""
+
+    cve_id: str
+    summary: str | None = None
+    matched_by: Literal["rule", "package", "rule_and_package"]
+
+
 class CheckResultRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -1139,6 +1189,7 @@ class CheckResultRead(BaseModel):
     created_at: datetime
     is_waived: bool = False
     waiver_id: int | None = None
+    cve_refs: list[CveRefRead] = Field(default_factory=list)
 
 
 class JobRunDetail(JobRunRead):
@@ -1741,10 +1792,45 @@ class AuditFlowCreate(BaseModel):
     save_to_inventory: bool = False
 
 
+class AuditFlowInventoryScope(BaseModel):
+    """Tag and site rule stored on a template. Hosts are read at run time."""
+
+    tags: list[StrippedStr] = Field(default_factory=list, max_length=20)
+    site: str | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def clean_tags(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            tag = item.strip()[:64]
+            if not tag or tag.lower() in seen:
+                continue
+            seen.add(tag.lower())
+            cleaned.append(tag)
+        return cleaned
+
+    @field_validator("site", mode="before")
+    @classmethod
+    def clean_site(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        site = str(value).strip()[:64]
+        return site or None
+
+    @model_validator(mode="after")
+    def require_tag_or_site(self) -> "AuditFlowInventoryScope":
+        if not self.tags and not self.site:
+            raise ValueError("tag or site is required")
+        return self
+
+
 class AuditFlowTemplateCreate(BaseModel):
     name: StrippedStr = Field(..., min_length=1, max_length=128)
     description: str | None = None
-    targets: list[StrippedStr] = Field(..., min_length=1, max_length=16)
+    targets: list[StrippedStr] = Field(default_factory=list, max_length=16)
+    inventory_scope: AuditFlowInventoryScope | None = None
     credentials: list[AuditFlowCredentialIn] = Field(default_factory=list, max_length=20)
     save_to_inventory: bool = False
     cron_expression: str | None = None
@@ -1764,11 +1850,20 @@ class AuditFlowTemplateCreate(BaseModel):
             self.cron_expression = None
         return self
 
+    @model_validator(mode="after")
+    def require_targets_or_scope(self) -> "AuditFlowTemplateCreate":
+        written = [item for item in self.targets if item.strip()]
+        if not written and self.inventory_scope is None:
+            raise ValueError("targets or inventory_scope is required")
+        self.targets = written
+        return self
+
 
 class AuditFlowTemplateUpdate(BaseModel):
     name: StrippedStr | None = Field(default=None, min_length=1, max_length=128)
     description: str | None = None
-    targets: list[StrippedStr] | None = Field(default=None, min_length=1, max_length=16)
+    targets: list[StrippedStr] | None = Field(default=None, max_length=16)
+    inventory_scope: AuditFlowInventoryScope | None = None
     credentials: list[AuditFlowCredentialIn] | None = Field(default=None, max_length=20)
     save_to_inventory: bool | None = None
     cron_expression: str | None = None
@@ -1797,6 +1892,7 @@ class AuditFlowTemplateRead(BaseModel):
     name: str
     description: str | None = None
     targets: list[str] = Field(default_factory=list)
+    inventory_scope: AuditFlowInventoryScope | None = None
     credentials: list[AuditFlowTemplateCredentialRead] = Field(default_factory=list)
     save_to_inventory: bool = False
     cron_expression: str | None = None

@@ -21,6 +21,7 @@ _DEMO_BLOCK_WRITE_PREFIXES = (
     "/api/v1/job-templates",
     "/api/v1/remediations",
     "/api/v1/audit-flow",
+    "/api/v1/audit-map",
     "/api/v1/inventory",
     "/api/v1/playbooks",
     "/api/v1/credentials",

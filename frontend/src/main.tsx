@@ -1,7 +1,7 @@
 import { QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { StrictMode, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { setAuthToken } from "./api/client";
 import { shouldClearQueryCacheOnIdentityChange } from "./auth/clearAuthArtifacts";
 import { AuthProvider, useAuth } from "./auth/AuthProvider";
@@ -27,6 +27,7 @@ import { WaiversPage } from "./pages/WaiversPage";
 import { TrendsPage } from "./pages/TrendsPage";
 import { AuditLogsPage } from "./pages/AuditLogsPage";
 import { AuditFlowPage } from "./pages/AuditFlowPage";
+import { AuditMapPage } from "./pages/AuditMapPage";
 import { UsersPage } from "./pages/UsersPage";
 import "./index.css";
 
@@ -71,6 +72,8 @@ createRoot(document.getElementById("root")!).render(
                       <Route path="audit-flow" element={<AuditFlowPage />} />
                       <Route path="console" element={<ConsolePage />} />
                       <Route path="hosts" element={<HostsPage />} />
+                      <Route path="audit-map" element={<AuditMapPage />} />
+                      <Route path="audit-map/coverage" element={<Navigate to="/audit-map" replace />} />
                       <Route path="credentials" element={<CredentialsPage />} />
                       <Route path="users" element={<UsersPage />} />
                       <Route path="jobs" element={<JobsPage />} />
