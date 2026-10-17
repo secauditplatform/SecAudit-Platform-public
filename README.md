@@ -28,10 +28,11 @@ It is built for security and infrastructure teams that need a controlled, audita
 
 ## What's new in v1.7.0
 
-- **AAG is advisory** — AI Audit Generation is its own navigation group. The model explains a finished check or drafts a custom profile. It does not write check results, start a job, or start remediation.
-- **One working provider** — the administrator saves an internal model or an external HTTPS API and turns the contour on for the selected row. The key is stored encrypted and is never shown back. While the contour is off, every saved provider stays offline. A call can wait up to 120 minutes.
-- **Explain a finished run** — the operator picks FAIL or ERROR rows. A factual sentence cites the run and the rule, and a sentence without a citation is marked. The same completed request is served again from the saved result. A failed request can be run again.
-- **Custom profile from a prompt** — Generate checks the package with the same validator as import. A valid package joins the profile list as `custom`. An existing name is not overwritten, and no job starts. Official CIS, STIG, and FSTEC names are rejected. A failed generation can be run again.
+v1.7.0 adds AAG, an assistant that sits beside the audit. It can explain a finished check or draft a custom profile. It does not write results, start a job, or start remediation.
+
+- **An explanation stays tied to the run** — the operator chooses FAIL or ERROR rows. Each sentence cites that run and that rule, and a sentence without a citation is marked. A finished answer is kept and shown again. A failed one can be asked again.
+- **A prompt can become a profile** — the draft passes the same validator as an import, then joins the profile list as `custom`. An existing name is left untouched, and nothing is scheduled to run. A name that presents the package as an official baseline is refused.
+- **One provider, chosen by an administrator** — an internal model or an external HTTPS API. The key is stored encrypted and is never shown back. Until that provider is turned on, every saved provider stays offline. A call can wait up to 120 minutes.
 
 ## What's new in v1.6.0
 
