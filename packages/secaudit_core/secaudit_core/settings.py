@@ -7,7 +7,7 @@ class SecAuditSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
-    app_version: str = "1.6.0"
+    app_version: str = "1.7.0"
     secret_key: str = "dev-secret-key"
 
     # Data-at-rest encryption backend: fernet (dev), vault (Transit), aws_kms (BYO-KMS).
@@ -89,6 +89,16 @@ class SecAuditSettings(BaseSettings):
 
     scheduled_reports_enabled: bool = True
     object_rbac_enabled: bool = True
+    # AAG (AI Audit Generation): advisory-only contour, off by default.
+    # Task screens never write check results; provider is perimeter-local or external API.
+    ai_enabled: bool = False
+    ai_provider: str = "none"
+    ai_internal_base_url: str | None = None
+    ai_external_base_url: str | None = None
+    ai_model: str | None = None
+    ai_timeout_seconds: int = 120 * 60
+    ai_max_tokens: int = 2000
+    ai_retry_on_network_error: bool = True
     s3_endpoint_url: str | None = None
     s3_region: str = "us-east-1"
     s3_bucket: str | None = None

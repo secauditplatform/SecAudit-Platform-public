@@ -21,6 +21,9 @@ from secaudit_core.enums import (
     WaiverStatus,
 )
 from secaudit_core.models import (
+    AagArtifact,
+    AagCallLog,
+    AagProviderConfig,
     ApiKey,
     AuditFlowCredential,
     AuditFlowHost,
@@ -69,6 +72,9 @@ from secaudit_core.models import (
 
 __all__ = [
     "Base",
+    "AagArtifact",
+    "AagCallLog",
+    "AagProviderConfig",
     "ApiKey",
     "AuditFlowCredential",
     "AuditFlowHost",

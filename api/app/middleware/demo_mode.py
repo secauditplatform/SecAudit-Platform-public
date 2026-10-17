@@ -37,6 +37,7 @@ _DEMO_BLOCK_WRITE_PREFIXES = (
     "/api/v1/dead-letters",
     "/api/v1/reports",
     "/api/v1/ws",
+    "/api/v1/aag",
 )
 
 

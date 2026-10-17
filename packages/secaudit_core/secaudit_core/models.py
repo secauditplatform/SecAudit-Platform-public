@@ -1052,3 +1052,90 @@ class AuditMapEdge(Base):
     target_host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True)
     target_port: Mapped[int] = mapped_column(Integer, nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(256))
+
+
+class AagProviderConfig(Base):
+    """Saved AAG providers. One selected row is the working provider.
+
+    Task screens read the selected row. The external API key is stored encrypted
+    and is never returned, logged, or written to call artifacts.
+    """
+
+    __tablename__ = "aag_provider_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False, default="none", server_default="none")
+    # Admin switch from the Connection screen. Off until an administrator saves it on.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # The working provider. Other saved rows stay offline.
+    selected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    internal_base_url: Mapped[str | None] = mapped_column(String(2048))
+    external_base_url: Mapped[str | None] = mapped_column(String(2048))
+    model_name: Mapped[str | None] = mapped_column(String(256))
+    encrypted_external_key: Mapped[str | None] = mapped_column(Text)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=7200, server_default="7200", nullable=False)
+    max_tokens: Mapped[int] = mapped_column(Integer, default=2000, server_default="2000", nullable=False)
+    updated_by: Mapped[str | None] = mapped_column(String(256))
+    last_test_ok: Mapped[bool | None] = mapped_column(Boolean)
+    last_test_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AagCallLog(Base):
+    """AAG provider call journal without prompts and without keys.
+
+    The row records where a request went and how it ended. It never stores the
+    prompt, the model text, or the API key.
+    """
+
+    __tablename__ = "aag_call_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    target_host: Mapped[str | None] = mapped_column(String(512))
+    model_name: Mapped[str | None] = mapped_column(String(256))
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str | None] = mapped_column(String(16))
+    draft_type: Mapped[str | None] = mapped_column(String(32))
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False, default="ok", server_default="ok")
+    error_code: Mapped[str | None] = mapped_column(String(32))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    run_id: Mapped[int | None] = mapped_column(Integer)
+    in_perimeter: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    token_count: Mapped[int | None] = mapped_column(Integer)
+    created_by: Mapped[str | None] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
+class AagArtifact(Base):
+    """One AAG task result, stored apart from job results.
+
+    The prompt stored here is already redacted. The external API key is never
+    written on this row. A failure here does not change a compliance run.
+    """
+
+    __tablename__ = "aag_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    requested_by: Mapped[str | None] = mapped_column(String(256))
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(256))
+    target_host: Mapped[str | None] = mapped_column(String(512))
+    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_redacted: Mapped[str] = mapped_column(Text, nullable=False)
+    response_text: Mapped[str | None] = mapped_column(Text)
+    citations_json: Mapped[dict | None] = mapped_column(JSON)
+    meta_json: Mapped[dict | None] = mapped_column(JSON)
+    run_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

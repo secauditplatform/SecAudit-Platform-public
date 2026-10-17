@@ -27,6 +27,9 @@ import {
   IconPlatformOverview,
   IconPlaybook,
   IconRemediation,
+  IconAagConnection,
+  IconAagExplain,
+  IconAagGenerate,
   IconReports,
   IconTrends,
   IconTemplates,
@@ -53,6 +56,9 @@ const NAV_ICONS: Record<NavRouteId, typeof IconDashboard> = {
   auditLogs: IconAudit,
   overview: IconPlatformOverview,
   auditMap: IconAuditMap,
+  aagConnection: IconAagConnection,
+  aagExplain: IconAagExplain,
+  aagGenerate: IconAagGenerate,
 };
 
 function readSidebarCollapsed(): boolean {

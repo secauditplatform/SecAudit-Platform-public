@@ -135,7 +135,7 @@ function listQuery(params?: ListParams): string {
   return qs ? `?${qs}` : "";
 }
 
-function buildQuery(params?: Record<string, string | number | undefined | null>): string {
+function buildQuery(params?: Record<string, string | number | boolean | undefined | null>): string {
   if (!params) return "";
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
@@ -798,6 +798,7 @@ export interface JobRun {
   status: string;
   started_at?: string;
   finished_at?: string;
+  created_at?: string;
   error_message?: string;
   check_mode?: boolean;
 }
@@ -1286,6 +1287,161 @@ export type AuditMapPayload = {
   profiles: { id: number; name: string }[];
 };
 
+export type AagProvider = "none" | "internal" | "external";
+
+export interface AagStatus {
+  enabled: boolean;
+  provider: AagProvider;
+  model_name?: string | null;
+  reachable?: boolean | null;
+  demo_mode: boolean;
+}
+
+export interface AagConnection {
+  id?: number | null;
+  provider: AagProvider;
+  internal_base_url?: string | null;
+  external_base_url?: string | null;
+  model_name?: string | null;
+  has_external_key: boolean;
+  enabled: boolean;
+  selected?: boolean;
+  timeout_seconds: number;
+  max_tokens: number;
+  updated_by?: string | null;
+  updated_at?: string | null;
+}
+
+export interface AagConnectionInput {
+  id?: number | null;
+  provider: AagProvider;
+  enabled?: boolean;
+  internal_base_url?: string | null;
+  external_base_url?: string | null;
+  model_name?: string | null;
+  external_api_key?: string | null;
+  timeout_seconds?: number;
+  max_tokens?: number;
+}
+
+export interface AagConnectionTestResult {
+  ok: boolean;
+  provider: AagProvider;
+  host?: string | null;
+  model_name?: string | null;
+  message: string;
+}
+
+export interface AagCallLogEntry {
+  id: number;
+  provider: string;
+  target_host?: string | null;
+  model_name?: string | null;
+  input_hash: string;
+  kind?: string | null;
+  draft_type?: string | null;
+  outcome?: string | null;
+  error_code?: string | null;
+  duration_ms?: number | null;
+  run_id?: number | null;
+  in_perimeter?: boolean;
+  token_count?: number | null;
+  created_by?: string | null;
+  created_at: string;
+}
+
+export type AagTaskKind = "explain" | "generate";
+
+export interface AagTaskInput {
+  kind: AagTaskKind;
+  prompt?: string | null;
+  run_id?: number | null;
+  compare_run_id?: number | null;
+  rule_tech_name?: string | null;
+  host_id?: number | null;
+  check_ids?: number[];
+  profile_name?: string | null;
+  profile_version?: string | null;
+  target_kind?: "os" | "software";
+  target_name?: string | null;
+  target_vendor?: string | null;
+  target_version?: string | null;
+  overview?: string | null;
+  purpose?: string | null;
+  script_kind?: "sh" | "ps1" | "py";
+}
+
+export interface AagExplainCandidate {
+  id: number;
+  rule_tech_name: string;
+  host_id: number;
+  host_name?: string | null;
+  os_type?: string | null;
+  message?: string | null;
+  rule_text?: string | null;
+  rule_title?: string | null;
+  has_remediation: boolean;
+  status: string;
+}
+
+export interface AagParagraph {
+  text: string;
+  confirmed: boolean;
+  is_fact: boolean;
+}
+
+export interface AagExplainSection {
+  rule: string;
+  host: string;
+  status: string;
+  what: string;
+  checked: string;
+  did: string;
+  confirmed: boolean;
+}
+
+export interface AagPackageDraft {
+  description: Record<string, unknown>;
+  rules: Record<string, unknown>;
+  script_name: string;
+  script: string;
+}
+
+export interface AagArtifact {
+  id: number;
+  kind: AagTaskKind;
+  status: "pending" | "completed" | "failed" | string;
+  provider: string;
+  model_name?: string | null;
+  target_host?: string | null;
+  in_perimeter: boolean;
+  input_hash: string;
+  prompt_redacted: string;
+  response_text?: string | null;
+  citations_json?: { run_id?: number; rule_tech_name?: string; host_id?: number } | null;
+  meta_json?: {
+    files?: AagPackageDraft | null;
+    validation_errors?: string[];
+    imported_profile_name?: string;
+    profile_name?: string;
+    checks?: { rule: string; host?: string; status: string; title?: string }[];
+  } | null;
+  paragraphs?: AagParagraph[];
+  explain_sections?: AagExplainSection[];
+  host_filter?: {
+    site?: string;
+    environment?: string;
+    tag?: string;
+    os_type?: string;
+    criticality?: string;
+    active_only?: boolean;
+  } | null;
+  error_message?: string | null;
+  requested_by?: string | null;
+  created_at: string;
+  finished_at?: string | null;
+}
+
 export const api = {
   health: () => request<{ status: string; app_name: string }>("/health"),
   categories: () => request<Category[]>("/categories"),
@@ -1714,7 +1870,16 @@ export const api = {
       body: JSON.stringify(data),
     }),
   deletePlaybook: (id: number) => request<void>(`/playbooks/${id}`, { method: "DELETE" }),
-  hosts: (params?: ListParams) => request<PaginatedResponse<Host>>(`/hosts${listQuery(params)}`),
+  hosts: (
+    params?: ListParams & {
+      site?: string;
+      environment?: string;
+      tag?: string;
+      os_type?: string;
+      criticality?: string;
+      active_only?: boolean;
+    },
+  ) => request<PaginatedResponse<Host>>(`/hosts${buildQuery(params)}`),
   getHost: (id: number) => request<Host>(`/hosts/${id}`),
   hostTags: () => request<{ id: number; name: string; created_at: string }[]>("/hosts/tags"),
   setHostTags: (hostId: number, tagNames: string[]) =>
@@ -2253,4 +2418,31 @@ export const api = {
   executeAuditFlow: (id: number) =>
     request<AuditFlowRun>(`/audit-flow/runs/${id}/execute`, { method: "POST" }),
   deleteAuditFlowRun: (id: number) => request<void>(`/audit-flow/runs/${id}`, { method: "DELETE" }),
+  aagStatus: () => request<AagStatus>("/aag/status"),
+  aagConnection: () => request<AagConnection>("/aag/connection"),
+  aagProviders: () => request<AagConnection[]>("/aag/providers"),
+  saveAagConnection: (data: AagConnectionInput) =>
+    request<AagConnection>("/aag/connection", { method: "PUT", body: JSON.stringify(data) }),
+  selectAagProvider: (id: number) =>
+    request<AagConnection>(`/aag/providers/${id}/select`, { method: "POST" }),
+  deleteAagProvider: (id: number) => request<void>(`/aag/providers/${id}`, { method: "DELETE" }),
+  testAagConnection: (providerId?: number) =>
+    request<AagConnectionTestResult>(
+      `/aag/connection/test${providerId != null ? buildQuery({ provider_id: providerId }) : ""}`,
+      { method: "POST" },
+    ),
+  aagCalls: (params?: ListParams) =>
+    request<PaginatedResponse<AagCallLogEntry>>(`/aag/calls${listQuery(params)}`),
+  deleteAagCall: (id: number) => request<void>(`/aag/calls/${id}`, { method: "DELETE" }),
+  aagTasks: (params?: { kind?: AagTaskKind; offset?: number; limit?: number }) =>
+    request<PaginatedResponse<AagArtifact>>(`/aag/tasks${buildQuery(params)}`),
+  createAagTask: (data: AagTaskInput) =>
+    request<AagArtifact>("/aag/tasks", { method: "POST", body: JSON.stringify(data) }),
+  deleteAagTask: (id: number) => request<void>(`/aag/tasks/${id}`, { method: "DELETE" }),
+  retryAagTask: (id: number) => request<AagArtifact>(`/aag/tasks/${id}/retry`, { method: "POST" }),
+  aagExplainCandidates: (runId: number) =>
+    request<AagExplainCandidate[]>(`/aag/explain/candidates${buildQuery({ run_id: runId })}`),
+  saveAagPackage: (id: number, data: AagPackageDraft) =>
+    request<AagArtifact>(`/aag/tasks/${id}/draft`, { method: "PUT", body: JSON.stringify(data) }),
+  acceptAagPackage: (id: number) => request<AagArtifact>(`/aag/tasks/${id}/accept`, { method: "POST" }),
 };

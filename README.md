@@ -26,6 +26,13 @@ It is built for security and infrastructure teams that need a controlled, audita
 - **Security built in** — Keycloak OIDC or local users, object-level RBAC, encrypted credentials, audit trail, and SIEM export.
 - **Production-ready packaging** — develop on lab Compose; deploy with hardened Compose or Helm on your infrastructure.
 
+## What's new in v1.7.0
+
+- **AAG is advisory** — AI Audit Generation is its own navigation group. The model explains a finished check or drafts a custom profile. It does not write check results, start a job, or start remediation.
+- **One working provider** — the administrator saves an internal model or an external HTTPS API and turns the contour on for the selected row. The key is stored encrypted and is never shown back. While the contour is off, every saved provider stays offline. A call can wait up to 120 minutes.
+- **Explain a finished run** — the operator picks FAIL or ERROR rows. A factual sentence cites the run and the rule, and a sentence without a citation is marked. The same completed request is served again from the saved result. A failed request can be run again.
+- **Custom profile from a prompt** — Generate checks the package with the same validator as import. A valid package joins the profile list as `custom`. An existing name is not overwritten, and no job starts. Official CIS, STIG, and FSTEC names are rejected. A failed generation can be run again.
+
 ## What's new in v1.6.0
 
 - **One IPv6 address is a scan target** — a single IPv6 address, or a hostname that resolves to AAAA, reaches nmap, SSH/WinRM, and the report as an address. An IPv6 prefix is rejected in the UI.

@@ -23,6 +23,7 @@ from app.models import (
     WaiverStatus,
 )
 
+from secaudit_core.aag_client import AAG_MAX_TIMEOUT_SECONDS
 from secaudit_core.cron import validate_cron_expression
 from secaudit_core.sensitive_data import reject_secret_config
 
@@ -2031,4 +2032,194 @@ class AuditFlowLogEntry(BaseModel):
     level: str
     message: str
     timestamp: str
+
+
+# --- AAG (AI Audit Generation): AAG-0 connection ---
+
+AagProvider = Literal["none", "internal", "external"]
+
+
+class AagStatusRead(BaseModel):
+    enabled: bool
+    provider: AagProvider
+    model_name: str | None = None
+    reachable: bool | None = None
+    demo_mode: bool = False
+
+
+class AagConnectionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    provider: AagProvider
+    internal_base_url: str | None = None
+    external_base_url: str | None = None
+    model_name: str | None = None
+    # The external key itself is never returned — only whether one is stored.
+    has_external_key: bool = False
+    enabled: bool = False
+    selected: bool = False
+    timeout_seconds: int = 30
+    max_tokens: int = 2000
+    updated_by: str | None = None
+    updated_at: datetime | None = None
+
+
+class AagConnectionUpdate(BaseModel):
+    id: int | None = None
+    provider: AagProvider
+    enabled: bool = False
+    internal_base_url: str | None = None
+    external_base_url: str | None = None
+    model_name: str | None = None
+    external_api_key: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1, le=AAG_MAX_TIMEOUT_SECONDS)
+    max_tokens: int | None = Field(default=None, ge=1, le=1_000_000)
+
+    _strip_urls = field_validator(
+        "internal_base_url", "external_base_url", "model_name", mode="before"
+    )(_strip_str)
+
+
+class AagConnectionTestRead(BaseModel):
+    ok: bool
+    provider: AagProvider
+    host: str | None = None
+    model_name: str | None = None
+    message: str
+
+
+class AagCallLogRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    provider: str
+    target_host: str | None = None
+    model_name: str | None = None
+    input_hash: str
+    kind: str | None = None
+    draft_type: str | None = None
+    outcome: str = "ok"
+    error_code: str | None = None
+    duration_ms: int | None = None
+    run_id: int | None = None
+    in_perimeter: bool = False
+    token_count: int | None = None
+    created_by: str | None = None
+    created_at: datetime
+
+
+AagTaskKind = Literal["explain", "generate"]
+
+
+class AagTaskCreate(BaseModel):
+    """Task screens send refs and a phrase. A URL or key here is rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: AagTaskKind
+    prompt: str | None = Field(default=None, max_length=8000)
+    run_id: int | None = None
+    compare_run_id: int | None = None
+    rule_tech_name: str | None = Field(default=None, max_length=256)
+    host_id: int | None = Field(default=None, ge=1)
+    check_ids: list[int] = Field(default_factory=list, max_length=25)
+    profile_name: str | None = Field(default=None, max_length=128)
+    profile_version: str | None = Field(default=None, max_length=32)
+    target_kind: Literal["os", "software"] | None = None
+    target_name: str | None = Field(default=None, max_length=128)
+    target_vendor: str | None = Field(default=None, max_length=128)
+    target_version: str | None = Field(default=None, max_length=64)
+    overview: str | None = Field(default=None, max_length=500)
+    purpose: str | None = Field(default=None, max_length=2000)
+    script_kind: Literal["sh", "ps1", "py"] | None = None
+
+    @field_validator(
+        "profile_version",
+        "target_name",
+        "target_vendor",
+        "target_version",
+        "overview",
+        "purpose",
+    )
+    @classmethod
+    def _blank_profile_field(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt_not_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            raise ValueError("Task text is empty")
+        return text
+
+
+class AagExplainCandidate(BaseModel):
+    id: int
+    rule_tech_name: str
+    host_id: int
+    host_name: str | None = None
+    os_type: str | None = None
+    message: str | None = None
+    rule_text: str | None = None
+    rule_title: str | None = None
+    has_remediation: bool = False
+    status: str
+
+
+class AagParagraph(BaseModel):
+    text: str
+    confirmed: bool = False
+    is_fact: bool = True
+
+
+class AagExplainSection(BaseModel):
+    """One check, split into what it is, what it verifies, and what the run recorded."""
+
+    rule: str = ""
+    host: str = ""
+    status: str = ""
+    what: str = ""
+    checked: str = ""
+    did: str = ""
+    confirmed: bool = False
+
+
+class AagPackageDraft(BaseModel):
+    """Edited package files. The server validates them; there is no separate check button."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: dict
+    rules: dict
+    script_name: str = Field(min_length=1, max_length=128)
+    script: str = ""
+
+
+class AagArtifactRead(BaseModel):
+    id: int
+    kind: str
+    status: str
+    provider: str
+    model_name: str | None = None
+    target_host: str | None = None
+    in_perimeter: bool
+    input_hash: str
+    prompt_redacted: str
+    response_text: str | None = None
+    citations_json: dict | None = None
+    meta_json: dict | None = None
+    paragraphs: list[AagParagraph] = Field(default_factory=list)
+    explain_sections: list[AagExplainSection] = Field(default_factory=list)
+    host_filter: dict | None = None
+    error_message: str | None = None
+    requested_by: str | None = None
+    created_at: datetime
+    finished_at: datetime | None = None
 

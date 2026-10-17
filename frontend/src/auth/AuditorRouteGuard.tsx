@@ -3,13 +3,27 @@ import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "./AuthProvider";
 
 const AUDITOR_ALLOWED_EXACT = new Set(["/"]);
-const AUDITOR_ALLOWED_PREFIXES = ["/overview", "/trends", "/reports", "/audit-map"];
+const AUDITOR_ALLOWED_PREFIXES = [
+  "/overview",
+  "/trends",
+  "/reports",
+  "/audit-map",
+  "/aag/explain",
+  "/aag/brief",
+  "/aag/search",
+  "/aag/drafts",
+];
 
-const OPERATOR_ONLY_PATHS = new Set(["/console", "/credentials", "/audit-flow", "/playbooks"]);
+const OPERATOR_ONLY_PATHS = new Set([
+  "/console",
+  "/credentials",
+  "/audit-flow",
+  "/playbooks",
+]);
 
 const REMEDIATION_PATHS = ["/remediation", "/network/remediation"];
 
-const ADMIN_ONLY_PATHS = new Set(["/users"]);
+const ADMIN_ONLY_PATHS = new Set(["/users", "/aag/connection", "/aag/generate"]);
 
 const AUDIT_ACCESS_PATHS = new Set(["/audit-logs"]);
 

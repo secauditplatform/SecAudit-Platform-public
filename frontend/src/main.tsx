@@ -28,6 +28,7 @@ import { TrendsPage } from "./pages/TrendsPage";
 import { AuditLogsPage } from "./pages/AuditLogsPage";
 import { AuditFlowPage } from "./pages/AuditFlowPage";
 import { AuditMapPage } from "./pages/AuditMapPage";
+import { AagConnectionPage, AagExplainPage, AagGeneratePage } from "./pages/aag/AagPages";
 import { UsersPage } from "./pages/UsersPage";
 import "./index.css";
 
@@ -84,6 +85,13 @@ createRoot(document.getElementById("root")!).render(
                       <Route path="waivers" element={<WaiversPage />} />
                       <Route path="trends" element={<TrendsPage />} />
                       <Route path="audit-logs" element={<AuditLogsPage />} />
+                      <Route path="aag" element={<Navigate to="/aag/connection" replace />} />
+                      <Route path="aag/connection" element={<AagConnectionPage />} />
+                      <Route path="aag/explain" element={<AagExplainPage />} />
+                      <Route path="aag/brief" element={<Navigate to="/aag/explain" replace />} />
+                      <Route path="aag/search" element={<Navigate to="/aag/explain" replace />} />
+                      <Route path="aag/drafts" element={<Navigate to="/aag/explain" replace />} />
+                      <Route path="aag/generate" element={<AagGeneratePage />} />
                     </Route>
                   </Routes>
                 </BrowserRouter>

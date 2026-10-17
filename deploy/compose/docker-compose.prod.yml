@@ -166,7 +166,7 @@ services:
         "worker",
         "--loglevel=info",
         "-Q",
-        "compliance,remediation,inventory,maintenance",
+        "compliance,remediation,inventory,maintenance,aag",
       ]
     restart: unless-stopped
     networks: [internal]

@@ -292,9 +292,11 @@ services:
       --directory=/packages/secaudit_core
       --pattern=*.py
       --recursive
+      --debug-force-polling
+      --interval=2
       --
       celery -A app.celery_app worker --loglevel=info
-      -Q compliance,remediation,inventory,maintenance
+      -Q compliance,remediation,inventory,maintenance,aag
 
   beat:
     build:

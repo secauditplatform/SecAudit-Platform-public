@@ -500,6 +500,54 @@ export function IconAuditMap({ className }: IconProps) {
   );
 }
 
+/** Four-point spark shared by the AAG navigation icons. */
+function AiSpark({ cx, cy, r }: { cx: number; cy: number; r: number }) {
+  const waist = r * 0.34;
+  return (
+    <path
+      fill="currentColor"
+      stroke="none"
+      d={`M${cx} ${cy - r} L${cx + waist} ${cy - waist} L${cx + r} ${cy} L${cx + waist} ${cy + waist} L${cx} ${cy + r} L${cx - waist} ${cy + waist} L${cx - r} ${cy} L${cx - waist} ${cy - waist} Z`}
+    />
+  );
+}
+
+/** Provider hookup — AAG connection. */
+export function IconAagConnection({ className }: IconProps) {
+  return (
+    <StrokeIcon className={className}>
+      <path d="M9 8.25V4" />
+      <path d="M15 8.25V4" />
+      <path d="M6.75 8.25h10.5v4.8a3.4 3.4 0 0 1-3.4 3.4h-3.7a3.4 3.4 0 0 1-3.4-3.4z" />
+      <path d="M12 16.45v3.7" />
+      <AiSpark cx={18.6} cy={18.8} r={2.15} />
+    </StrokeIcon>
+  );
+}
+
+/** Explanation of a finding — AAG explain. */
+export function IconAagExplain({ className }: IconProps) {
+  return (
+    <StrokeIcon className={className}>
+      <path d="M4.5 6.5h9.2a2 2 0 0 1 2 2V14a2 2 0 0 1-2 2H8.8L5.5 19.2V16h-1a2 2 0 0 1-2-2V8.5a2 2 0 0 1 2-2z" />
+      <path d="M6.2 10.2h6" />
+      <path d="M6.2 13.2h4" />
+      <AiSpark cx={18.7} cy={6.2} r={2.45} />
+    </StrokeIcon>
+  );
+}
+
+/** New custom profile from a description — AAG generate. */
+export function IconAagGenerate({ className }: IconProps) {
+  return (
+    <StrokeIcon className={className}>
+      <AiSpark cx={8.6} cy={11} r={5.4} />
+      <AiSpark cx={18.6} cy={5.8} r={2.05} />
+      <AiSpark cx={18} cy={17.8} r={1.45} />
+    </StrokeIcon>
+  );
+}
+
 /** Network topology with wrench — remediation config generation. */
 export function IconNetworkRemediation({ className }: IconProps) {
   return (

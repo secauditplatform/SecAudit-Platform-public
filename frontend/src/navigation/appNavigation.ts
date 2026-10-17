@@ -14,9 +14,12 @@ export type NavRouteId =
   | "auditLogs"
   | "overview"
   | "auditFlow"
-  | "auditMap";
+  | "auditMap"
+  | "aagConnection"
+  | "aagExplain"
+  | "aagGenerate";
 
-export type NavGroupId = "overview" | "audit" | "infrastructure" | "reports";
+export type NavGroupId = "overview" | "audit" | "infrastructure" | "reports" | "aag";
 
 export type NavItemConfig = {
   id: NavRouteId;
@@ -108,6 +111,15 @@ export const NAV_GROUPS: NavGroupConfig[] = [
       },
     ],
   },
+  {
+    id: "aag",
+    labelKey: "nav.groups.aag",
+    items: [
+      { id: "aagConnection", to: "/aag/connection", labelKey: "nav.aagConnection", adminOnly: true },
+      { id: "aagExplain", to: "/aag/explain", labelKey: "nav.aagExplain" },
+      { id: "aagGenerate", to: "/aag/generate", labelKey: "nav.aagGenerate", adminOnly: true },
+    ],
+  },
 ];
 
 export const AUDITOR_NAV_GROUPS: NavGroupConfig[] = [
@@ -130,6 +142,13 @@ export const AUDITOR_NAV_GROUPS: NavGroupConfig[] = [
     items: [
       { id: "trends", to: "/trends", labelKey: "nav.trends" },
       { id: "reports", to: "/reports", labelKey: "nav.reports" },
+    ],
+  },
+  {
+    id: "aag",
+    labelKey: "nav.groups.aag",
+    items: [
+      { id: "aagExplain", to: "/aag/explain", labelKey: "nav.aagExplain" },
     ],
   },
 ];
@@ -158,6 +177,9 @@ export const ROUTE_BREADCRUMBS: Record<string, BreadcrumbConfig> = {
   "/trends": { groupKey: "nav.groups.reports", pageKey: "nav.trends" },
   "/reports": { groupKey: "nav.groups.reports", pageKey: "nav.reports" },
   "/audit-logs": { groupKey: "nav.groups.reports", pageKey: "nav.auditLogs" },
+  "/aag/connection": { groupKey: "nav.groups.aag", pageKey: "nav.aagConnection" },
+  "/aag/explain": { groupKey: "nav.groups.aag", pageKey: "nav.aagExplain" },
+  "/aag/generate": { groupKey: "nav.groups.aag", pageKey: "nav.aagGenerate" },
 };
 
 export function filterNavGroups(

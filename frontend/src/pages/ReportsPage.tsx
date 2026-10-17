@@ -873,6 +873,7 @@ export function ReportsPage() {
             resetKey={activeRunId}
             canOperate={canOperate}
             profileId={profileId}
+            runId={activeRunId}
             onRequestWaiver={requestWaiver}
           />
         </div>

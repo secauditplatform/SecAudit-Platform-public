@@ -42,6 +42,26 @@ RULE_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 LEGACY_RULE_FIELD_KEYS = frozenset(
     alias for aliases in RULE_FIELD_ALIASES.values() for alias in aliases
 )
+_RULE_NUMBER = re.compile(r"^RULE0*(\d+)$", re.IGNORECASE)
+
+
+def rule_identity_keys(*values: str) -> list[str]:
+    """Ids that name one check. RULE219 and RULE0219 are the same requirement."""
+    keys: list[str] = []
+    for value in values:
+        text = (value or "").strip()
+        if not text:
+            continue
+        candidates = [text]
+        match = _RULE_NUMBER.fullmatch(text)
+        if match:
+            number = str(int(match.group(1)))
+            candidates.append(f"RULE{number}")
+            candidates.append(f"RULE{int(number):04d}")
+        for candidate in candidates:
+            if candidate not in keys:
+                keys.append(candidate)
+    return keys
 
 
 def profile_name_from_meta(meta: dict) -> str:

@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.routers import (
+    aag,
     api_keys,
     audit_flow,
     audit_map,
@@ -34,6 +35,7 @@ api_router = APIRouter()
 api_router.include_router(health.router, tags=["health"])
 api_router.include_router(metrics.router, tags=["metrics"])
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(aag.router, prefix="/aag", tags=["aag"])
 api_router.include_router(audit_logs.router, prefix="/audit-logs", tags=["audit-logs"])
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(categories.router, prefix="/categories", tags=["categories"])

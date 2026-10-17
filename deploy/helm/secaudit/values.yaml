@@ -39,7 +39,7 @@ worker:
     repository: secaudit/worker
     tag: ""
     pullPolicy: IfNotPresent
-  queues: "compliance,remediation,inventory,maintenance"
+  queues: "compliance,remediation,inventory,maintenance,aag"
   resources:
     requests:
       cpu: 250m

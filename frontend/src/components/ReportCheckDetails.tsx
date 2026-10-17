@@ -1,4 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import type { CheckResult, ProfileRule } from "../api/client";
 import { useTranslation } from "../i18n/I18nProvider";
 import { useTableSort } from "../hooks/useTableSort";
@@ -33,6 +34,7 @@ type ReportCheckDetailsProps = {
   resetKey: number | null;
   canOperate: boolean;
   profileId: number | null;
+  runId?: number | null;
   onRequestWaiver: (row: CheckResult) => void;
 };
 
@@ -76,6 +78,7 @@ export function ReportCheckDetails({
   resetKey,
   canOperate,
   profileId,
+  runId,
   onRequestWaiver,
 }: ReportCheckDetailsProps) {
   const { t } = useTranslation();
@@ -420,6 +423,9 @@ export function ReportCheckDetails({
                           <Button variant="secondary" className="pf-btn--sm" onClick={() => onRequestWaiver(row)}>
                             {t("reports.requestWaiver")}
                           </Button>
+                        ) : null}
+                        {runId != null && (row.status === "fail" || row.status === "error") ? (
+                          <Link to={`/aag/explain?runId=${runId}&checks=${row.id}`}>{t("aag.openExplain")}</Link>
                         ) : null}
                       </td>
                     </tr>

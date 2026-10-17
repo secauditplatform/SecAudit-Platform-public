@@ -5,7 +5,7 @@ type PanelProps = {
   title?: string;
   description?: string;
   toolbar?: ReactNode;
-  children: ReactNode;
+  children?: ReactNode;
   className?: string;
   noPadding?: boolean;
   collapsible?: boolean;
@@ -13,6 +13,12 @@ type PanelProps = {
   collapsed?: boolean;
   onCollapsedChange?: (collapsed: boolean) => void;
 };
+
+function panelHasBody(children: ReactNode): boolean {
+  if (children == null || children === false || children === true || children === "") return false;
+  if (Array.isArray(children)) return children.some((child) => panelHasBody(child));
+  return true;
+}
 
 export const Panel = forwardRef<HTMLElement, PanelProps>(function Panel(
   {
@@ -41,6 +47,7 @@ export const Panel = forwardRef<HTMLElement, PanelProps>(function Panel(
     if (!isControlled) setUncontrolledCollapsed(next);
     onCollapsedChange?.(next);
   };
+  const hasBody = panelHasBody(children);
 
   return (
     <section ref={ref} className={`pf-panel${collapsed ? " pf-panel--collapsed" : ""} ${className}`}>
@@ -83,11 +90,11 @@ export const Panel = forwardRef<HTMLElement, PanelProps>(function Panel(
           {toolbar && <div className="pf-panel__toolbar">{toolbar}</div>}
         </div>
       )}
-      {!collapsed && (
+      {!collapsed && hasBody ? (
         <div className={noPadding ? "pf-panel__body pf-panel__body--flush" : "pf-panel__body"}>
           {children}
         </div>
-      )}
+      ) : null}
     </section>
   );
 });
