@@ -7,7 +7,7 @@ import json
 import re
 import shlex
 import socket
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from typing import TypedDict
 
 # Default smallest allowed prefix length (largest network): /20 ≈ 4096 addresses.

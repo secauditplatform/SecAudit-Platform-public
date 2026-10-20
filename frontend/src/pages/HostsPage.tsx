@@ -876,11 +876,11 @@ export function HostsPage() {
                   {hasActiveScanFilters
                     ? t("profiles.filterResultsActive", {
                         count: filteredScans.length,
-                        total: scans.data.length,
+                        total: scans.data?.length ?? 0,
                       })
                     : t("profiles.filterShown", {
                         count: filteredScans.length,
-                        total: scans.data.length,
+                        total: scans.data?.length ?? 0,
                       })}
                 </p>
                 {hasActiveScanFilters ? (

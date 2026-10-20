@@ -56,7 +56,7 @@ function linkedCredentialsForHost(host: Host, credentials: Credential[]): HostLi
     {
       id: assigned.id,
       name: assigned.name,
-      credential_type: assigned.credential_type,
+      credential_type: assigned.credential_type as HostLinkedCredential["credential_type"],
       username: assigned.username,
     },
   ];

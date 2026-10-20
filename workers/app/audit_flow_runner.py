@@ -324,7 +324,8 @@ def _use_netmiko(open_ports: list[int], services_text: str) -> bool:
 
 
 def _ssh_exec(client, command: str) -> str:
-    _, stdout, stderr = client.exec_command(command, timeout=8)
+    # command is a constant from _SSH_* facts dicts, never operator input.
+    _, stdout, stderr = client.exec_command(command, timeout=8)  # nosec B601
     out = stdout.read().decode("utf-8", errors="replace")
     err = stderr.read().decode("utf-8", errors="replace")
     text = sanitize_probe_text(out) or sanitize_probe_text(err)

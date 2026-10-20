@@ -530,8 +530,10 @@ export function AuditFlowPage() {
     setSaveToInventory(Boolean(run.save_to_inventory));
     setCreds((prev) => {
       if (prev.some((item) => item.secret.trim())) return prev;
-      if (!run.credentials.length) return prev;
-      return run.credentials.map((cred) => ({
+      const runCredentials = run.credentials ?? [];
+      if (!runCredentials.length) return prev;
+      return runCredentials.map((cred) => ({
+        ...emptyCred(),
         label: cred.label || "",
         credential_type: cred.credential_type,
         username: cred.username,

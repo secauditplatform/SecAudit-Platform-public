@@ -204,12 +204,6 @@ export function CveFeedPanel() {
   const rulesLoading =
     formOpen && (profilesQuery.isLoading || rulesQueries.some((query) => query.isLoading));
 
-  if (!isAdmin) return null;
-
-  const loaded = Boolean(status.data?.loaded);
-  const importedAt = status.data?.imported_at
-    ? new Date(status.data.imported_at).toLocaleString(dateLocale)
-    : null;
   const stats = useMemo(() => {
     let byRule = 0;
     let byProfile = 0;
@@ -226,6 +220,13 @@ export function CveFeedPanel() {
     return { total: entries.length, cves: cves.size, byRule, byProfile, both };
   }, [entries]);
   const busy = replaceFeed.isPending || clearFeed.isPending || saveEntry.isPending || deleteEntry.isPending;
+
+  if (!isAdmin) return null;
+
+  const loaded = Boolean(status.data?.loaded);
+  const importedAt = status.data?.imported_at
+    ? new Date(status.data.imported_at).toLocaleString(dateLocale)
+    : null;
 
   const onFile = async (file: File | undefined) => {
     if (!file) return;

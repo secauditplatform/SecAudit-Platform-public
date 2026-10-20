@@ -56,7 +56,7 @@ export function RemediationPage({
   const { t, dateLocale } = useTranslation();
   const { confirm } = useConfirm();
   const toast = useToast();
-  const { isAdmin, canSeeObjectOwners, canOperate, canExecute, canAccessRemediation } = useAuth();
+  const { isAdmin, canSeeObjectOwners, canExecute, canAccessRemediation } = useAuth();
   const scheduleLabels = useScheduleLabels();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();

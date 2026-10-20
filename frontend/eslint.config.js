@@ -6,7 +6,16 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist/**", "node_modules/**", "coverage/**", "playwright-report/**", "test-results/**"],
+    ignores: [
+      "dist/**",
+      "node_modules/**",
+      "coverage/**",
+      "playwright-report/**",
+      "test-results/**",
+      // i18n/build utilities are Node scripts, not application code.
+      "scripts/**",
+      "check-trust-cards.mjs",
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -39,6 +48,10 @@ export default tseslint.config(
         ...globals.browser,
         ...globals.node,
       },
+    },
+    rules: {
+      // Playwright fixtures use `use(page)`; it is not a React hook.
+      "react-hooks/rules-of-hooks": "off",
     },
   }
 );

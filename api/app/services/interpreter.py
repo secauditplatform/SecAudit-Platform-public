@@ -1,4 +1,5 @@
 import re
+import shutil
 import tarfile
 import tempfile
 import zipfile
@@ -55,11 +56,18 @@ def _safe_extract_zip(archive: zipfile.ZipFile, dest: Path) -> None:
     if len(archive.namelist()) > MAX_ARCHIVE_FILES:
         raise ValueError("Archive contains too many files")
     dest_root = dest.resolve()
-    for member in archive.namelist():
-        target = (dest / member).resolve()
+    for member in archive.infolist():
+        target = (dest / member.filename).resolve()
         if dest_root not in target.parents and target != dest_root:
-            raise ValueError(f"Unsafe archive path: {member}")
-    archive.extractall(dest)
+            raise ValueError(f"Unsafe archive path: {member.filename}")
+    for member in archive.infolist():
+        target = (dest / member.filename).resolve()
+        if member.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open(member) as source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
 
 
 def _safe_extract_tar(archive: tarfile.TarFile, dest: Path) -> None:
@@ -70,7 +78,7 @@ def _safe_extract_tar(archive: tarfile.TarFile, dest: Path) -> None:
         target = (dest / member.name).resolve()
         if dest_root not in target.parents and target != dest_root:
             raise ValueError(f"Unsafe archive path: {member.name}")
-    archive.extractall(dest)
+    archive.extractall(dest, filter="data")
 
 
 def _resolve_package_root(extracted_dir: Path) -> Path:
@@ -124,7 +132,6 @@ def materialize_uploaded_package(
             with tarfile.open(archive_path) as archive:
                 _safe_extract_tar(archive, extract_to)
             return _resolve_package_root(extract_to), temp_dir
-
     flat_root = root / "package"
     flat_root.mkdir()
     for filename, content in uploads:

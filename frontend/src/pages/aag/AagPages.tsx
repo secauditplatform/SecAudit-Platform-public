@@ -1358,38 +1358,6 @@ function AagTaskPage({
   );
 }
 
-function AagStubPage({ labelKey, withRunHint }: { labelKey: string; withRunHint?: boolean }) {
-  const { t } = useTranslation();
-  const statusQuery = useAagStatus();
-  const [params] = useSearchParams();
-  const runId = params.get("runId");
-  const statusData = statusQuery.data;
-
-  return (
-    <>
-      <PageHeader title={t(labelKey)} description={t("aag.subtitle")} />
-      {statusQuery.isPending ? (
-        <Spinner />
-      ) : statusQuery.isError || !statusData ? (
-        <QueryErrorState
-          title={t("aag.statusError")}
-          message={statusQuery.error instanceof Error ? statusQuery.error.message : undefined}
-          onRetry={() => void statusQuery.refetch()}
-        />
-      ) : (
-        <>
-          {withRunHint && runId ? (
-            <Panel title={t("aag.runHintTitle")} collapsible={false}>
-              <p className="pf-table__muted">{t("aag.runHintBody", { runId })}</p>
-            </Panel>
-          ) : null}
-          <AagDisabledNotice status={statusData} />
-        </>
-      )}
-    </>
-  );
-}
-
 export function AagExplainPage() {
   return <AagTaskPage kind="explain" labelKey="nav.aagExplain" withRunHint />;
 }

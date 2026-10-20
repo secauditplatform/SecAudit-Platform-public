@@ -672,7 +672,7 @@ export function ComplianceHeatmap({
                   key={key}
                   type="button"
                   className={`pf-ops-heat__cell pf-ops-heat__cell--interactive${isSelected ? " is-selected" : ""}`}
-                  style={{ background: complianceColor(pct), opacity: 0.42 + (pct / 100) * 0.58 }}
+                  style={{ background: complianceColor(pct ?? 0), opacity: 0.42 + ((pct ?? 0) / 100) * 0.58 }}
                   title={title}
                   aria-pressed={isSelected}
                   aria-label={title}
