@@ -1297,6 +1297,38 @@ export interface AagStatus {
   demo_mode: boolean;
 }
 
+export interface AagUsageModel {
+  model_name: string;
+  other: boolean;
+  calls: number;
+  failed: number;
+  tokens: number;
+  explain_calls: number;
+  generate_calls: number;
+}
+
+export interface AagUsage {
+  explain_total: number;
+  explain_completed: number;
+  explain_failed: number;
+  explain_pending: number;
+  generate_total: number;
+  generate_completed: number;
+  generate_failed: number;
+  generate_pending: number;
+  profiles_in_list: number;
+  profiles_ready: number;
+  calls_total: number;
+  calls_failed: number;
+  providers: number;
+  explain_runs: number;
+  tokens_total: number;
+  tokens_explain: number;
+  tokens_generate: number;
+  duration_ms_avg: number;
+  models: AagUsageModel[];
+}
+
 export interface AagConnection {
   id?: number | null;
   provider: AagProvider;
@@ -2419,6 +2451,7 @@ export const api = {
     request<AuditFlowRun>(`/audit-flow/runs/${id}/execute`, { method: "POST" }),
   deleteAuditFlowRun: (id: number) => request<void>(`/audit-flow/runs/${id}`, { method: "DELETE" }),
   aagStatus: () => request<AagStatus>("/aag/status"),
+  aagUsage: () => request<AagUsage>("/aag/usage"),
   aagConnection: () => request<AagConnection>("/aag/connection"),
   aagProviders: () => request<AagConnection[]>("/aag/providers"),
   saveAagConnection: (data: AagConnectionInput) =>

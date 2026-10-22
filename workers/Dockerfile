@@ -21,6 +21,7 @@ RUN mkdir -p /usr/share/ansible/collections \
     && chmod -R a+rX /usr/share/ansible
 
 COPY workers/ .
+COPY workers/sitecustomize.py /usr/local/lib/python3.12/site-packages/sitecustomize.py
 
 USER secaudit:secaudit
 

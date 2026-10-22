@@ -16,11 +16,37 @@ from secaudit_core.playbook_security import (
 )
 
 
+_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "PYTHONPATH",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+    }
+)
+
+
 def _ansible_env(work_dir: Path) -> dict[str, str]:
     """Build env so ansible-playbook works as non-root (HOME=/nonexistent in containers)."""
     local_tmp = work_dir / "ansible-local"
     local_tmp.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if key in _ENV_ALLOWLIST}
     env["HOME"] = str(work_dir)
     env["ANSIBLE_LOCAL_TMP"] = str(local_tmp)
     env["ANSIBLE_HOST_KEY_CHECKING"] = "False"
@@ -31,7 +57,6 @@ def _ansible_env(work_dir: Path) -> dict[str, str]:
     collections = Path("/usr/share/ansible/collections")
     if collections.is_dir():
         env["ANSIBLE_COLLECTIONS_PATH"] = str(collections)
-        env["ANSIBLE_COLLECTIONS_PATHS"] = str(collections)
     return env
 
 

@@ -1,11 +1,15 @@
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
-
-import ansible_runner
 
 from secaudit_core.playbook_security import assert_playbook_local_execution_policy
 from secaudit_core.settings import SecAuditSettings
@@ -150,7 +154,19 @@ def _extract_event_message(event: dict) -> tuple[str, str, str]:
     return host, task, str(msg).strip()
 
 
-def _collect_runner_output(runner: ansible_runner.Runner, *, check_mode: bool = False) -> tuple[str, list[str]]:
+def _redact_values(text: str, values: list[str] | None) -> str:
+    for value in values or []:
+        if value and len(value) >= 4:
+            text = text.replace(str(value), "***")
+    return text
+
+
+def _collect_runner_output(
+    runner,
+    *,
+    check_mode: bool = False,
+    redact_values: list[str] | None = None,
+) -> tuple[str, list[str]]:
     lines: list[str] = []
     errors: list[str] = []
 
@@ -159,6 +175,7 @@ def _collect_runner_output(runner: ansible_runner.Runner, *, check_mode: bool = 
         if event_type not in _EVENT_HOST:
             continue
         host, task, msg = _extract_event_message(event)
+        msg = _redact_values(msg, redact_values)
         prefix = f"[{host}] {task}"
         res = (event.get("event_data") or {}).get("res") or {}
         changed = bool(res.get("changed"))
@@ -182,7 +199,7 @@ def _collect_runner_output(runner: ansible_runner.Runner, *, check_mode: bool = 
     stdout = ""
     if runner.stdout:
         stdout = runner.stdout.read() if hasattr(runner.stdout, "read") else str(runner.stdout)
-        stdout = stdout.strip()
+        stdout = _redact_values(stdout.strip(), redact_values)
         if stdout:
             lines.append(stdout)
 
@@ -190,7 +207,7 @@ def _collect_runner_output(runner: ansible_runner.Runner, *, check_mode: bool = 
     return combined, errors
 
 
-def _failure_message(runner: ansible_runner.Runner, errors: list[str], output: str) -> str:
+def _failure_message(runner, errors: list[str], output: str) -> str:
     if errors:
         return "\n".join(errors)
     if output.strip():
@@ -229,6 +246,96 @@ def _ansible_local_envvars(work_dir: Path) -> dict[str, str]:
         "ANSIBLE_LOCAL_TMP": str(local_tmp),
         **_ansible_collections_envvars(),
     }
+
+
+# ansible-runner seeds its env from os.environ. Only these variables may cross
+# into the child; platform secrets (SECRET_KEY, DB/Redis passwords, Vault token)
+# must never be visible to a playbook.
+_ANSIBLE_CHILD_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TZ",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "PYTHONPATH",
+        "PYTHONIOENCODING",
+        "PYTHONUTF8",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "WINDIR",
+        "COMSPEC",
+    }
+)
+
+
+def _ansible_child_env() -> dict[str, str]:
+    """Environment for the isolated ansible-runner child process."""
+    return {key: value for key, value in os.environ.items() if key in _ANSIBLE_CHILD_ENV_ALLOWLIST}
+
+
+def _run_ansible_child(
+    run_kwargs: dict,
+    cancel_event,
+    work_dir: Path,
+):
+    """Execute ansible-runner in a subprocess that has no platform secrets."""
+    result_path = work_dir / "runner-result.json"
+    cancel_path = work_dir / "runner-cancel"
+    payload = {
+        "run_kwargs": run_kwargs,
+        "result_path": str(result_path),
+        "cancel_path": str(cancel_path),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-m", "app.executors.ansible_child"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_ansible_child_env(),
+        cwd=str(Path(__file__).resolve().parents[2]),
+    )
+
+    def _watch_cancel() -> None:
+        while process.poll() is None:
+            if cancel_event is not None and cancel_event.is_set():
+                try:
+                    cancel_path.touch()
+                except OSError:
+                    pass
+                return
+            time.sleep(0.25)
+
+    if cancel_event is not None:
+        threading.Thread(target=_watch_cancel, daemon=True).start()
+
+    stdout, stderr = process.communicate(json.dumps(payload, default=str))
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("Job run cancelled")
+    if process.returncode != 0:
+        detail = (stderr or stdout or "ansible-runner child failed").strip()
+        raise AnsiblePlaybookError(f"Ansible runner failed: {detail[-1000:]}")
+    if not result_path.is_file():
+        raise AnsiblePlaybookError("Ansible runner produced no result")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if result.get("error"):
+        raise AnsiblePlaybookError(str(result["error"]))
+    return SimpleNamespace(
+        status=result.get("status"),
+        rc=result.get("rc"),
+        stats=result.get("stats") or {},
+        events=result.get("events") or [],
+        stdout=result.get("stdout") or "",
+    )
 
 
 def normalize_private_key(raw: str) -> str:
@@ -376,6 +483,10 @@ def _run_playbook(
             }
             if credentials and credentials.get("username"):
                 host_vars["ansible_user"] = credentials["username"]
+            if str(host_vars.get("ansible_connection") or "").strip().lower() == "local":
+                raise ValueError(
+                    f"Host '{name}': ansible_connection=local is not allowed in inventory"
+                )
 
             mode = resolve_connection_mode(host, credentials, connection_mode)
             resolved_modes.append(f"{name}={mode}")
@@ -430,21 +541,17 @@ def _run_playbook(
 
         try:
             run_kwargs: dict = {
+                "private_data_dir": str(tmp_path),
                 "playbook": str(playbook_file),
                 "inventory": str(inv_file),
                 "extravars": extravars or {},
                 "envvars": envvars,
                 "quiet": False,
                 "ignore_logging": True,
-                "cancel_callback": (
-                    (lambda: bool(cancel_event and cancel_event.is_set()))
-                    if cancel_event is not None
-                    else None
-                ),
             }
             if check_mode:
                 run_kwargs["cmdline"] = "--check --diff"
-            runner = ansible_runner.run(**run_kwargs)
+            runner = _run_ansible_child(run_kwargs, cancel_event, tmp_path)
         finally:
             # Best-effort shred of secrets written for the run.
             try:
@@ -457,7 +564,13 @@ def _run_playbook(
         if cancel_event and cancel_event.is_set():
             raise InterruptedError("Job run cancelled")
 
-        output, errors = _collect_runner_output(runner, check_mode=check_mode)
+        redact_values = [
+            str(credentials.get(key) or "")
+            for key in ("password", "key_passphrase", "private_key")
+        ] if credentials else []
+        output, errors = _collect_runner_output(
+            runner, check_mode=check_mode, redact_values=redact_values
+        )
 
         if runner.status == "failed" or runner.rc not in (None, 0):
             modes = ", ".join(resolved_modes)

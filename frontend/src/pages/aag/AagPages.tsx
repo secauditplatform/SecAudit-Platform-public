@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   api,
   type AagArtifact,
@@ -9,6 +9,7 @@ import {
   type AagPackageDraft,
   type AagProvider,
   type AagStatus,
+  type AagUsage,
   type AagExplainCandidate,
   type AagExplainSection,
   type AagTaskKind,
@@ -21,6 +22,8 @@ import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { PageHeader } from "../../components/ui/PageHeader";
 import { Panel } from "../../components/ui/Panel";
+import { ComplianceRing } from "../../components/InsightSummary";
+import { scrollAppToTop } from "../../components/ScrollToTop";
 import { Pagination } from "../../components/ui/Pagination";
 import { QueryErrorState } from "../../components/ui/QueryErrorState";
 import { Spinner } from "../../components/ui/Spinner";
@@ -1688,7 +1691,7 @@ function AagPackageEditor({
         </div>
         <div className="pf-aag-result__tools">
           {imported ? (
-            <Badge variant="success" literal>
+            <Badge variant="info" literal>
               {t("aag.packageInList")}
             </Badge>
           ) : null}
@@ -1862,6 +1865,248 @@ function blankProvider(): AagConnectionInput {
   };
 }
 
+function formatDuration(ms: number, t: (key: string, vars?: Record<string, string | number>) => string) {
+  if (ms < 1000) return t("aag.statsDurationMs", { ms });
+  const seconds = ms / 1000;
+  if (seconds < 60) {
+    const sec = seconds < 10 ? seconds.toFixed(1) : String(Math.round(seconds));
+    return t("aag.statsDurationSec", { sec });
+  }
+  const min = Math.floor(seconds / 60);
+  const sec = Math.round(seconds % 60);
+  return t("aag.statsDurationMin", { min, sec });
+}
+
+function rate(part: number, total: number): number | null {
+  if (total <= 0) return null;
+  return Math.round((part / total) * 100);
+}
+
+function AagScore({
+  percent,
+  label,
+  meta,
+  emptyLabel,
+}: {
+  percent: number | null;
+  label: string;
+  meta?: string;
+  emptyLabel: string;
+}) {
+  return (
+    <div className="pf-platform-hero__snapshot-score-panel">
+      {percent != null ? (
+        <>
+          <div className="pf-platform-hero__snapshot-ring-shell">
+            <ComplianceRing percent={percent} compact />
+          </div>
+          <div className="pf-platform-hero__snapshot-score-copy">
+            <span className="pf-platform-hero__snapshot-score-label">{label}</span>
+            {meta ? <span className="pf-platform-hero__snapshot-score-meta">{meta}</span> : null}
+          </div>
+        </>
+      ) : (
+        <div className="pf-platform-hero__snapshot-empty">
+          <span className="pf-platform-hero__snapshot-empty-value">—</span>
+          <p className="pf-platform-hero__snapshot-empty-label">{emptyLabel}</p>
+          <span className="pf-platform-hero__snapshot-score-label">{label}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AagMetric({
+  value,
+  label,
+  hint,
+  to,
+  accent,
+}: {
+  value: number | string;
+  label: string;
+  hint?: string;
+  to?: string;
+  accent?: "cyan" | "gold" | "rose" | "neutral";
+}) {
+  const className = `pf-platform-metric${accent ? ` pf-platform-metric--${accent}` : ""}`;
+  const content = (
+    <>
+      <span className="pf-platform-metric__value">{value}</span>
+      <span className="pf-platform-metric__label">{label}</span>
+      {hint ? <span className="pf-platform-metric__hint">{hint}</span> : null}
+    </>
+  );
+  if (to) {
+    return (
+      <Link to={to} className={className} onClick={() => scrollAppToTop()}>
+        {content}
+      </Link>
+    );
+  }
+  return <div className={className}>{content}</div>;
+}
+
+function AagUsageStrip({ usage }: { usage: AagUsage }) {
+  const { t } = useTranslation();
+  const models = usage.models ?? [];
+  const tokens = usage.tokens_total ?? 0;
+  const duration = formatDuration(usage.duration_ms_avg ?? 0, t);
+  const maxBar = Math.max(1, ...models.map((item) => (item.tokens > 0 ? item.tokens : item.calls)));
+  const profileTotal = usage.profiles_in_list + usage.profiles_ready;
+  return (
+    <div className="pf-platform-hero__body" aria-label={t("aag.statsAria")}>
+        <section className="pf-platform-hero__snapshot">
+          <div className="pf-platform-hero__snapshot-header">
+            <div className="pf-platform-hero__snapshot-heading">
+              <h3 className="pf-platform-hero__snapshot-title">{t("aag.statsBoardTitle")}</h3>
+              <p className="pf-platform-hero__snapshot-subtitle">
+                {t("aag.statsBoardMeta", {
+                  calls: usage.calls_total,
+                  tokens: tokens.toLocaleString(),
+                  models: models.filter((item) => !item.other).length,
+                })}
+              </p>
+            </div>
+          </div>
+          <div className="pf-platform-hero__snapshot-main pf-platform-hero__snapshot-rings">
+            <AagScore
+              percent={rate(usage.explain_completed, usage.explain_total)}
+              label={t("aag.statsExplain")}
+              meta={t("aag.statsTaskMeta", {
+                completed: usage.explain_completed,
+                failed: usage.explain_failed,
+                pending: usage.explain_pending,
+              })}
+              emptyLabel={t("aag.statsRingEmpty")}
+            />
+            <AagScore
+              percent={rate(usage.generate_completed, usage.generate_total)}
+              label={t("aag.statsGenerate")}
+              meta={t("aag.statsTaskMeta", {
+                completed: usage.generate_completed,
+                failed: usage.generate_failed,
+                pending: usage.generate_pending,
+              })}
+              emptyLabel={t("aag.statsRingEmpty")}
+            />
+            <AagScore
+              percent={rate(usage.calls_total - usage.calls_failed, usage.calls_total)}
+              label={t("aag.statsCalls")}
+              meta={t("aag.statsCallsMeta", { failed: usage.calls_failed })}
+              emptyLabel={t("aag.statsRingEmpty")}
+            />
+            <AagScore
+              percent={rate(usage.profiles_in_list, profileTotal)}
+              label={t("aag.statsProfiles")}
+              meta={t("aag.statsProfilesMeta", { ready: usage.profiles_ready })}
+              emptyLabel={t("aag.statsRingEmpty")}
+            />
+          </div>
+          <div className="pf-platform-hero__snapshot-facts">
+            <div className="pf-platform-fact">
+              <span className="pf-platform-fact__label">{t("aag.statsTokens")}</span>
+              <span className="pf-platform-fact__value">{tokens.toLocaleString()}</span>
+              <span className="pf-platform-fact__meta">
+                {t("aag.statsTokensMeta", { explain: usage.tokens_explain ?? 0, generate: usage.tokens_generate ?? 0 })}
+              </span>
+            </div>
+            <div className="pf-platform-fact">
+              <span className="pf-platform-fact__label">{t("aag.statsDuration")}</span>
+              <span className="pf-platform-fact__value">{duration}</span>
+              <span className="pf-platform-fact__meta">{t("aag.statsDurationMeta")}</span>
+            </div>
+            <div className="pf-platform-fact">
+              <span className="pf-platform-fact__label">{t("aag.statsRuns")}</span>
+              <span className="pf-platform-fact__value">{usage.explain_runs}</span>
+              <span className="pf-platform-fact__meta">{t("aag.statsRunsMeta")}</span>
+            </div>
+            <div className="pf-platform-fact">
+              <span className="pf-platform-fact__label">{t("aag.statsProviders")}</span>
+              <span className="pf-platform-fact__value">{usage.providers}</span>
+              <span className="pf-platform-fact__meta">{t("aag.statsProvidersMeta")}</span>
+            </div>
+          </div>
+          <div className="pf-aag-models" aria-label={t("aag.statsModels")}>
+            <div className="pf-aag-models__title">{t("aag.statsModels")}</div>
+            {models.length === 0 ? (
+              <p className="pf-aag-models__empty">{t("aag.statsModelsEmpty")}</p>
+            ) : (
+              <ul className="pf-aag-models__list">
+                {models.map((item) => {
+                  const width = Math.max(6, Math.round(((item.tokens > 0 ? item.tokens : item.calls) / maxBar) * 100));
+                  const name = item.other ? t("aag.statsModelOther") : item.model_name || t("aag.statsModelUnnamed");
+                  return (
+                    <li key={item.other ? "other" : item.model_name || "unnamed"} className="pf-aag-models__row">
+                      <div className="pf-aag-models__head">
+                        <span className="pf-aag-models__name">{name}</span>
+                        <span className="pf-aag-models__tokens">{item.tokens.toLocaleString()}</span>
+                      </div>
+                      <div className="pf-aag-models__track" aria-hidden>
+                        <span className="pf-aag-models__bar" style={{ width: `${width}%` }} />
+                      </div>
+                      <div className="pf-aag-models__meta">
+                        {t("aag.statsModelMeta", {
+                          calls: item.calls,
+                          failed: item.failed,
+                          explain: item.explain_calls,
+                          generate: item.generate_calls,
+                        })}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        </section>
+        <div className="pf-platform-hero__metrics pf-platform-hero__metrics--strip">
+          <AagMetric
+            to="/aag/explain"
+            accent="cyan"
+            value={usage.explain_total}
+            label={t("aag.statsExplain")}
+            hint={t("aag.statsTaskMeta", {
+              completed: usage.explain_completed,
+              failed: usage.explain_failed,
+              pending: usage.explain_pending,
+            })}
+          />
+          <AagMetric
+            to="/aag/generate"
+            accent="cyan"
+            value={usage.generate_total}
+            label={t("aag.statsGenerate")}
+            hint={t("aag.statsTaskMeta", {
+              completed: usage.generate_completed,
+              failed: usage.generate_failed,
+              pending: usage.generate_pending,
+            })}
+          />
+          <AagMetric
+            accent="gold"
+            value={usage.profiles_in_list}
+            label={t("aag.statsProfiles")}
+            hint={t("aag.statsProfilesMeta", { ready: usage.profiles_ready })}
+          />
+          <AagMetric
+            accent={usage.calls_failed > 0 ? "rose" : "neutral"}
+            value={usage.calls_total}
+            label={t("aag.statsCalls")}
+            hint={t("aag.statsCallsMeta", { failed: usage.calls_failed })}
+          />
+          <AagMetric accent="neutral" value={tokens.toLocaleString()} label={t("aag.statsTokens")} hint={duration} />
+          <AagMetric
+            accent="gold"
+            value={usage.providers}
+            label={t("aag.statsProviders")}
+            hint={t("aag.statsProvidersMeta")}
+          />
+        </div>
+      </div>
+  );
+}
+
 export function AagConnectionPage() {
   const { t } = useTranslation();
   const { isAdmin } = useAuth();
@@ -1879,6 +2124,12 @@ export function AagConnectionPage() {
   const providersQuery = useQuery({
     queryKey: ["aagProviders"],
     queryFn: api.aagProviders,
+    enabled: isAdmin,
+    retry: false,
+  });
+  const usageQuery = useQuery({
+    queryKey: ["aagUsage"],
+    queryFn: api.aagUsage,
     enabled: isAdmin,
     retry: false,
   });
@@ -1905,6 +2156,7 @@ export function AagConnectionPage() {
     await queryClient.invalidateQueries({ queryKey: ["aagStatus"] });
     await queryClient.invalidateQueries({ queryKey: ["aagConnection"] });
     await queryClient.invalidateQueries({ queryKey: ["aagProviders"] });
+    await queryClient.invalidateQueries({ queryKey: ["aagUsage"] });
   };
 
   const saveMutation = useMutation({
@@ -1980,6 +2232,7 @@ export function AagConnectionPage() {
         setCallsPage(callsPage - 1);
       }
       await queryClient.invalidateQueries({ queryKey: ["aagCalls"] });
+      await queryClient.invalidateQueries({ queryKey: ["aagUsage"] });
     },
     onError: (error: unknown) => {
       toast.error(error instanceof Error ? error.message : t("aag.callsError"));
@@ -1996,6 +2249,7 @@ export function AagConnectionPage() {
       );
       await queryClient.invalidateQueries({ queryKey: ["aagCalls"] });
       await queryClient.invalidateQueries({ queryKey: ["aagStatus"] });
+      await queryClient.invalidateQueries({ queryKey: ["aagUsage"] });
     },
     onError: (error: unknown) => {
       setTestResult(`${t("aag.testFail")}: ${error instanceof Error ? error.message : ""}`);
@@ -2051,32 +2305,36 @@ export function AagConnectionPage() {
     <>
       <PageHeader title={t("nav.aagConnection")} description={t("aag.connectionLead")} />
 
-      <Panel title={t("aag.providerStatus")}>
-        <div className="pf-form pf-form--wide">
-          <div className={`pf-aag-contour${status.enabled ? " is-on" : " is-off"}`}>
-            <div className="pf-aag-contour__status">
-              <span className="pf-aag-contour__mark">
-                <span className="pf-aag-contour__dot" aria-hidden />
-                {status.enabled ? t("aag.contourOn") : t("aag.contourOff")}
-              </span>
-              <span className="pf-aag-contour__hint">
-                {status.enabled ? t("aag.contourOnHint") : t("aag.disabledBody")}
-              </span>
+          <section className="pf-platform-hero pf-aag-board" aria-label={t("aag.statsAria")}>
+            <div className={`pf-aag-contour${status.enabled ? " is-on" : " is-off"}`}>
+              <div className="pf-aag-contour__status">
+                <span className="pf-aag-contour__mark">
+                  <span className="pf-aag-contour__dot" aria-hidden />
+                  {status.enabled ? t("aag.contourOn") : t("aag.contourOff")}
+                </span>
+                <span className="pf-aag-contour__copy">
+                  <span className="pf-aag-contour__hint">
+                    {status.enabled ? t("aag.contourOnHint") : t("aag.disabledBody")}
+                  </span>
+                  {status.enabled ? (
+                    <span className="pf-aag-contour__meta">{providerSignature(status, t)}</span>
+                  ) : null}
+                </span>
+              </div>
+              <Button
+                variant={status.enabled ? "secondary" : "primary"}
+                loading={contourMutation.isPending}
+                disabled={!status.enabled && stored.provider === "none"}
+                onClick={() => contourMutation.mutate()}
+              >
+                {status.enabled ? t("aag.contourDisable") : t("aag.contourEnabled")}
+              </Button>
             </div>
-            <Button
-              variant={status.enabled ? "secondary" : "primary"}
-              loading={contourMutation.isPending}
-              disabled={!status.enabled && stored.provider === "none"}
-              onClick={() => contourMutation.mutate()}
-            >
-              {status.enabled ? t("aag.contourDisable") : t("aag.contourEnabled")}
-            </Button>
-          </div>
-          {!status.enabled && stored.provider === "none" ? (
-            <p className="pf-form__hint">{t("aag.contourEnabledHint")}</p>
-          ) : null}
-        </div>
-      </Panel>
+            {!status.enabled && stored.provider === "none" ? (
+              <p className="pf-aag-contour__note">{t("aag.contourEnabledHint")}</p>
+            ) : null}
+            {usageQuery.data ? <AagUsageStrip usage={usageQuery.data} /> : null}
+          </section>
 
       {formMode !== "closed" ? (
       <Panel

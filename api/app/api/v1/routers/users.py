@@ -151,6 +151,7 @@ async def update_user(
 
     if password:
         user.hashed_password = hash_password(password)
+        user.token_version = int(user.token_version or 0) + 1
 
     await db.flush()
     await db.refresh(user)

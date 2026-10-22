@@ -662,6 +662,12 @@ def load_profile_rules_metadata(package_dir: Path, *, limit: int | None = None) 
             "check_script": item.get("check_script"),
             "scap_rule_id": item.get("scap_rule_id"),
             "criticality": item.get("criticality"),
+            "operator": item.get("operator"),
+            "target_value": item.get("target_value"),
+            "default_value": item.get("default_value"),
+            "value_type": item.get("value_type"),
+            "parser_rule": item.get("parser_rule"),
+            "match_pattern": item.get("match_pattern"),
         }
         for item in _load_rules_records(rules_path)
     ]

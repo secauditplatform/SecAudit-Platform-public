@@ -41,6 +41,7 @@ class AuthUser:
     auth_mode: str = "unknown"
     local_source: str | None = None
     scopes: list[str] | None = None
+    token_version: int = 0
 
     def has_role(self, *roles: UserRole | str) -> bool:
         allowed = {r.value if isinstance(r, UserRole) else r for r in roles}
@@ -59,6 +60,7 @@ def create_local_token(
     *,
     local_source: str | None = None,
     jti: str | None = None,
+    token_version: int = 0,
 ) -> str:
     now = datetime.now(UTC)
     ttl = settings.local_auth_token_ttl_seconds
@@ -68,6 +70,7 @@ def create_local_token(
         "realm_access": {"roles": roles},
         "typ": LOCAL_TOKEN_TYPE,
         "local_source": local_source,
+        "ver": int(token_version or 0),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
     }
@@ -86,6 +89,7 @@ def create_local_refresh_token(
     *,
     local_source: str | None = None,
     jti: str | None = None,
+    token_version: int = 0,
 ) -> str:
     now = datetime.now(UTC)
     ttl = settings.local_auth_refresh_token_ttl_seconds
@@ -95,6 +99,7 @@ def create_local_refresh_token(
         "realm_access": {"roles": roles},
         "typ": LOCAL_REFRESH_TOKEN_TYPE,
         "local_source": local_source,
+        "ver": int(token_version or 0),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
     }
@@ -113,11 +118,22 @@ def create_local_token_pair(
     *,
     local_source: str | None = None,
     jti: str | None = None,
+    token_version: int = 0,
 ) -> LocalTokenPair:
     return LocalTokenPair(
-        access_token=create_local_token(username, roles, local_source=local_source, jti=jti),
+        access_token=create_local_token(
+            username,
+            roles,
+            local_source=local_source,
+            jti=jti,
+            token_version=token_version,
+        ),
         refresh_token=create_local_refresh_token(
-            username, roles, local_source=local_source, jti=jti
+            username,
+            roles,
+            local_source=local_source,
+            jti=jti,
+            token_version=token_version,
         ),
     )
 
@@ -176,6 +192,7 @@ def _decode_local_refresh_token(token: str) -> AuthUser | None:
         roles=roles,
         auth_mode="local",
         local_source=payload.get("local_source"),
+        token_version=int(payload.get("ver") or 0),
     )
 
 
@@ -184,6 +201,7 @@ def refresh_local_tokens(
     current_roles: list[str],
     *,
     local_source: str | None = None,
+    token_version: int | None = None,
 ) -> LocalTokenPair:
     user = _decode_local_refresh_token(refresh_token)
     if not user or not user.username:
@@ -194,6 +212,7 @@ def refresh_local_tokens(
         current_roles,
         local_source=local_source or user.local_source,
         jti=jti,
+        token_version=user.token_version if token_version is None else token_version,
     )
 
 
@@ -217,6 +236,7 @@ def _decode_local_token(token: str) -> AuthUser | None:
         roles=roles,
         auth_mode="local",
         local_source=payload.get("local_source"),
+        token_version=int(payload.get("ver") or 0),
     )
 
 
@@ -320,15 +340,13 @@ def _synthetic_admin_when_auth_disabled() -> AuthUser:
 
 
 async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
-    """Revocation + optional live DB revalidation for local access tokens."""
+    """Revocation, token-version and optional live DB revalidation for local access tokens."""
     from app.services.auth_sessions import is_auth_token_revoked
 
     jti = extract_local_token_jti(token)
     if jti and await is_auth_token_revoked(jti):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
 
-    if not settings.local_auth_revalidate_user:
-        return user
     if user.local_source not in (None, "database"):
         return user
 
@@ -337,8 +355,11 @@ async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
     try:
         from app.core.database import async_session
     except ImportError:
-        logger.warning("local user revalidation skipped: database driver unavailable")
-        return user
+        logger.warning("local user revalidation unavailable: database driver missing")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="User validation unavailable",
+        ) from None
     from app.models import User
 
     async with async_session() as db:
@@ -346,6 +367,19 @@ async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
         db_user = result.scalar_one_or_none()
         if not db_user or not db_user.is_active:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User inactive")
+        current_version = int(db_user.token_version or 0)
+        if int(user.token_version or 0) != current_version:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
+        if not settings.local_auth_revalidate_user:
+            return AuthUser(
+                sub=user.sub,
+                username=user.username,
+                roles=user.roles,
+                auth_mode="local",
+                local_source=user.local_source,
+                scopes=user.scopes,
+                token_version=current_version,
+            )
         role = db_user.role.value
         return AuthUser(
             sub=f"local:{db_user.username}",
@@ -353,6 +387,7 @@ async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
             roles=[role],
             auth_mode="local",
             local_source="database",
+            token_version=current_version,
         )
 
 

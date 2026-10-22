@@ -36,9 +36,11 @@ from app.schemas import (
     AagParagraph,
     AagStatusRead,
     AagTaskCreate,
+    AagUsageRead,
     PaginatedResponse,
 )
 from app.services.aag_tasks import (
+    aag_usage,
     accept_generated_profile,
     contour_switch,
     delete_aag_artifact,
@@ -470,6 +472,14 @@ async def test_aag_connection(
         model_name=row.model_name,
         message="Provider responds",
     )
+
+
+@router.get("/usage", response_model=AagUsageRead)
+async def get_aag_usage(
+    db: AsyncSession = Depends(get_db),
+    _: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+) -> AagUsageRead:
+    return AagUsageRead(**await aag_usage(db))
 
 
 @router.get("/calls", response_model=PaginatedResponse[AagCallLogRead])

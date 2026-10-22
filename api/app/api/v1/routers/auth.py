@@ -58,6 +58,8 @@ async def _resolve_refresh_user(
     db_user = result.scalar_one_or_none()
     if not db_user or not db_user.is_active:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    if int(token_user.token_version or 0) != int(db_user.token_version or 0):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token revoked")
 
     role = db_user.role.value
     return (
@@ -67,6 +69,7 @@ async def _resolve_refresh_user(
             roles=[role],
             auth_mode="local",
             local_source="database",
+            token_version=int(db_user.token_version or 0),
         ),
         "database",
     )
@@ -140,7 +143,13 @@ async def _issue_local_login(
     username = db_user.username
     role = db_user.role.value
     session_id = await acquire_auth_session() if auth_idle_enabled() else None
-    tokens = create_local_token_pair(username, [role], local_source="database", jti=session_id)
+    tokens = create_local_token_pair(
+        username,
+        [role],
+        local_source="database",
+        jti=session_id,
+        token_version=db_user.token_version,
+    )
     metadata = {"roles": [role], "source": "database", "session_id": session_id}
     if metadata_extra:
         metadata.update(metadata_extra)
@@ -562,6 +571,7 @@ async def refresh_local_access_token(
         data.refresh_token,
         user.roles if not settings.demo_mode else [UserRole.ADMIN.value],
         local_source=local_source,
+        token_version=user.token_version,
     )
 
     await log_audit_event(

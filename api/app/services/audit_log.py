@@ -7,6 +7,7 @@ from fastapi import Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser
+from app.core.client_ip import client_ip
 from app.core.config import settings
 from app.core.database import async_session
 from app.models import AuditLog, TaskOutbox
@@ -21,15 +22,8 @@ logger = logging.getLogger(__name__)
 def _request_ip(request: Request | None) -> str | None:
     if request is None:
         return None
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip() or None
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip() or None
-    if request.client:
-        return request.client.host
-    return None
+    value = client_ip(request)
+    return None if value == "unknown" else value
 
 
 def _resolve_actor(user: AuthUser | None) -> tuple[str, list[str] | None, str]:

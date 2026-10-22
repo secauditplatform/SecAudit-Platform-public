@@ -21,6 +21,8 @@ from secaudit_core.url_safety import UnsafeOutboundURLError, validate_outbound_w
 
 TASK_KINDS = ("explain", "generate")
 AAG_MAX_TIMEOUT_SECONDS = 120 * 60
+EXPLAIN_MIN_TOKENS = 4000
+GENERATE_MIN_TOKENS = 8192
 DRAFT_TYPES = ("waiver", "remediation_plan", "audit_flow", "network", "playbook", "mapping")
 HOST_FILTER_KEYS = ("site", "environment", "tag", "os_type", "criticality", "active_only")
 MAX_FINDINGS = 25
@@ -31,10 +33,13 @@ _SYSTEM_PROMPTS = {
         "Reply with one JSON object and no other text. "
         '{"checks":[{"rule":"","host":"","status":"","what":"","checked":"","did":""}]} '
         "One object per finding in the input, in the same order. "
-        "what: one sentence naming the control from its title. "
-        "checked: one sentence on the condition it verifies, from rule_text only. "
-        "did: one or two sentences on what the check did in this run and what it recorded, "
-        "citing run_id=<id> and rule=<rule>. "
+        "what: at least three sentences. Name the control from its title, then explain it "
+        "from explanation, impact, and scope when those are present. "
+        "checked: at least three sentences. State the condition and quote every parameter "
+        "that is present: operator, target, default, value_type, parser, match_pattern, "
+        "criticality, check_script. Do not invent a parameter that is not in the input. "
+        "did: at least two sentences. Quote the message, then say what that recorded value "
+        "means for this control. Cite run_id=<id> and rule=<rule>. "
         "Copy status from the input. Do not change PASS, FAIL, ERROR, or SKIP. "
         "Do not add a check that is not in the input."
     ),
@@ -46,7 +51,11 @@ _SYSTEM_PROMPTS = {
         "Do not sign the package as CIS, STIG, or FSTEK. "
         "rules.format must be secaudit.profile_rules. Each rule needs requirement_id, title, "
         "explanation, criticality, check_script, and match_pattern. "
-        "The script prints RULE0001=PASS style lines for every rule. "
+        "The script performs the check for every rule and prints RULE0001=PASS or FAIL with a short reason. "
+        "Do not print FAIL for every rule without running the check. "
+        "Each rule explanation names the expected value. "
+        "Write overview as several sentences on what the profile checks, and purpose as several sentences "
+        "on the misconfiguration it catches. "
         "Copy every operator line that is present. Do not replace those values. "
         "Fill every omitted field from the request: version, os or software, overview, and purpose. "
         "Name the check script check.sh, check.ps1, or check.py, and set check_script to check. "
@@ -71,6 +80,15 @@ class AagChatResult:
     def __init__(self, text: str, token_count: int | None = None) -> None:
         self.text = text
         self.token_count = token_count
+
+
+def token_limit(kind: str, configured: int) -> int:
+    """Generate needs room for the description, every rule, and a real check script."""
+    if kind == "explain":
+        return max(configured, EXPLAIN_MIN_TOKENS)
+    if kind == "generate":
+        return max(configured, GENERATE_MIN_TOKENS)
+    return configured
 
 
 def system_prompt(kind: str) -> str:
@@ -289,7 +307,7 @@ def build_explain_fragment(findings: list[Mapping[str, Any]], *, run_id: int) ->
         lines.append("; ".join(parts))
         if rule_text:
             lines.append(f"rule_text={rule_text}")
-    return redact_fragment("\n".join(lines))[:12000]
+    return redact_fragment("\n".join(lines))[:24000]
 
 
 def parse_explain_sections(raw: str) -> list[dict[str, Any]]:

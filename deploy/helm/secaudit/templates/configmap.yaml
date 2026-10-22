@@ -15,6 +15,7 @@ data:
   CONSOLE_ALLOW_IN_PRODUCTION: {{ .Values.config.consoleAllowInProduction | quote }}
   SECRETS_BACKEND: {{ .Values.config.secretsBackend | quote }}
   CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
+  TRUSTED_PROXIES: {{ .Values.config.trustedProxies | default "" | quote }}
   FRONTEND_BASE_URL: {{ .Values.config.frontendBaseUrl | quote }}
   PROFILES_PATH: /profiles
   PROFILES_STORAGE_PATH: /data/profiles

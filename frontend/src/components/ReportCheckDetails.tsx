@@ -339,7 +339,7 @@ export function ReportCheckDetails({
                 direction={sort.direction}
                 onSort={toggleSort}
               />
-              <th scope="col" />
+              <th scope="col" className="pf-table__col-actions" />
             </tr>
           </thead>
           <tbody>
@@ -418,26 +418,36 @@ export function ReportCheckDetails({
                         </div>
                       </td>
                       <td>{row.message || t("common.dash")}</td>
-                      <td onClick={(event) => event.stopPropagation()}>
-                        {canRequestWaiver ? (
-                          <Button variant="secondary" className="pf-btn--sm" onClick={() => onRequestWaiver(row)}>
-                            {t("reports.requestWaiver")}
-                          </Button>
-                        ) : null}
-                        {runId != null && (row.status === "fail" || row.status === "error") ? (
-                          <Link to={`/aag/explain?runId=${runId}&checks=${row.id}`}>{t("aag.openExplain")}</Link>
-                        ) : null}
+                      <td className="pf-table__col-actions" onClick={(event) => event.stopPropagation()}>
+                        <div className="pf-table__actions pf-check-details__actions">
+                          {canRequestWaiver ? (
+                            <Button variant="secondary" className="pf-btn--sm" onClick={() => onRequestWaiver(row)}>
+                              {t("reports.requestWaiver")}
+                            </Button>
+                          ) : null}
+                          {runId != null &&
+                          (row.status.toLowerCase() === "fail" || row.status.toLowerCase() === "error") ? (
+                            <Link
+                              to={`/aag/explain?runId=${runId}&checks=${row.id}`}
+                              className="pf-btn pf-btn--secondary pf-btn--sm"
+                            >
+                              {t("aag.openExplain")}
+                            </Link>
+                          ) : null}
+                        </div>
                       </td>
                     </tr>
                     {cveRefs.length > 0 ? (
                       <tr className="pf-cve-refs-row">
                         <td colSpan={6}>
-                          <div className="pf-cve-refs">
+                          <div className="pf-cve-refs" role="group" aria-label={t("reports.cveRefsLabel")}>
                             <p className="pf-cve-refs__label">{t("reports.cveRefsLabel")}</p>
-                            <ul className="pf-cve-refs__list" aria-label={t("reports.cveRefsLabel")}>
+                            <ul className="pf-cve-refs__list">
                               {cveRefs.map((ref) => (
                                 <li key={`${ref.cve_id}-${ref.matched_by}`} className="pf-cve-refs__item">
-                                  <span className="pf-table__mono pf-cve-refs__id">{ref.cve_id}</span>
+                                  <Badge variant="warning" literal>
+                                    {ref.cve_id}
+                                  </Badge>
                                   <span className="pf-cve-refs__match">{t(matchedLabelKey(ref.matched_by))}</span>
                                   {ref.summary ? <span className="pf-cve-refs__summary">{ref.summary}</span> : null}
                                 </li>

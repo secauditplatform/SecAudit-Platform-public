@@ -21,6 +21,7 @@ from app.core.auth import AuthUser
 from app.core.config import settings
 from app.models import (
     AagArtifact,
+    AagCallLog,
     AagProviderConfig,
     CheckResult,
     Host,
@@ -291,6 +292,184 @@ async def _artifact_visible(db: AsyncSession, user: AuthUser, artifact: AagArtif
     return visible.scalar_one_or_none() is not None
 
 
+def fold_aag_usage(
+    grouped: list[tuple[str, str, int]],
+    imported_names: list[str],
+    live_profiles: set[str],
+    call_outcomes: list[tuple[str, int]],
+    providers: int,
+    explain_runs: int,
+) -> dict[str, int]:
+    """Turn grouped rows into the Status counts. A removed profile is not still in the list."""
+    bucket = {
+        "explain": {"completed": 0, "failed": 0, "pending": 0},
+        "generate": {"completed": 0, "failed": 0, "pending": 0},
+    }
+    for kind, status, count in grouped:
+        slot = bucket.get(kind)
+        if slot is None:
+            continue
+        key = status if status in slot else "pending"
+        slot[key] += count
+    in_list = sum(1 for name in imported_names if name and name in live_profiles)
+    calls_total = sum(count for _, count in call_outcomes)
+    calls_failed = sum(count for outcome, count in call_outcomes if outcome != "ok")
+
+    def total(kind: str) -> int:
+        return sum(bucket[kind].values())
+
+    return {
+        "explain_total": total("explain"),
+        "explain_completed": bucket["explain"]["completed"],
+        "explain_failed": bucket["explain"]["failed"],
+        "explain_pending": bucket["explain"]["pending"],
+        "generate_total": total("generate"),
+        "generate_completed": bucket["generate"]["completed"],
+        "generate_failed": bucket["generate"]["failed"],
+        "generate_pending": bucket["generate"]["pending"],
+        "profiles_in_list": in_list,
+        "profiles_ready": len(imported_names) - in_list,
+        "calls_total": calls_total,
+        "calls_failed": calls_failed,
+        "providers": providers,
+        "explain_runs": explain_runs,
+    }
+
+
+def fold_call_metrics(
+    rows: list[tuple[str, str, str, int, int, int, int]],
+) -> dict[str, object]:
+    """Group journal rows by model. ``rows`` are model, kind, outcome, tokens, duration sum, timed calls, count."""
+    tokens_total = tokens_explain = tokens_generate = 0
+    duration_sum = duration_calls = 0
+    models: dict[str, dict[str, object]] = {}
+    for model, kind, outcome, tokens, duration, timed, count in rows:
+        tokens = max(0, int(tokens))
+        duration = max(0, int(duration))
+        timed = max(0, int(timed))
+        count = max(0, int(count))
+        tokens_total += tokens
+        if kind == "explain":
+            tokens_explain += tokens
+        elif kind == "generate":
+            tokens_generate += tokens
+        duration_sum += duration
+        duration_calls += timed
+        name = (model or "").strip()
+        slot = models.get(name)
+        if slot is None:
+            slot = {
+                "model_name": name,
+                "other": False,
+                "calls": 0,
+                "failed": 0,
+                "tokens": 0,
+                "explain_calls": 0,
+                "generate_calls": 0,
+            }
+            models[name] = slot
+        slot["calls"] = int(slot["calls"]) + count
+        slot["tokens"] = int(slot["tokens"]) + tokens
+        if outcome != "ok":
+            slot["failed"] = int(slot["failed"]) + count
+        if kind == "explain":
+            slot["explain_calls"] = int(slot["explain_calls"]) + count
+        elif kind == "generate":
+            slot["generate_calls"] = int(slot["generate_calls"]) + count
+    ranked = sorted(models.values(), key=lambda item: (-int(item["tokens"]), -int(item["calls"]), str(item["model_name"])))
+    shown = ranked[:8]
+    rest = ranked[8:]
+    if rest:
+        shown.append(
+            {
+                "model_name": "",
+                "other": True,
+                "calls": sum(int(item["calls"]) for item in rest),
+                "failed": sum(int(item["failed"]) for item in rest),
+                "tokens": sum(int(item["tokens"]) for item in rest),
+                "explain_calls": sum(int(item["explain_calls"]) for item in rest),
+                "generate_calls": sum(int(item["generate_calls"]) for item in rest),
+            }
+        )
+    return {
+        "tokens_total": tokens_total,
+        "tokens_explain": tokens_explain,
+        "tokens_generate": tokens_generate,
+        "duration_ms_avg": duration_sum // duration_calls if duration_calls else 0,
+        "models": shown,
+    }
+
+
+async def aag_usage(db: AsyncSession) -> dict[str, object]:
+    grouped = (
+        await db.execute(
+            select(AagArtifact.kind, AagArtifact.status, func.count()).group_by(
+                AagArtifact.kind, AagArtifact.status
+            )
+        )
+    ).all()
+    metas = (
+        await db.execute(
+            select(AagArtifact.meta_json).where(
+                AagArtifact.kind == "generate",
+                AagArtifact.status == "completed",
+            )
+        )
+    ).scalars().all()
+    imported = [str((meta or {}).get("imported_profile_name") or "").strip() for meta in metas]
+    claimed = {name for name in imported if name}
+    live: set[str] = set()
+    if claimed:
+        live = set(
+            (await db.execute(select(Profile.profile_name).where(Profile.profile_name.in_(claimed)))).scalars()
+        )
+    call_rows = (
+        await db.execute(
+            select(
+                AagCallLog.model_name,
+                AagCallLog.kind,
+                AagCallLog.outcome,
+                func.coalesce(func.sum(AagCallLog.token_count), 0),
+                func.coalesce(func.sum(AagCallLog.duration_ms), 0),
+                func.count(AagCallLog.duration_ms),
+                func.count(),
+            ).group_by(AagCallLog.model_name, AagCallLog.kind, AagCallLog.outcome)
+        )
+    ).all()
+    folded_calls = [
+        (
+            str(model or ""),
+            str(kind or ""),
+            str(outcome or ""),
+            int(tokens or 0),
+            int(duration or 0),
+            int(timed or 0),
+            int(count or 0),
+        )
+        for model, kind, outcome, tokens, duration, timed, count in call_rows
+    ]
+    outcomes: dict[str, int] = {}
+    for _model, _kind, outcome, _tokens, _duration, _timed, count in folded_calls:
+        outcomes[outcome] = outcomes.get(outcome, 0) + count
+    providers = await db.scalar(select(func.count()).select_from(AagProviderConfig)) or 0
+    explain_runs = await db.scalar(
+        select(func.count(func.distinct(AagArtifact.run_id))).where(
+            AagArtifact.kind == "explain",
+            AagArtifact.run_id.is_not(None),
+        )
+    ) or 0
+    counts: dict[str, object] = fold_aag_usage(
+        [(str(kind), str(status), int(count)) for kind, status, count in grouped],
+        imported,
+        live,
+        list(outcomes.items()),
+        int(providers),
+        int(explain_runs),
+    )
+    counts.update(fold_call_metrics(folded_calls))
+    return counts
+
+
 async def list_aag_artifacts(
     db: AsyncSession,
     user: AuthUser,
@@ -354,6 +533,29 @@ async def _completed_run(db: AsyncSession, user: AuthUser, run_id: int) -> JobRu
     return run
 
 
+_PARAMETER_FIELDS = (
+    ("criticality", "criticality"),
+    ("impact", "impact"),
+    ("scope", "scope"),
+    ("operator", "operator"),
+    ("target_value", "target"),
+    ("default_value", "default"),
+    ("value_type", "value_type"),
+    ("parser_rule", "parser"),
+    ("match_pattern", "match_pattern"),
+    ("check_script", "check_script"),
+)
+
+
+def _parameter_line(rule: dict) -> str:
+    parts: list[str] = []
+    for key, label in _PARAMETER_FIELDS:
+        value = str(rule.get(key) or "").strip()
+        if value:
+            parts.append(f"{label}={value}")
+    return "; ".join(parts)
+
+
 def _rule_index(package_path: str | None) -> tuple[dict[str, str], dict[str, str], set[str]]:
     texts: dict[str, str] = {}
     titles: dict[str, str] = {}
@@ -371,6 +573,9 @@ def _rule_index(package_path: str | None) -> tuple[dict[str, str], dict[str, str
         title = str(rule.get("title") or "").strip()
         explanation = str(rule.get("explanation") or "").strip()
         text = ". ".join(part for part in (title, explanation) if part)
+        parameters = _parameter_line(rule)
+        if parameters:
+            text = f"{text}\nparameters: {parameters}".strip()
         for key in keys:
             if key:
                 texts[key] = text

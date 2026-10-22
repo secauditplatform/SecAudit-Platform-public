@@ -22,6 +22,7 @@ from secaudit_core.aag_client import (
     complete_chat,
     generated_package_files,
     package_request_errors,
+    token_limit,
     write_generated_package,
 )
 from secaudit_core.models import AagArtifact, AagCallLog, AagProviderConfig
@@ -139,7 +140,7 @@ def run_aag_artifact(artifact_id: int, *, database_url: str, settings: SecAuditS
                 kind=artifact.kind,
                 api_key=api_key,
                 timeout_seconds=row.timeout_seconds or settings.ai_timeout_seconds,
-                max_tokens=row.max_tokens or settings.ai_max_tokens,
+                max_tokens=token_limit(artifact.kind, row.max_tokens or settings.ai_max_tokens),
                 retry_on_network_error=settings.ai_retry_on_network_error,
                 allow_private=settings.outbound_webhooks_allow_private,
                 citation=artifact.citations_json,

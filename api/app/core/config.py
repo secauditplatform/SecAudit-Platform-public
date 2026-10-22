@@ -33,7 +33,11 @@ class Settings(SecAuditSettings):
     local_auth_rate_limit_enabled: bool = True
     local_auth_rate_limit_max_attempts: int = 10
     local_auth_rate_limit_window_seconds: int = 60
-    # When true, every local access token is checked against DB is_active/roles.
+    # Comma-separated CIDRs of reverse proxies allowed to supply X-Forwarded-For.
+    # Empty means forwarded headers are ignored (secure default).
+    trusted_proxies: str = ""
+    # When true, roles are re-read on every local access token. Token version and
+    # is_active are always checked for database-backed local tokens.
     local_auth_revalidate_user: bool = True
     # Lifetime of the intermediate token issued between password and TOTP steps.
     local_auth_mfa_challenge_ttl_seconds: int = 300

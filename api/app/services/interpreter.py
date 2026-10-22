@@ -75,10 +75,30 @@ def _safe_extract_tar(archive: tarfile.TarFile, dest: Path) -> None:
         raise ValueError("Archive contains too many files")
     dest_root = dest.resolve()
     for member in archive.getmembers():
+        if member.issym() or member.islnk():
+            raise ValueError(f"Archive links are not allowed: {member.name}")
+        if not member.isfile() and not member.isdir():
+            raise ValueError(f"Unsupported archive member: {member.name}")
         target = (dest / member.name).resolve()
         if dest_root not in target.parents and target != dest_root:
             raise ValueError(f"Unsafe archive path: {member.name}")
-    archive.extractall(dest, filter="data")
+
+    for member in archive.getmembers():
+        target = (dest / member.name).resolve()
+        if member.isdir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = archive.extractfile(member)
+        if source is None:
+            raise ValueError(f"Unreadable archive member: {member.name}")
+        with source, target.open("wb") as output:
+            shutil.copyfileobj(source, output)
+        if member.mode:
+            try:
+                target.chmod(member.mode & 0o777)
+            except OSError:
+                pass
 
 
 def _resolve_package_root(extracted_dir: Path) -> Path:

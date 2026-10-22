@@ -110,6 +110,8 @@ config:
   consoleAllowInProduction: "false"
   secretsBackend: "fernet"
   corsOrigins: "https://secaudit.example.com"
+  # Pod/ingress CIDR of the frontend proxy; empty disables X-Forwarded-For trust.
+  trustedProxies: ""
   frontendBaseUrl: "https://secaudit.example.com"
   profilesAutoSeed: "false"
   sshStrictHostKeyChecking: "true"

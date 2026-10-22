@@ -2047,6 +2047,38 @@ class AagStatusRead(BaseModel):
     demo_mode: bool = False
 
 
+class AagUsageModelRead(BaseModel):
+    model_name: str = ""
+    other: bool = False
+    calls: int = 0
+    failed: int = 0
+    tokens: int = 0
+    explain_calls: int = 0
+    generate_calls: int = 0
+
+
+class AagUsageRead(BaseModel):
+    explain_total: int = 0
+    explain_completed: int = 0
+    explain_failed: int = 0
+    explain_pending: int = 0
+    generate_total: int = 0
+    generate_completed: int = 0
+    generate_failed: int = 0
+    generate_pending: int = 0
+    profiles_in_list: int = 0
+    profiles_ready: int = 0
+    calls_total: int = 0
+    calls_failed: int = 0
+    providers: int = 0
+    explain_runs: int = 0
+    tokens_total: int = 0
+    tokens_explain: int = 0
+    tokens_generate: int = 0
+    duration_ms_avg: int = 0
+    models: list[AagUsageModelRead] = Field(default_factory=list)
+
+
 class AagConnectionRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

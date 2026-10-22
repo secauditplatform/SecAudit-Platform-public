@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import yaml
+
+# Controller-side lookups can read the worker environment/files; inventory and
+# credential variables are equally off-limits to an operator-authored playbook.
+_FORBIDDEN_TEMPLATE = re.compile(r"\b(?:lookup|query)\s*\(", re.IGNORECASE)
+_FORBIDDEN_VARS = re.compile(
+    r"\b(?:hostvars|ansible_password|ansible_ssh_pass|ansible_ssh_private_key_passphrase)\b",
+    re.IGNORECASE,
+)
+_FORBIDDEN_CONNECTION_VAR = re.compile(r"\bansible_connection\b", re.IGNORECASE)
+_CONTROLLER_FILE_MODULES = frozenset(
+    {"copy", "template", "assemble", "unarchive", "script"}
+)
 
 # Local controller execution is allowed only for constrained network/audit patterns.
 _LOCAL_CONNECTION_MODULES = frozenset(
@@ -144,6 +157,14 @@ def _play_uses_local_connection(play: dict[str, Any]) -> bool:
     return False
 
 
+def _task_uses_local_connection(task: dict[str, Any]) -> bool:
+    vars_block = task.get("vars")
+    if not isinstance(vars_block, dict):
+        return False
+    ansible_connection = vars_block.get("ansible_connection")
+    return ansible_connection is not None and _normalize_module(str(ansible_connection)) == "local"
+
+
 def _task_module_name(task: dict[str, Any]) -> str | None:
     if "action" in task:
         action = task["action"]
@@ -233,6 +254,47 @@ def _assert_local_task_allowed(
         )
 
 
+def _controller_src(module: str, args: Any) -> str | None:
+    if isinstance(args, dict):
+        if args.get("remote_src") is True:
+            return None
+        for key in ("src", "cmd"):
+            if key in args and args[key] is not None:
+                return str(args[key])
+        return None
+    text = str(args or "").strip()
+    if not text:
+        return None
+    if module == "script":
+        return text.split()[0]
+    match = re.search(r"(?:^|\s)src\s*=\s*(\S+)", text)
+    return match.group(1) if match else None
+
+
+def _assert_no_controller_file_read(task: dict[str, Any], context: str) -> None:
+    """Reject copy/template/script reads from absolute or traversal paths."""
+    for key, args in task.items():
+        if not isinstance(key, str):
+            continue
+        module = key.rsplit(".", 1)[-1]
+        if module not in _CONTROLLER_FILE_MODULES:
+            continue
+        src = _controller_src(module, args)
+        if src is None:
+            continue
+        cleaned = src.strip().strip("'\"")
+        parts = cleaned.replace("\\", "/").split("/")
+        if (
+            cleaned.startswith(("/", "~"))
+            or ".." in parts
+            or "{{" in cleaned
+            or "{%" in cleaned
+        ):
+            raise PlaybookSecurityError(
+                f"{context}: {module} may only use a relative package file as src"
+            )
+
+
 def assert_playbook_local_execution_policy(content: str) -> None:
     """Reject playbooks that would run unconstrained code on the Ansible controller.
 
@@ -241,6 +303,18 @@ def assert_playbook_local_execution_policy(content: str) -> None:
     set ``connection: local`` on ``hosts: all`` or use shell/raw/copy on localhost
     are rejected at validate and runtime.
     """
+    if _FORBIDDEN_TEMPLATE.search(content or ""):
+        raise PlaybookSecurityError(
+            "lookup/query is forbidden in playbooks (controller-side data access)"
+        )
+    if _FORBIDDEN_VARS.search(content or ""):
+        raise PlaybookSecurityError(
+            "hostvars and credential variables are forbidden in playbooks"
+        )
+    if _FORBIDDEN_CONNECTION_VAR.search(content or ""):
+        raise PlaybookSecurityError(
+            "ansible_connection variable is forbidden; use the play-level connection keyword"
+        )
     try:
         loaded = yaml.safe_load(content or "")
     except yaml.YAMLError as exc:
@@ -263,6 +337,10 @@ def assert_playbook_local_execution_policy(content: str) -> None:
         play_name = play.get("name")
         if play_name:
             context = f"Play #{index} ({play_name})"
+        if isinstance(play.get("vars"), dict) and "ansible_connection" in play["vars"]:
+            raise PlaybookSecurityError(
+                f"{context}: ansible_connection in vars is forbidden; use the play-level connection keyword"
+            )
 
         local_connection = _play_uses_local_connection(play) or _hosts_are_localhost_only(
             play.get("hosts")
@@ -276,11 +354,18 @@ def assert_playbook_local_execution_policy(content: str) -> None:
         for task in _iter_task_dicts(play.get("tasks")):
             task_name = str(task.get("name") or "unnamed task")
             task_context = f"{context} / task '{task_name}'"
+            if isinstance(task.get("vars"), dict) and "ansible_connection" in task["vars"]:
+                raise PlaybookSecurityError(
+                    f"{task_context}: ansible_connection in task vars is forbidden"
+                )
             if "local_action" in task:
                 raise PlaybookSecurityError(
                     f"{task_context}: local_action is forbidden (unsandboxed worker execution)"
                 )
             delegated_local = _delegate_is_local(task.get("delegate_to"))
+
+            if not local_connection and not delegated_local:
+                _assert_no_controller_file_read(task, task_context)
 
             if local_connection:
                 _assert_local_task_allowed(
