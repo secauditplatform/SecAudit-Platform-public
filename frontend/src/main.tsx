@@ -28,6 +28,7 @@ import { TrendsPage } from "./pages/TrendsPage";
 import { AuditLogsPage } from "./pages/AuditLogsPage";
 import { AuditFlowPage } from "./pages/AuditFlowPage";
 import { AuditMapPage } from "./pages/AuditMapPage";
+import { AuditMapDesignsPage } from "./pages/AuditMapDesignsPage";
 import { AagConnectionPage, AagExplainPage, AagGeneratePage } from "./pages/aag/AagPages";
 import { UsersPage } from "./pages/UsersPage";
 import "./index.css";
@@ -74,6 +75,7 @@ createRoot(document.getElementById("root")!).render(
                       <Route path="console" element={<ConsolePage />} />
                       <Route path="hosts" element={<HostsPage />} />
                       <Route path="audit-map" element={<AuditMapPage />} />
+                      <Route path="audit-map/designs" element={<AuditMapDesignsPage />} />
                       <Route path="audit-map/coverage" element={<Navigate to="/audit-map" replace />} />
                       <Route path="credentials" element={<CredentialsPage />} />
                       <Route path="users" element={<UsersPage />} />

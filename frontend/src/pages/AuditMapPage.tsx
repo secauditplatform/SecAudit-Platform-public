@@ -11,38 +11,27 @@ import { PageHeader } from "../components/ui/PageHeader";
 import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
 import { useTranslation } from "../i18n/I18nProvider";
-import {
-  AUDIT_MAP_DEFAULT_ZOOM,
-  AUDIT_MAP_MAX_ZOOM,
-  AUDIT_MAP_MIN_ZOOM,
-  fitAuditMapCamera,
-  packAuditMap,
-} from "./auditMapLayout";
+import { AuditMapDonutMap } from "./AuditMapDonutMap";
+import { AuditMapRadar } from "./AuditMapRadar";
+import { isRadarAggregate } from "./auditMapRadarLayout";
 import { existingAuditJob, readyAuditJob, readyAuditTemplate, reusableAuditJob } from "./auditMapRun";
 
 const UNASSIGNED = "__none__";
 const STATUS_ORDER = ["pass", "fail", "error", "unchecked"] as const;
 const VIEWS: AuditMapViewName[] = ["network", "service", "platform", "profile"];
 
-type DisplayMode = "map" | "list" | "donut";
-const DISPLAY_MODES: DisplayMode[] = ["map", "list", "donut"];
+type DisplayMode = "list" | "donut" | "radar";
+const DISPLAY_MODES: DisplayMode[] = ["radar", "donut", "list"];
 const DISPLAY_LABEL: Record<DisplayMode, string> = {
-  map: "auditMap.displayMap",
   list: "auditMap.displayList",
   donut: "auditMap.displayDonut",
+  radar: "auditMap.displayRadar",
 };
 
 function displayParam(value: string | null): DisplayMode {
   if (value === "list" || value === "donut") return value;
-  return "map";
+  return "radar";
 }
-
-const DONUT_STROKE: Record<string, string> = {
-  pass: "var(--pf-green-500)",
-  fail: "var(--pf-red-600)",
-  error: "var(--pf-gold-400)",
-  unchecked: "var(--pf-black-400)",
-};
 
 function statusCounts(items: { status: string }[]): Record<string, number> {
   const counts: Record<string, number> = { pass: 0, fail: 0, error: 0, unchecked: 0 };
@@ -53,53 +42,6 @@ function statusCounts(items: { status: string }[]): Record<string, number> {
   return counts;
 }
 
-function StatusDonut({ counts, total, label }: { counts: Record<string, number>; total: number; label: string }) {
-  const radius = 34;
-  const circle = 2 * Math.PI * radius;
-  let taken = 0;
-  return (
-    <div className="pf-audit-map__donut" role="img" aria-label={label}>
-      <svg viewBox="0 0 88 88" width="88" height="88" aria-hidden="true">
-        <circle
-          cx="44"
-          cy="44"
-          r={radius}
-          fill="none"
-          strokeWidth="12"
-          style={{ stroke: "color-mix(in srgb, var(--text-secondary) 14%, transparent)" }}
-        />
-        <g transform="rotate(-90 44 44)">
-          {STATUS_ORDER.map((status) => {
-            const value = counts[status] ?? 0;
-            if (!value || !total) return null;
-            const length = (value / total) * circle;
-            const offset = -(taken / total) * circle;
-            taken += value;
-            return (
-              <circle
-                key={status}
-                cx="44"
-                cy="44"
-                r={radius}
-                fill="none"
-                strokeWidth="12"
-                style={{ stroke: DONUT_STROKE[status] }}
-                strokeDasharray={`${length} ${circle - length}`}
-                strokeDashoffset={offset}
-              />
-            );
-          })}
-        </g>
-      </svg>
-      <span className="pf-audit-map__donut-total" aria-hidden="true">
-        {total}
-      </span>
-    </div>
-  );
-}
-
-type Point = { x: number; y: number };
-
 function siteParam(value: string): string | undefined {
   return value || undefined;
 }
@@ -107,10 +49,6 @@ function siteParam(value: string): string | undefined {
 function viewParam(value: string | null): AuditMapViewName {
   if (value === "service" || value === "platform" || value === "profile") return value;
   return "network";
-}
-
-function repeatsHost(view: AuditMapViewName): boolean {
-  return view === "service" || view === "profile";
 }
 
 function nodeLabel(node: AuditMapNode, mode: "ip" | "dns"): string {
@@ -160,87 +98,38 @@ export function AuditMapPage() {
   const criticality = params.get("criticality") ?? "";
   const profile = params.get("profile") ?? "";
   const tag = params.get("tag") ?? "";
-  const view = viewParam(params.get("view"));
+  const rawView = viewParam(params.get("view"));
   const labelMode = params.get("label") === "dns" ? "dns" : "ip";
   const display = displayParam(params.get("display"));
-  const [draft, setDraft] = useState<Record<string, Point>>({});
+  const view = display === "donut" && rawView === "profile" ? "network" : rawView;
   const [activeId, setActiveId] = useState<number | null>(null);
   const [activeGroup, setActiveGroup] = useState<string | null>(null);
   const [donutGroup, setDonutGroup] = useState<string | null>(null);
   const [focus, setFocus] = useState<string | null>(null);
+  const [radarZoom, setRadarZoom] = useState(1);
+  const [radarPan, setRadarPan] = useState({ x: 0, y: 0 });
   const [trackedRun, setTrackedRun] = useState<{ hostId: number; runId: number } | null>(null);
   const refreshedRun = useRef<number | null>(null);
-  const [zoom, setZoom] = useState(AUDIT_MAP_DEFAULT_ZOOM);
-  const [pan, setPan] = useState<Point>({ x: 0, y: 0 });
-  const camera = useRef({ zoom: AUDIT_MAP_DEFAULT_ZOOM, pan: { x: 0, y: 0 } });
-  const userAdjusted = useRef(false);
-  const layoutRef = useRef<{ placed: Map<string, Point> }>({ placed: new Map() });
-  const viewportRef = useRef<HTMLDivElement | null>(null);
   const detailRef = useRef<HTMLElement | null>(null);
-  const panDrag = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
-  const suppressClick = useRef(false);
-
-  function applyCamera(nextZoom: number, nextPan: Point) {
-    camera.current = { zoom: nextZoom, pan: nextPan };
-    setZoom(nextZoom);
-    setPan(nextPan);
-  }
-
-  function fitCamera() {
-    const el = viewportRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    const next = fitAuditMapCamera([...layoutRef.current.placed.values()], {
-      width: rect.width,
-      height: rect.height,
-    });
-    userAdjusted.current = false;
-    applyCamera(next.zoom, next.pan);
-  }
-
-  function resetCamera() {
-    fitCamera();
-  }
-
-  function zoomBy(factor: number, centerX?: number, centerY?: number) {
-    const el = viewportRef.current;
-    const { zoom: current, pan: currentPan } = camera.current;
-    const next = Math.min(AUDIT_MAP_MAX_ZOOM, Math.max(AUDIT_MAP_MIN_ZOOM, current * factor));
-    if (next === current) return;
-    userAdjusted.current = true;
-    const scale = next / current;
-    let anchor = { x: 0, y: 0 };
-    if (el && centerX != null && centerY != null) {
-      const rect = el.getBoundingClientRect();
-      anchor = { x: centerX - rect.left, y: centerY - rect.top };
-    } else if (el) {
-      const rect = el.getBoundingClientRect();
-      anchor = { x: rect.width / 2, y: rect.height / 2 };
-    }
-    applyCamera(next, {
-      x: anchor.x - (anchor.x - currentPan.x) * scale,
-      y: anchor.y - (anchor.y - currentPan.y) * scale,
-    });
-  }
-
-  useEffect(() => {
-    const el = viewportRef.current;
-    if (!el) return;
-    const onWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      zoomBy(event.deltaY < 0 ? 1.12 : 1 / 1.12, event.clientX, event.clientY);
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, []);
 
   useEffect(() => {
     const panel = detailRef.current;
-    if (!panel || activeId == null || (display !== "map" && display !== "donut")) return;
+    if (!panel || activeId == null || display !== "radar") return;
     const fit = () => {
       const scroller = panel.closest(".pf-main");
       if (!(scroller instanceof HTMLElement)) return;
-      panel.style.maxHeight = `${Math.max(280, scroller.clientHeight - 16)}px`;
+      if (window.matchMedia("(max-width: 1180px)").matches) {
+        panel.style.maxHeight = "";
+        return;
+      }
+      const stage = panel.closest(".pf-audit-map__stage--overlay");
+      const top = panel.getBoundingClientRect().top;
+      const available = Math.min(
+        scroller.clientHeight - 16,
+        stage instanceof HTMLElement ? stage.clientHeight : scroller.clientHeight,
+        window.innerHeight - top - 16,
+      );
+      panel.style.maxHeight = `${Math.max(280, available)}px`;
     };
     fit();
     panel.scrollIntoView({ block: "nearest" });
@@ -250,6 +139,15 @@ export function AuditMapPage() {
       panel.style.maxHeight = "";
     };
   }, [activeId, display]);
+
+  const availableViews = display === "donut" ? VIEWS.filter((item) => item !== "profile") : VIEWS;
+
+  useEffect(() => {
+    if (display !== "donut" || rawView !== "profile") return;
+    const next = new URLSearchParams(params);
+    next.delete("view");
+    setParams(next, { replace: true });
+  }, [display, params, rawView, setParams]);
 
   const filters = {
     site: siteParam(site),
@@ -346,11 +244,24 @@ export function AuditMapPage() {
     return [...seen.values()];
   }, [groups]);
 
-  const layout = useMemo(
-    () => packAuditMap(visibleGroups, new Map(), draft, false),
-    [visibleGroups, draft],
+  const profilesBySize = useMemo(() => {
+    if (view !== "profile") return visibleGroups;
+    return [...visibleGroups].sort(
+      (a, b) => b.nodes.length - a.nodes.length || (a.key ?? "").localeCompare(b.key ?? ""),
+    );
+  }, [view, visibleGroups]);
+  const radarGroups = useMemo(
+    () => (view === "profile" ? profilesBySize.slice(0, 12) : visibleGroups),
+    [profilesBySize, view, visibleGroups],
   );
-  layoutRef.current = layout;
+  const profileTail = useMemo(
+    () => (view === "profile" ? profilesBySize.slice(12) : []),
+    [profilesBySize, view],
+  );
+  const selectorGroups = useMemo(
+    () => (view === "profile" ? profileTail : groups),
+    [groups, profileTail, view],
+  );
 
   const active = useMemo(() => {
     if (activeId == null) return null;
@@ -366,15 +277,22 @@ export function AuditMapPage() {
     return null;
   }, [activeGroup, activeId, groups, view]);
 
-  const canvasNodes = useMemo(() => {
-    const list: { groupKey: string; node: AuditMapNode }[] = [];
-    for (const group of visibleGroups) {
-      for (const node of group.nodes) {
-        list.push({ groupKey: group.key ?? "", node });
-      }
-    }
-    return list;
-  }, [visibleGroups]);
+  const radarAggregate = useMemo(() => isRadarAggregate(radarGroups), [radarGroups]);
+  const radarCounts = useMemo(
+    () => statusCounts(visibleGroups.flatMap((group) => group.nodes)),
+    [visibleGroups],
+  );
+  const radarTotal = radarCounts.pass + radarCounts.fail + radarCounts.error + radarCounts.unchecked;
+  const runningHostId =
+    trackedRun &&
+    (runQuery.data?.status === "pending" || runQuery.data?.status === "running" || !runQuery.data)
+      ? trackedRun.hostId
+      : null;
+
+  useEffect(() => {
+    setRadarZoom(1);
+    setRadarPan({ x: 0, y: 0 });
+  }, [focus, view, mapQuery.data]);
 
   const liveRun = trackedRun && active && trackedRun.hostId === active.host_id ? runQuery.data : undefined;
   const liveStatus = liveRun?.status;
@@ -408,7 +326,6 @@ export function AuditMapPage() {
     setActiveGroup(null);
     setDonutGroup(null);
     setFocus(null);
-    setDraft({});
   }
 
   function setView(nextView: AuditMapViewName) {
@@ -416,7 +333,6 @@ export function AuditMapPage() {
     next.set("view", nextView);
     setParams(next);
     setActiveGroup(null);
-    setDraft({});
     setDonutGroup(null);
     setFocus(null);
   }
@@ -430,6 +346,7 @@ export function AuditMapPage() {
   function setDisplay(mode: DisplayMode) {
     const next = new URLSearchParams(params);
     next.set("display", mode);
+    if (mode === "donut" && view === "profile") next.delete("view");
     setParams(next);
   }
 
@@ -477,67 +394,23 @@ export function AuditMapPage() {
     setActiveGroup(null);
   }
 
-  function startDrag(event: React.PointerEvent, placeId: string) {
-    if (!canExecute || repeatsHost(view)) return;
-    if (event.button !== 0) return;
-    const zoomNow = camera.current.zoom;
-    const origin = layout.placed.get(placeId) ?? { x: 0, y: 0 };
-    const startX = event.clientX;
-    const startY = event.clientY;
-    let moved = false;
-    const move = (ev: PointerEvent) => {
-      if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) > 5) moved = true;
-      setDraft((current) => ({
-        ...current,
-        [placeId]: {
-          x: origin.x + (ev.clientX - startX) / zoomNow,
-          y: origin.y + (ev.clientY - startY) / zoomNow,
-        },
-      }));
-    };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      if (moved) {
-        suppressClick.current = true;
-        window.setTimeout(() => {
-          suppressClick.current = false;
-        }, 0);
-      }
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+  function radarZoomBy(factor: number) {
+    setRadarZoom((current) => Math.min(2.5, Math.max(0.6, current * factor)));
   }
 
-  function startPan(event: React.PointerEvent) {
-    if (event.button !== 0) return;
-    if ((event.target as HTMLElement).closest(".pf-audit-map__object, button, a, input, label, select")) return;
-    const startX = event.clientX;
-    const startY = event.clientY;
-    const origin = { ...camera.current.pan };
-    panDrag.current = { startX, startY, originX: origin.x, originY: origin.y };
-    const move = (ev: PointerEvent) => {
-      const drag = panDrag.current;
-      if (!drag) return;
-      if (Math.abs(ev.clientX - drag.startX) + Math.abs(ev.clientY - drag.startY) > 4) {
-        userAdjusted.current = true;
-      }
-      applyCamera(camera.current.zoom, {
-        x: drag.originX + (ev.clientX - drag.startX),
-        y: drag.originY + (ev.clientY - drag.startY),
-      });
-    };
-    const up = () => {
-      panDrag.current = null;
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
+  function resetRadarView() {
+    setRadarZoom(1);
+    setRadarPan({ x: 0, y: 0 });
   }
+
+  const darkPanel = display === "radar" || display === "donut";
 
   const hostCard = active ? (
-            <aside ref={detailRef} className="pf-audit-map__detail" aria-label={active.name}>
+            <aside
+              ref={detailRef}
+              className={`pf-audit-map__detail${darkPanel ? " pf-audit-map__detail--radar" : ""}`}
+              aria-label={active.name}
+            >
               <div className={`pf-audit-map__detail-head pf-audit-map__detail-head--${active.status}`}>
                 <span className="pf-audit-map__detail-glyph" aria-hidden>
                   <PlatformGlyph osType={active.os_type} />
@@ -719,7 +592,7 @@ export function AuditMapPage() {
               {t("auditMap.viewsAria")}
             </span>
             <div className="pf-segmented pf-audit-map__segmented" role="tablist" aria-labelledby="audit-map-view-mode">
-              {VIEWS.map((item) => (
+              {availableViews.map((item) => (
                 <button
                   key={item}
                   type="button"
@@ -945,47 +818,21 @@ export function AuditMapPage() {
       ) : null}
 
       {data && nodes.length > 0 && display === "donut" ? (
-        <div className={donutGroup || active ? "pf-audit-map__stage pf-audit-map__stage--open" : "pf-audit-map__stage"}>
-          <div className="pf-audit-map__donuts">
-          {visibleGroups.map((group) => {
-            const key = group.key ?? "";
-            const counts = statusCounts(group.nodes);
-            const total = group.nodes.length;
-            return (
-              <section
-                key={key || "other"}
-                className={`pf-audit-map__donut-card pf-audit-map__zone--${group.status}${donutGroup === key ? " is-selected" : ""}`}
-                aria-label={`${groupTitle(group.key)} · ${total}`}
-              >
-                <button
-                  type="button"
-                  className="pf-audit-map__donut-head"
-                  aria-expanded={donutGroup === key}
-                  onClick={() => {
-                    setDonutGroup(donutGroup === key ? null : key);
-                    setActiveId(null);
-                    setActiveGroup(null);
-                  }}
-                >
-                  <span className="pf-audit-map__dot" aria-hidden />
-                  <h3>{groupTitle(group.key)}</h3>
-                  <span className="pf-audit-map__group-count">{total}</span>
-                </button>
-                <div className="pf-audit-map__donut-wrap">
-                  <StatusDonut counts={counts} total={total} label={`${groupTitle(group.key)} · ${total}`} />
-                  <ul className="pf-audit-map__donut-legend">
-                    {STATUS_ORDER.map((status) => (
-                      <li key={status}>
-                        <span className={`pf-audit-map__dot pf-audit-map__dot--${status}`} aria-hidden />
-                        <span>{t(`auditMap.legend.${status}`)}</span>
-                        <strong>{counts[status] ?? 0}</strong>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </section>
-            );
-          })}
+        <div className={donutGroup || active ? "pf-audit-map__stage pf-audit-map__stage--donut-open" : "pf-audit-map__stage"}>
+          <div className="pf-audit-map__donut-map-wrap">
+            <p className="pf-audit-map__hint">{t("auditMap.donutMapHint")}</p>
+            <AuditMapDonutMap
+              groups={visibleGroups}
+              titleFor={groupTitle}
+              selectedKey={donutGroup}
+              onSelect={(key) => {
+                const next = key ?? "";
+                setDonutGroup(donutGroup === next ? null : next);
+                setActiveId(null);
+                setActiveGroup(null);
+              }}
+              t={t}
+            />
           </div>
           {active
             ? hostCard
@@ -997,7 +844,7 @@ export function AuditMapPage() {
                 const counts = statusCounts(group.nodes);
                 const total = group.nodes.length;
                 return (
-                  <aside className="pf-audit-map__detail" aria-label={groupTitle(group.key)}>
+                  <aside className="pf-audit-map__detail pf-audit-map__detail--radar" aria-label={groupTitle(group.key)}>
                     <div className={`pf-audit-map__detail-head pf-audit-map__detail-head--${group.status}`}>
                       <span className="pf-audit-map__dot" aria-hidden />
                       <div className="pf-audit-map__detail-title">
@@ -1067,138 +914,130 @@ export function AuditMapPage() {
         </div>
       ) : null}
 
-      {data && nodes.length > 0 && display === "map" ? (
-        <div className={active ? "pf-audit-map__stage pf-audit-map__stage--open" : "pf-audit-map__stage"}>
-          <div className="pf-audit-map__map">
-            <div className="pf-audit-map__maphead">
-              <p className="pf-audit-map__hint">{t("auditMap.canvasHint")}</p>
-              <div className="pf-audit-map__zoombar">
-                <button type="button" aria-label={t("auditMap.zoomOut")} onClick={() => zoomBy(1 / 1.25)}>
-                  −
-                </button>
-                <span aria-hidden>{Math.round(zoom * 100)}%</span>
-                <button type="button" aria-label={t("auditMap.zoomIn")} onClick={() => zoomBy(1.25)}>
-                  +
-                </button>
-                <button type="button" aria-label={t("auditMap.zoomReset")} onClick={resetCamera}>
-                  {t("auditMap.zoomFit")}
-                </button>
+      {data && nodes.length > 0 && display === "radar" ? (
+        <>
+          <div className="pf-audit-map__radar-toolbar">
+            <p className="pf-audit-map__hint">
+              {radarAggregate
+                ? t("auditMap.radarClusterHint")
+                : view === "profile" && profileTail.length > 0
+                  ? t("auditMap.radarProfileHint")
+                  : visibleGroups.length > 8
+                    ? t("auditMap.radarDrillHint")
+                    : t("auditMap.radarHint")}
+            </p>
+            <div className="pf-audit-map__radar-toolbar-controls">
+              <div className="pf-audit-map__radar-hud pf-audit-map__radar-hud--bar">
+                <p className="pf-audit-map__radar-eyebrow">{t("auditMap.radarTotal")}</p>
+                <div className="pf-audit-map__radar-big">
+                  <strong>{radarTotal}</strong>
+                  <span>{t("auditMap.radarNodes")}</span>
+                </div>
+                <div className="pf-audit-map__radar-numbers">
+                  {STATUS_ORDER.map((status) => (
+                    <span key={status} className="pf-audit-map__radar-number">
+                      <span className={`pf-audit-map__dot pf-audit-map__dot--${status}`} aria-hidden />
+                      <span className="pf-audit-map__radar-number-label">
+                        {status === "unchecked" ? t("auditMap.radarUnchecked") : t(`auditMap.legend.${status}`)}
+                      </span>
+                      <b>{radarCounts[status] ?? 0}</b>
+                    </span>
+                  ))}
+                </div>
               </div>
-            </div>
-            <div
-              ref={viewportRef}
-              className="pf-audit-map__canvas"
-              style={{ height: Math.max(480, Math.min(layout.height, 700)) }}
-              onPointerDown={startPan}
-            >
-            <div
-              className="pf-audit-map__world"
-              style={{
-                width: layout.width,
-                height: layout.height,
-                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
-              }}
-            >
-              {layout.frames.map((frame) => (
-                <div
-                  key={frame.key || "other"}
-                  className={`pf-audit-map__group pf-audit-map__group--${frame.status}`}
-                  style={{ top: frame.top, left: frame.left, width: frame.width, height: frame.height }}
-                />
-              ))}
-              {layout.frames.map((frame) => (
-                <button
-                  key={`title-${frame.key || "other"}`}
-                  type="button"
-                  className={`pf-audit-map__group-title pf-audit-map__group-title--${frame.status}`}
-                  style={{ top: frame.top + 12, left: frame.left + 14, maxWidth: frame.width - 28 }}
-                  aria-label={`${groupTitle(frame.key)} · ${frame.count}`}
-                  onClick={() => {
-                    setFocus(focus === frame.key ? null : frame.key);
-                  }}
-                >
-                  <span className="pf-audit-map__group-name">{groupTitle(frame.key)}</span>
-                  <span className="pf-audit-map__group-count">{frame.count}</span>
-                  {(["error", "fail"] as const)
-                    .filter((key) => (frame.stats[key] ?? 0) > 0)
-                    .map((key) => (
-                      <span key={key} className={`pf-audit-map__mini pf-audit-map__mini--${key}`}>
-                        {t(`auditMap.legend.${key}`)} {frame.stats[key]}
-                      </span>
-                    ))}
-                </button>
-              ))}
-              {canvasNodes.map(({ groupKey, node }) => {
-                  const placeId = `${groupKey}:${node.host_id}`;
-                  const point = layout.placed.get(placeId) ?? { x: 0, y: 0 };
-                  const label = view === "network" ? nodeLabel(node, labelMode) : node.name;
-                  const sub = node.ip || node.dns || node.hostname || "";
-                  const hint = `${node.name} · ${sub} · ${t(`auditMap.legend.${node.status}`)}`;
-                  const extra = node.services.length > 1 ? ` +${node.services.length - 1}` : "";
-                  return (
-                    <button
-                      key={placeId}
-                      type="button"
-                      className={`pf-audit-map__object pf-audit-map__object--${node.status}${
-                        point.y < 130 ? " pf-audit-map__object--tip-below" : ""
-                      }${hostSelected(node.host_id, groupKey) ? " pf-audit-map__object--active" : ""}${
-                        trackedRun?.hostId === node.host_id &&
-                        (runQuery.data?.status === "pending" || runQuery.data?.status === "running" || !runQuery.data)
-                          ? " pf-audit-map__object--running"
-                          : ""
-                      }`}
-                      style={{ left: point.x, top: point.y }}
-                      aria-label={hint}
-                      aria-pressed={hostSelected(node.host_id, groupKey)}
-                      onClick={() => {
-                        if (suppressClick.current) return;
-                        openHost(node.host_id, groupKey);
-                      }}
-                      onPointerDown={(event) => startDrag(event, placeId)}
-                    >
-                      <span className="pf-audit-map__object-head">
-                        <span className="pf-audit-map__glyph" aria-hidden>
-                          <PlatformGlyph osType={node.os_type} />
-                        </span>
-                        <span className="pf-audit-map__object-name">{label}</span>
-                        <span className={`pf-audit-map__dot pf-audit-map__dot--${node.status}`} aria-hidden />
-                      </span>
-                      <span className="pf-audit-map__object-sub">{sub || "—"}</span>
-                      <span className="pf-audit-map__object-meta">
-                        <span className="pf-audit-map__port">
-                          {node.port}
-                          {extra}
-                        </span>
-                      </span>
-                      <span className="pf-audit-map__object-stats">
-                        {node.checks && node.checks.pass + node.checks.fail + node.checks.error > 0
-                          ? (["pass", "fail", "error"] as const)
-                              .filter((status) => (node.checks?.[status] ?? 0) > 0)
-                              .map((status) => (
-                                <span key={status} className={`pf-audit-map__mini pf-audit-map__mini--${status}`}>
-                                  {t(`auditMap.legend.${status}`)} {node.checks?.[status]}
-                                </span>
-                              ))
-                          : null}
-                      </span>
-                      <span className="pf-audit-map__tip" aria-hidden>
-                        <strong>{node.name}</strong>
-                        <span>{sub || "—"}</span>
-                        <span>
-                          {t(`auditMap.legend.${node.status}`)} · {t("auditMap.port")} {node.port}
-                          {extra}
-                        </span>
-                      </span>
-                    </button>
-                  );
-              })}
-            </div>
+              <div className="pf-audit-map__radar-zoom">
+                <div className="pf-audit-map__zoombar">
+                  <button type="button" aria-label={t("auditMap.zoomOut")} onClick={() => radarZoomBy(1 / 1.25)}>
+                    −
+                  </button>
+                  <span aria-hidden>{Math.round(radarZoom * 100)}%</span>
+                  <button type="button" aria-label={t("auditMap.zoomIn")} onClick={() => radarZoomBy(1.25)}>
+                    +
+                  </button>
+                  <button type="button" aria-label={t("auditMap.zoomReset")} onClick={resetRadarView}>
+                    {t("auditMap.zoomFit")}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
-          {hostCard}
-        </div>
+          {selectorGroups.length > 0 ? (
+            <div
+              className="pf-audit-map__profile-tail"
+              aria-label={
+                view === "profile"
+                  ? t("auditMap.profileTail")
+                  : view === "network"
+                    ? t("auditMap.radarAllSubnets")
+                    : view === "service"
+                      ? t("auditMap.radarAllPorts")
+                      : t("auditMap.radarAllPlatforms")
+              }
+            >
+              <span className="pf-audit-map__profile-tail-title">
+                {view === "profile"
+                  ? t("auditMap.profileTail")
+                  : view === "network"
+                    ? t("auditMap.radarAllSubnets")
+                    : view === "service"
+                      ? t("auditMap.radarAllPorts")
+                      : t("auditMap.radarAllPlatforms")}{" "}
+                · {selectorGroups.length}
+              </span>
+              {selectorGroups.map((group) => {
+                const active = focus !== null && (group.key ?? "") === focus;
+                return (
+                  <button
+                    key={group.key ?? "other"}
+                    type="button"
+                    className={`pf-audit-map__profile-tail-item${active ? " is-active" : ""}`}
+                    aria-label={`${groupTitle(group.key)} · ${group.nodes.length}`}
+                    aria-pressed={active}
+                    onClick={() => {
+                      const next = group.key ?? "";
+                      setFocus(focus === next ? null : next);
+                      setActiveId(null);
+                      setActiveGroup(null);
+                    }}
+                  >
+                    <span className={`pf-audit-map__dot pf-audit-map__dot--${group.status}`} aria-hidden />
+                    <span>{groupTitle(group.key)}</span>
+                    <b>{group.nodes.length}</b>
+                  </button>
+                );
+              })}
+            </div>
+          ) : null}
+
+          <div className={active ? "pf-audit-map__stage pf-audit-map__stage--overlay" : "pf-audit-map__stage"}>
+            <AuditMapRadar
+              groups={radarGroups}
+              edges={view === "network" ? data.edges : []}
+              labelFor={(node) => (view === "network" ? nodeLabel(node, labelMode) : node.name)}
+              titleFor={groupTitle}
+              isSelected={(node, groupKey) => hostSelected(node.host_id, groupKey)}
+              runningHostId={runningHostId}
+              focusKey={focus}
+              zoom={radarZoom}
+              pan={radarPan}
+              onPan={setRadarPan}
+              onSelect={(node, groupKey) => openHost(node.host_id, groupKey)}
+              onFocusGroup={(key) => {
+                const next = key ?? "";
+                setFocus(focus === next ? null : next);
+                setActiveId(null);
+                setActiveGroup(null);
+              }}
+              t={t}
+            />
+            {hostCard}
+          </div>
+
+
+        </>
       ) : null}
+
     </section>
   );
 }
