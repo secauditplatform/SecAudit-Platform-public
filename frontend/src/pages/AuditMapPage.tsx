@@ -3,10 +3,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api, type AuditMapNode, type AuditMapViewName } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
-import { operationsPath, type OperationsPlatform, type OperationsTask } from "../components/OperationsTabs";
+import {
+  isUnixOsType,
+  operationsPath,
+  type OperationsPlatform,
+  type OperationsTask,
+} from "../components/OperationsTabs";
 import { Button } from "../components/ui/Button";
 import { EmptyState } from "../components/ui/EmptyState";
-import { IconLinux, IconNetwork, IconWindows } from "../components/ui/Icons";
+import { IconLinux, IconNetwork, IconUnix, IconWindows } from "../components/ui/Icons";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Spinner } from "../components/ui/Spinner";
 import { useToast } from "../components/ui/Toast";
@@ -70,6 +75,7 @@ function platformOf(osType: string | null): OperationsPlatform {
   const normalized = (osType ?? "linux").toLowerCase();
   if (normalized === "network") return "network";
   if (normalized === "windows") return "windows";
+  if (isUnixOsType(normalized)) return "unix";
   return "linux";
 }
 
@@ -83,6 +89,7 @@ function PlatformGlyph({ osType }: { osType: string | null }) {
   const kind = (osType ?? "").toLowerCase();
   if (kind === "windows") return <IconWindows />;
   if (kind === "network") return <IconNetwork />;
+  if (isUnixOsType(kind)) return <IconUnix />;
   return <IconLinux />;
 }
 
@@ -354,6 +361,7 @@ export function AuditMapPage() {
     const key = (osType ?? "").toLowerCase();
     if (key === "linux") return t("hosts.osLinux");
     if (key === "windows") return t("hosts.osWindows");
+    if (key === "unix") return t("hosts.osUnix");
     if (key === "network") return t("hosts.osNetwork");
     if (!key || key === "other") return t("auditMap.otherPlatform");
     return osType ?? t("auditMap.otherPlatform");

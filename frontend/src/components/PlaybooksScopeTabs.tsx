@@ -1,26 +1,29 @@
-import { IconLinux, IconNetwork, IconWindows } from "./ui/Icons";
+import { IconLinux, IconNetwork, IconUnix, IconWindows } from "./ui/Icons";
 import { useTranslation } from "../i18n/I18nProvider";
 
-export type PlaybookPlatformScope = "linux" | "windows" | "network";
+export type PlaybookPlatformScope = "linux" | "windows" | "unix" | "network";
 export type PlaybookPageView = "catalog" | "jobs";
 
-const PLATFORMS: PlaybookPlatformScope[] = ["linux", "windows", "network"];
+const PLATFORMS: PlaybookPlatformScope[] = ["linux", "windows", "unix", "network"];
 
 const PLATFORM_LABEL: Record<PlaybookPlatformScope, string> = {
   linux: "playbooks.scopeLinux",
   windows: "playbooks.scopeWindows",
+  unix: "playbooks.scopeUnix",
   network: "playbooks.scopeNetwork",
 };
 
 const PLATFORM_DESCRIPTION: Record<PlaybookPlatformScope, string> = {
   linux: "playbooks.scopeLinuxDescription",
   windows: "playbooks.scopeWindowsDescription",
+  unix: "playbooks.scopeUnixDescription",
   network: "playbooks.scopeNetworkDescription",
 };
 
 const PLATFORM_ICON: Record<PlaybookPlatformScope, typeof IconLinux> = {
   linux: IconLinux,
   windows: IconWindows,
+  unix: IconUnix,
   network: IconNetwork,
 };
 

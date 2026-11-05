@@ -1,3 +1,4 @@
+import ipaddress
 import json
 from datetime import datetime
 from typing import Annotated, Generic, Literal, TypeVar
@@ -192,6 +193,7 @@ class CheckScriptRead(BaseModel):
     execution_type: ExecutionType
     script_file: str
     script_kind: ScriptKind = ScriptKind.AUDIT
+    is_primary: bool = False
     description: str | None
     interpreter_rules: list[InterpreterRuleRead] = []
 
@@ -239,6 +241,51 @@ class ProfileRuleUpdateResult(BaseModel):
     rule: ProfileRuleRead
     profile_version: str
     changelog_entry: ProfileRuleChangelogEntry
+
+
+class ProfileVersionCreate(BaseModel):
+    label: str | None = None
+    requirement_ids: list[str] | None = None
+    activate: bool = True
+
+    @field_validator("label")
+    @classmethod
+    def _trim_label(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        trimmed = value.strip()
+        return trimmed[:128] or None
+
+    @field_validator("requirement_ids")
+    @classmethod
+    def _non_empty(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and not value:
+            raise ValueError("Select at least one check")
+        return value
+
+
+class ProfileVersionRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    profile_id: int
+    number: int
+    label: str | None = None
+    enabled_count: int = 0
+    is_active: bool
+    created_by: str | None = None
+    created_at: datetime
+
+
+class ProfileVersionDetail(ProfileVersionRead):
+    requirement_ids: list[str] = []
+
+
+class ProfileVersionDependencies(BaseModel):
+    jobs: int = 0
+    job_runs: int = 0
+    check_results: int = 0
+    active_runs: int = 0
 
 
 class ProfileDetail(ProfileRead):
@@ -357,6 +404,17 @@ def _normalize_host_label(value: str | None, *, max_len: int) -> str | None:
     return cleaned[:max_len]
 
 
+def _validate_host_address(value: str) -> str:
+    """Reject dotted-numeric typos like 1921.68.1.223 before they reach ssh-keyscan."""
+    cleaned = value.strip()
+    if "." in cleaned and all(ch.isdigit() or ch == "." for ch in cleaned):
+        try:
+            ipaddress.ip_address(cleaned)
+        except ValueError as exc:
+            raise ValueError("Hostname looks like an IP address but is not valid") from exc
+    return cleaned
+
+
 class HostBase(BaseModel):
     name: StrippedStr
     hostname: StrippedStr
@@ -367,6 +425,11 @@ class HostBase(BaseModel):
     criticality: HostCriticality | None = None
     credential_id: int | None = None
     is_active: bool = True
+
+    @field_validator("hostname", mode="after")
+    @classmethod
+    def _check_hostname(cls, value: str) -> str:
+        return _validate_host_address(value)
 
     @field_validator("site", "environment", mode="before")
     @classmethod
@@ -413,6 +476,11 @@ class HostUpdate(BaseModel):
     is_active: bool | None = None
     ssh_host_key_fingerprint: str | None = None
     clear_ssh_host_key: bool = False
+
+    @field_validator("hostname", mode="after")
+    @classmethod
+    def _check_hostname(cls, value: str | None) -> str | None:
+        return None if value is None else _validate_host_address(value)
 
     @field_validator("site", "environment", mode="before")
     @classmethod
@@ -922,6 +990,7 @@ class ScheduledReportDeliverResponse(BaseModel):
 class JobBase(BaseModel):
     name: str
     profile_id: int | None = None
+    profile_version_id: int | None = None
     playbook_id: int | None = None
     execution_type: ExecutionType | None = None
     dynamic_filter: DynamicHostFilter | None = None
@@ -955,6 +1024,7 @@ class JobCreate(JobBase):
 class JobUpdate(BaseModel):
     name: str | None = None
     profile_id: int | None = None
+    profile_version_id: int | None = None
     playbook_id: int | None = None
     execution_type: ExecutionType | None = None
     dynamic_filter: DynamicHostFilter | None = None
@@ -1065,7 +1135,7 @@ class PlaybookBase(BaseModel):
     content: str
     is_active: bool = True
     scope: JobScope = JobScope.STANDARD
-    platform: Literal["linux", "windows", "network"] = "linux"
+    platform: Literal["linux", "windows", "unix", "network"] = "linux"
     kind: Literal["user", "compliance_template"] = "user"
     version: str = "1.0"
     profile_id: int | None = None
@@ -1077,7 +1147,7 @@ class PlaybookCreate(BaseModel):
     content: str
     is_active: bool = True
     scope: JobScope = JobScope.STANDARD
-    platform: Literal["linux", "windows", "network"] = "linux"
+    platform: Literal["linux", "windows", "unix", "network"] = "linux"
 
 
 class PlaybookUpdate(BaseModel):
@@ -1085,7 +1155,7 @@ class PlaybookUpdate(BaseModel):
     description: str | None = None
     content: str | None = None
     is_active: bool | None = None
-    platform: Literal["linux", "windows", "network"] | None = None
+    platform: Literal["linux", "windows", "unix", "network"] | None = None
 
 
 class PlaybookContentUpdate(BaseModel):

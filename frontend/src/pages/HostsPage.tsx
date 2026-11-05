@@ -6,6 +6,7 @@ import { HostCredentialPopover } from "../components/HostCredentialPopover";
 import { DirectoryDiscoveryPanel } from "../components/DirectoryDiscoveryPanel";
 import { HostCsvImportPanel } from "../components/HostCsvImportPanel";
 import { HostSelectionToolbar } from "../components/HostSelectionToolbar";
+import { isUnixOsType } from "../components/OperationsTabs";
 import { OpsListExpandFooter } from "../components/OpsListExpandFooter";
 import { Badge } from "../components/ui/Badge";
 import { Button } from "../components/ui/Button";
@@ -24,6 +25,10 @@ import { ObjectOwnerCell } from "../components/ObjectOwnerCell";
 import { useTableSort } from "../hooks/useTableSort";
 import { sliceOpsList } from "../utils/opsListLimit";
 import { hostCriticalityVariant } from "../utils/statusVariant";
+
+function supportsSshFingerprint(osType: string | undefined): boolean {
+  return (osType ?? "linux").toLowerCase() === "linux" || isUnixOsType(osType);
+}
 
 function scanMethodLabel(
   scan: Pick<InventoryScan, "method" | "nmap_flags" | "snmp_port">,
@@ -557,7 +562,14 @@ export function HostsPage() {
   const filteredHostRows = useMemo(() => {
     const query = hostSearch.trim().toLowerCase();
     return hostRows.filter((host) => {
-      if (hostOsFilter !== "all" && (host.os_type ?? "linux") !== hostOsFilter) return false;
+      if (hostOsFilter === "unix" && !isUnixOsType(host.os_type)) return false;
+      if (
+        hostOsFilter !== "all" &&
+        hostOsFilter !== "unix" &&
+        (host.os_type ?? "linux") !== hostOsFilter
+      ) {
+        return false;
+      }
       if (hostStatusFilter === "active" && !host.is_active) return false;
       if (hostStatusFilter === "inactive" && host.is_active) return false;
       if (hostCredentialFilter === "with" && !hostHasCredential(host)) return false;
@@ -974,6 +986,10 @@ export function HostsPage() {
               >
                 <option value="linux">{t("hosts.osLinux")}</option>
                 <option value="windows">{t("hosts.osWindows")}</option>
+                <option value="freebsd">{t("hosts.osFreebsd")}</option>
+                <option value="openbsd">{t("hosts.osOpenbsd")}</option>
+                <option value="netbsd">{t("hosts.osNetbsd")}</option>
+                <option value="unix">{t("hosts.osUnix")}</option>
                 <option value="network">{t("hosts.osNetwork")}</option>
               </select>
             </div>
@@ -1147,6 +1163,10 @@ export function HostsPage() {
                     <option value="all">{t("hosts.listOsAll")}</option>
                     <option value="linux">{t("hosts.osLinux")}</option>
                     <option value="windows">{t("hosts.osWindows")}</option>
+                    <option value="freebsd">{t("hosts.osFreebsd")}</option>
+                    <option value="openbsd">{t("hosts.osOpenbsd")}</option>
+                    <option value="netbsd">{t("hosts.osNetbsd")}</option>
+                    <option value="unix">{t("hosts.osUnix")}</option>
                     <option value="network">{t("hosts.osNetwork")}</option>
                   </select>
                 </div>
@@ -1493,10 +1513,10 @@ export function HostsPage() {
                             onClick={() => scanFingerprintMutation.mutate(host.id)}
                             disabled={
                               scanFingerprintMutation.isPending ||
-                              (host.os_type ?? "linux").toLowerCase() !== "linux"
+                              !supportsSshFingerprint(host.os_type)
                             }
                             title={
-                              (host.os_type ?? "linux").toLowerCase() === "linux"
+                              supportsSshFingerprint(host.os_type)
                                 ? t("hosts.scanSshFingerprint")
                                 : t("hosts.scanSshFingerprintLinuxOnly")
                             }

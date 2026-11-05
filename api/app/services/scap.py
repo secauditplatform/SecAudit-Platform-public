@@ -413,6 +413,13 @@ def _write_profile_rules_json(dest: Path, rules: list[dict]) -> None:
     )
 
 
+def _looks_like_unix_benchmark(haystack: str) -> bool:
+    return any(
+        token in haystack
+        for token in ("freebsd", "openbsd", "netbsd", "dragonfly", "solaris", "illumos", "aix", "hp-ux", "unix", "macos")
+    )
+
+
 def _infer_os_meta(benchmark: XccdfBenchmark) -> dict:
     haystack = f"{benchmark.title} {benchmark.benchmark_id} {benchmark.platform or ''}".lower()
     if "windows" in haystack:
@@ -421,6 +428,13 @@ def _infer_os_meta(benchmark: XccdfBenchmark) -> dict:
             "vendor": "Microsoft",
             "version": "",
             "icon": "ic_windows.svg",
+        }
+    if _looks_like_unix_benchmark(haystack):
+        return {
+            "name": "UNIX",
+            "vendor": "SCAP",
+            "version": "",
+            "icon": "ic_linux.svg",
         }
     return {
         "name": "Linux",
@@ -434,6 +448,8 @@ def _category_slug_for_benchmark(benchmark: XccdfBenchmark) -> str:
     haystack = f"{benchmark.title} {benchmark.benchmark_id} {benchmark.platform or ''}".lower()
     if "windows" in haystack:
         return "windows-platform"
+    if _looks_like_unix_benchmark(haystack):
+        return "unix-platform"
     if any(token in haystack for token in ("network", "cisco", "juniper", "firewall")):
         return "network-platform"
     return "linux-platform"

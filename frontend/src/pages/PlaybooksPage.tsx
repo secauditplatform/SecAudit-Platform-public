@@ -9,6 +9,7 @@ import {
   type PlaybookTemplate,
 } from "../api/client";
 import { HostPicker } from "../components/HostPicker";
+import { hostMatchesOperationsPlatform } from "../components/OperationsTabs";
 import { JobRunLogs } from "../components/JobRunLogs";
 import { OpsListExpandFooter } from "../components/OpsListExpandFooter";
 import { PlaybookRunResults } from "../components/PlaybookRunResults";
@@ -70,22 +71,24 @@ function templateMatchesPlatform(template: PlaybookTemplate, platform: PlaybookP
   if (platform === "network") {
     return template.id.startsWith("network");
   }
+  // UNIX gets its own inventory templates; the Ansible ping works everywhere.
+  if (platform === "unix") {
+    return template.id.startsWith("unix") || template.id === "connectivity-check";
+  }
   const prefix = platform === "linux" ? "linux" : "windows";
   return template.id.startsWith(prefix) || template.id === "connectivity-check";
-}
-
-function hostMatchesPlatform(osType: string | undefined, platform: PlaybookPlatformScope): boolean {
-  const normalized = (osType ?? "linux").toLowerCase();
-  if (platform === "network") return normalized === "network";
-  if (platform === "windows") return normalized === "windows";
-  return normalized !== "network" && normalized !== "windows";
 }
 
 function playbookMatchesPlatform(
   playbook: { name: string; scope?: OperationsScope; platform?: string | null },
   platform: PlaybookPlatformScope
 ): boolean {
-  if (playbook.platform === "linux" || playbook.platform === "windows" || playbook.platform === "network") {
+  if (
+    playbook.platform === "linux" ||
+    playbook.platform === "windows" ||
+    playbook.platform === "unix" ||
+    playbook.platform === "network"
+  ) {
     return playbook.platform === platform;
   }
   // Legacy rows without platform: keep previous name/scope heuristics.
@@ -96,6 +99,9 @@ function playbookMatchesPlatform(
   if (playbook.scope === "network") return false;
   if (platform === "windows") {
     return name.startsWith("windows") || name.includes("win-");
+  }
+  if (platform === "unix") {
+    return name.startsWith("unix") || name.includes("bsd");
   }
   return !name.startsWith("windows") && !name.includes("win-");
 }
@@ -386,7 +392,7 @@ export function PlaybooksPage() {
   const activeHosts = useMemo(
     () =>
       (hosts.data?.items ?? []).filter(
-        (host) => host.is_active && hostMatchesPlatform(host.os_type, playbookPlatform)
+        (host) => host.is_active && hostMatchesOperationsPlatform(host.os_type, playbookPlatform)
       ),
     [hosts.data, playbookPlatform]
   );

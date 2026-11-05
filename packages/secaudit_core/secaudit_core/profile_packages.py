@@ -250,6 +250,28 @@ def _looks_like_network_os(haystack: str) -> bool:
     return any(token in haystack for token in _NETWORK_OS_TOKENS)
 
 
+_UNIX_OS_TOKENS = (
+    "freebsd",
+    "openbsd",
+    "netbsd",
+    "dragonfly",
+    "solaris",
+    "sunos",
+    "illumos",
+    "hp-ux",
+    "hpux",
+    "aix",
+    "unix",
+    "bsd",
+    "macos",
+    "darwin",
+)
+
+
+def _looks_like_unix_os(haystack: str) -> bool:
+    return any(token in haystack for token in _UNIX_OS_TOKENS)
+
+
 def infer_category_slug(
     tree_path: str | None,
     os_meta: dict | None,
@@ -268,6 +290,8 @@ def infer_category_slug(
                 second = parts[1] if len(parts) > 1 else ""
                 if "WINDOWS" in second:
                     return "windows-platform"
+                if any(token in second.lower() for token in _UNIX_OS_TOKENS):
+                    return "unix-platform"
                 return "linux-platform"
             if root == "NETWORK":
                 return "network-platform"
@@ -279,6 +303,8 @@ def infer_category_slug(
             return "windows-platform"
         if _looks_like_network_os(haystack):
             return "network-platform"
+        if _looks_like_unix_os(haystack):
+            return "unix-platform"
         return "linux-platform"
 
     if software_meta:
@@ -289,6 +315,8 @@ def infer_category_slug(
         if any(token in category_label for token in ("операцион", "operating system", "operating systems")):
             if "windows" in haystack:
                 return "windows-platform"
+            if _looks_like_unix_os(haystack):
+                return "unix-platform"
             return "linux-platform"
         return "services"
 

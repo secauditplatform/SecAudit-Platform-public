@@ -263,6 +263,7 @@ async def _run_python_async(
                 f"fi; "
                 f"exit $EXIT_CODE",
                 timeout=timeout + 30,
+                stdin=asyncssh.DEVNULL,
             )
             raise_if_cancelled()
             return _checked_output(result)

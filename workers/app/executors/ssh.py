@@ -128,6 +128,7 @@ async def _run_script_async(
                 f"{env_prefix}"
                 f"chmod +x {remote_path} && bash {remote_path}{cli_suffix}; EXIT_CODE=$?; exit $EXIT_CODE",
                 timeout=timeout,
+                stdin=asyncssh.DEVNULL,
             )
             raise_if_cancelled()
             return _checked_output(result, operation="Remote script")
@@ -267,6 +268,7 @@ async def _run_package_script_async(
                     f"cd {q_remote_dir} && bash {q_bash_script}; "
                     f"EXIT_CODE=$?; exit $EXIT_CODE",
                     timeout=timeout,
+                    stdin=asyncssh.DEVNULL,
                 )
                 raise_if_cancelled()
                 return _checked_output(result, operation="Remediation script")

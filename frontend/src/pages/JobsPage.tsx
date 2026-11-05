@@ -61,6 +61,7 @@ function populateFormFromJob(
     setName: (name: string) => void;
     setJobType: (type: "ssh" | "winrm" | "python" | "playbook" | "ansible") => void;
     setProfileId: (id: number | "") => void;
+    setProfileVersionId: (id: number | "") => void;
     setPlaybookId: (id: number | "") => void;
     setHostIds: (ids: number[]) => void;
     setIsScheduled: (scheduled: boolean) => void;
@@ -87,6 +88,7 @@ function populateFormFromJob(
             : "ssh"
     );
     setters.setProfileId(job.profile_id ?? "");
+    setters.setProfileVersionId(job.profile_version_id ?? "");
     setters.setPlaybookId("");
   }
   setters.setHostIds(job.host_ids);
@@ -118,6 +120,7 @@ export function JobsPage({
   const [name, setName] = useState("");
   const [jobType, setJobType] = useState<"ssh" | "winrm" | "python" | "playbook" | "ansible">("ssh");
   const [profileId, setProfileId] = useState<number | "">("");
+  const [profileVersionId, setProfileVersionId] = useState<number | "">("");
   const [playbookId, setPlaybookId] = useState<number | "">("");
   const [hostIds, setHostIds] = useState<number[]>([]);
   const [isScheduled, setIsScheduled] = useState(false);
@@ -150,6 +153,7 @@ export function JobsPage({
   useEffect(() => {
     setHostIds([]);
     setProfileId("");
+    setProfileVersionId("");
     setPlaybookId("");
     setSelectedJobId(null);
     if (operationsPlatform === "windows") setJobType("winrm");
@@ -167,7 +171,11 @@ export function JobsPage({
   }, [presetHosts, operationsPlatform]);
 
   useEffect(() => {
-    if (operationsPlatform === "linux" && jobType !== "ssh" && jobType !== "playbook") {
+    if (
+      (operationsPlatform === "linux" || operationsPlatform === "unix") &&
+      jobType !== "ssh" &&
+      jobType !== "playbook"
+    ) {
       setJobType("ssh");
     } else if (operationsPlatform === "windows" && jobType !== "winrm" && jobType !== "playbook") {
       setJobType("winrm");
@@ -178,6 +186,11 @@ export function JobsPage({
 
   const jobs = useQuery({ queryKey: ["jobs", operationsScope], queryFn: () => api.jobs(operationsScope) });
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: () => api.profiles() });
+  const profileVersions = useQuery({
+    queryKey: ["profile-versions", profileId],
+    queryFn: () => api.getProfileVersions(profileId as number),
+    enabled: profileId !== "",
+  });
   const playbooks = useQuery({
     queryKey: ["playbooks", operationsScope, operationsPlatform],
     queryFn: () => api.playbooks(operationsScope, operationsPlatform === "network" ? undefined : operationsPlatform),
@@ -228,10 +241,12 @@ export function JobsPage({
     const hostOsById = new Map(
       (hosts.data?.items ?? []).map((host) => [host.id, host.os_type] as const)
     );
-    return all.filter((job) =>
-      jobMatchesOperationsPlatform(job, operationsPlatform, { profileCategoryById, hostOsById })
+    return all.filter(
+      (job) =>
+        job.id === urlEditJobId ||
+        jobMatchesOperationsPlatform(job, operationsPlatform, { profileCategoryById, hostOsById })
     );
-  }, [jobs.data, profiles.data, hosts.data, operationsPlatform]);
+  }, [jobs.data, profiles.data, hosts.data, operationsPlatform, urlEditJobId]);
 
   useEffect(() => {
     if (!Number.isInteger(presetJobId) || presetJobId <= 0 || !jobs.data) return;
@@ -462,6 +477,7 @@ export function JobsPage({
     setName("");
     setJobType("ssh");
     setProfileId("");
+    setProfileVersionId("");
     setPlaybookId("");
     setHostIds([]);
     setIsScheduled(false);
@@ -474,6 +490,7 @@ export function JobsPage({
     setName,
     setJobType,
     setProfileId,
+    setProfileVersionId,
     setPlaybookId,
     setHostIds,
     setIsScheduled,
@@ -562,6 +579,7 @@ export function JobsPage({
       is_scheduled: isScheduled,
       cron_expression: isScheduled ? cronExpression : undefined,
       profile_id: jobType !== "playbook" && profileId !== "" ? profileId : undefined,
+      profile_version_id: jobType !== "playbook" && profileVersionId !== "" ? profileVersionId : null,
       playbook_id: !isNetwork && jobType === "playbook" && playbookId !== "" ? playbookId : undefined,
       // Network Platform packages run Python (Netmiko) on the worker — not Ansible.
       execution_type: isNetwork ? ("python" as const) : executionType,
@@ -579,6 +597,7 @@ export function JobsPage({
         is_scheduled: isScheduled,
         cron_expression: isScheduled ? cronExpression : null,
         profile_id: profileId !== "" ? profileId : null,
+        profile_version_id: profileVersionId !== "" ? profileVersionId : null,
         playbook_id: null,
         execution_type: "python",
         network_check_mode: networkCheckMode,
@@ -593,6 +612,7 @@ export function JobsPage({
         cron_expression: isScheduled ? cronExpression : null,
         playbook_id: playbookId !== "" ? playbookId : null,
         profile_id: null,
+        profile_version_id: null,
         execution_type: null,
       };
     }
@@ -609,6 +629,7 @@ export function JobsPage({
       is_scheduled: isScheduled,
       cron_expression: isScheduled ? cronExpression : null,
       profile_id: profileId !== "" ? profileId : null,
+      profile_version_id: profileVersionId !== "" ? profileVersionId : null,
       playbook_id: null,
       execution_type: executionType,
     };
@@ -630,10 +651,12 @@ export function JobsPage({
       setJobType("playbook");
       setPlaybookId(template.playbook_id);
       setProfileId("");
+      setProfileVersionId("");
     } else {
       const exec = template.execution_type;
       setJobType(exec === "winrm" ? "winrm" : exec === "python" ? "python" : "ssh");
       setProfileId(template.profile_id ?? "");
+      setProfileVersionId("");
       setPlaybookId("");
     }
     setHostIds(template.host_ids);
@@ -696,7 +719,7 @@ export function JobsPage({
                   setJobType(e.target.value as "ssh" | "winrm" | "python" | "playbook" | "ansible")
                 }
               >
-                {operationsPlatform === "linux" && (
+                {(operationsPlatform === "linux" || operationsPlatform === "unix") && (
                   <>
                     <option value="ssh">{t("jobs.typeSsh")}</option>
                     <option value="playbook">{t("jobs.typePlaybook")}</option>
@@ -729,13 +752,17 @@ export function JobsPage({
               </div>
             )}
             {jobType !== "playbook" || isNetwork ? (
+              <>
               <div className="pf-form__group">
                 <label htmlFor="job-profile">{t("jobs.profile")}</label>
                 <select
                   id="job-profile"
                   className="pf-select"
                   value={profileId}
-                  onChange={(e) => setProfileId(e.target.value ? Number(e.target.value) : "")}
+                  onChange={(e) => {
+                    setProfileId(e.target.value ? Number(e.target.value) : "");
+                    setProfileVersionId("");
+                  }}
                 >
                   <option value="">{t("jobs.selectProfile")}</option>
                   {availableProfiles.map((s) => (
@@ -745,6 +772,30 @@ export function JobsPage({
                   ))}
                 </select>
               </div>
+              {(profileVersions.data?.length ?? 0) > 0 ? (
+                <div className="pf-form__group">
+                  <label htmlFor="job-profile-version">
+                    {t("profiles.requirementsVersion")}
+                  </label>
+                  <select
+                    id="job-profile-version"
+                    className="pf-select"
+                    value={profileVersionId}
+                    onChange={(e) =>
+                      setProfileVersionId(e.target.value ? Number(e.target.value) : "")
+                    }
+                  >
+                    <option value="">{t("profiles.activeVersion")}</option>
+                    {profileVersions.data?.map((version) => (
+                      <option key={version.id} value={version.id}>
+                        v{version.number}
+                        {version.label ? ` — ${version.label}` : ""} ({version.enabled_count})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : null}
+              </>
             ) : (
               <div className="pf-form__group">
                 <label htmlFor="job-playbook">{t("jobs.playbook")}</label>

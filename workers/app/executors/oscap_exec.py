@@ -70,7 +70,7 @@ def _extract_results_xml(combined: str) -> bytes:
 
 
 async def _ensure_oscap(conn: asyncssh.SSHClientConnection) -> None:
-    check = await conn.run("command -v oscap", timeout=30)
+    check = await conn.run("command -v oscap", timeout=30, stdin=asyncssh.DEVNULL)
     if check.exit_status != 0 or not (check.stdout or "").strip():
         raise OscapNotAvailableError(
             "OpenSCAP (oscap) is not installed on the target host. "
@@ -83,7 +83,12 @@ async def _upload_content(
     remote_dir: str,
     content_files: list[Path],
 ) -> None:
-    await conn.run(f"mkdir -p {shlex.quote(remote_dir)}", timeout=30, check=True)
+    await conn.run(
+        f"mkdir -p {shlex.quote(remote_dir)}",
+        timeout=30,
+        check=True,
+        stdin=asyncssh.DEVNULL,
+    )
     async with conn.start_sftp_client() as sftp:
         for local in content_files:
             remote = f"{remote_dir}/{local.name}"
@@ -151,7 +156,7 @@ async def _run_oscap_eval_async(
                 f"exit $EVAL_EXIT"
             )
             raise_if_cancelled()
-            result = await conn.run(eval_cmd, timeout=timeout)
+            result = await conn.run(eval_cmd, timeout=timeout, stdin=asyncssh.DEVNULL)
             raise_if_cancelled()
             combined = (result.stdout or "") + (result.stderr or "")
 

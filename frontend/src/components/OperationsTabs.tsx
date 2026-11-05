@@ -6,11 +6,12 @@ import {
   IconLinux,
   IconNetwork,
   IconRemediation,
+  IconUnix,
   IconWindows,
 } from "./ui/Icons";
 
 export type OperationsTask = "compliance" | "remediation";
-export type OperationsPlatform = "linux" | "windows" | "network";
+export type OperationsPlatform = "linux" | "windows" | "unix" | "network";
 export type OperationsScope = "standard" | "network";
 
 /** @deprecated Prefer OperationsTask + OperationsPlatform */
@@ -20,19 +21,42 @@ export type OperationsTab =
   | "network-compliance"
   | "network-remediation";
 
-const PLATFORMS: OperationsPlatform[] = ["linux", "windows", "network"];
+const PLATFORMS: OperationsPlatform[] = ["linux", "windows", "unix", "network"];
 
 const PLATFORM_LABEL: Record<OperationsPlatform, string> = {
   linux: "playbooks.scopeLinux",
   windows: "playbooks.scopeWindows",
+  unix: "playbooks.scopeUnix",
   network: "playbooks.scopeNetwork",
 };
 
 const PLATFORM_ICON: Record<OperationsPlatform, typeof IconLinux> = {
   linux: IconLinux,
   windows: IconWindows,
+  unix: IconUnix,
   network: IconNetwork,
 };
+
+/** Host os_type values that belong to the UNIX platform tab. */
+const UNIX_OS_TYPES = new Set([
+  "unix",
+  "freebsd",
+  "openbsd",
+  "netbsd",
+  "dragonfly",
+  "solaris",
+  "illumos",
+  "hpux",
+  "hp-ux",
+  "sunos",
+  "aix",
+  "macos",
+  "darwin",
+]);
+
+export function isUnixOsType(osType: string | null | undefined): boolean {
+  return UNIX_OS_TYPES.has((osType ?? "").toLowerCase());
+}
 
 const TASK_ICON: Record<OperationsTask, typeof IconJobs> = {
   compliance: IconJobs,
@@ -48,11 +72,13 @@ const TASK_DESCRIPTION: Record<OperationsTask, Record<OperationsPlatform, string
   compliance: {
     linux: "jobs.description",
     windows: "jobs.description",
+    unix: "jobs.description",
     network: "network.jobsDescription",
   },
   remediation: {
     linux: "remediation.description",
     windows: "remediation.description",
+    unix: "remediation.description",
     network: "network.remediationDescription",
   },
 };
@@ -65,7 +91,7 @@ export function parseOperationsPlatform(
   value: string | null | undefined,
   fallback: OperationsPlatform = "linux"
 ): OperationsPlatform {
-  if (value === "linux" || value === "windows" || value === "network") return value;
+  if (value === "linux" || value === "windows" || value === "unix" || value === "network") return value;
   return fallback;
 }
 
@@ -94,7 +120,8 @@ export function hostMatchesOperationsPlatform(
   const normalized = (osType ?? "linux").toLowerCase();
   if (platform === "network") return normalized === "network";
   if (platform === "windows") return normalized === "windows";
-  return normalized !== "network" && normalized !== "windows";
+  if (platform === "unix") return isUnixOsType(normalized);
+  return normalized !== "network" && normalized !== "windows" && !isUnixOsType(normalized);
 }
 
 export function profileMatchesOperationsPlatform(
@@ -104,8 +131,14 @@ export function profileMatchesOperationsPlatform(
   const category = (categoryName || "").toLowerCase();
   if (platform === "network") return category.includes("network");
   if (platform === "windows") return category.includes("windows");
+  // UNIX tab lists only UNIX OS profiles; Services profiles stay on Linux.
+  if (platform === "unix") return category.includes("unix");
   // Linux + Services for OS-level / service checks on Linux hosts
-  return !category.includes("windows") && !category.includes("network");
+  return (
+    !category.includes("windows") &&
+    !category.includes("network") &&
+    !category.includes("unix")
+  );
 }
 
 export function jobMatchesOperationsPlatform(
@@ -126,6 +159,9 @@ export function jobMatchesOperationsPlatform(
     if (exec === "ssh" || exec === "ansible") return false;
   }
   if (platform === "linux") {
+    if (exec === "winrm") return false;
+  }
+  if (platform === "unix") {
     if (exec === "winrm") return false;
   }
   if (platform === "network") {

@@ -435,6 +435,7 @@ export function ProfilesCatalogPanel() {
             <option value="all">{t("profiles.catalogPlatformAll")}</option>
             <option value="linux">{t("profiles.platform.linux")}</option>
             <option value="windows">{t("profiles.platform.windows")}</option>
+            <option value="unix">{t("profiles.platform.unix")}</option>
             <option value="network">{t("profiles.platform.network")}</option>
           </select>
         </div>

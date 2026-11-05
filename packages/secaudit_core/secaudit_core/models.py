@@ -99,8 +99,44 @@ class Profile(Base):
     compliance_playbooks: Mapped[list["Playbook"]] = relationship(back_populates="profile")
 
 
+class ProfileVersion(Base):
+    """Immutable snapshot of the requirement set a run evaluates.
+
+    ``requirement_ids`` is always explicit so a package resync cannot widen an
+    existing version. A profile without versions evaluates every requirement.
+    """
+
+    __tablename__ = "profile_versions"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "number", name="uq_profile_version_number"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str | None] = mapped_column(String(128))
+    requirement_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    # At most one active version per profile; enforced by a partial unique index.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class CheckScript(Base):
     __tablename__ = "check_scripts"
+    __table_args__ = (
+        # One active audit script and one active remediation script per profile.
+        Index(
+            "uq_check_script_primary",
+            "profile_id",
+            "script_kind",
+            unique=True,
+            postgresql_where=text("is_primary"),
+            sqlite_where=text("is_primary"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), nullable=False)
@@ -113,6 +149,10 @@ class CheckScript(Base):
         Enum(ScriptKind, name="scriptkind", **_PG_ENUM_KW),
         default=ScriptKind.AUDIT,
         nullable=False,
+    )
+    # No primary script means every audit script of the job type runs (legacy behavior).
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
     )
     description: Mapped[str | None] = mapped_column(Text)
 
@@ -488,7 +528,7 @@ class Playbook(Base):
         default=JobScope.STANDARD,
         nullable=False,
     )
-    # linux | windows | network — UI platform tab (orthogonal to JobScope for standard).
+    # linux | windows | unix | network — UI platform tab (orthogonal to JobScope for standard).
     platform: Mapped[str] = mapped_column(String(16), default="linux", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -504,6 +544,9 @@ class Job(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     profile_id: Mapped[int | None] = mapped_column(ForeignKey("profiles.id"), nullable=True)
+    profile_version_id: Mapped[int | None] = mapped_column(
+        ForeignKey("profile_versions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     playbook_id: Mapped[int | None] = mapped_column(ForeignKey("playbooks.id"), nullable=True)
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)

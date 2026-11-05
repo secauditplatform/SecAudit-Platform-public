@@ -2,7 +2,7 @@ import Editor from "@monaco-editor/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { api, type CheckScript, type ProfileDependencies, type ProfileRule, type ProfileRuleChangelogEntry, type ProfileRuleUpdate } from "../api/client";
+import { api, type CheckScript, type ProfileDependencies, type ProfileRule, type ProfileRuleChangelogEntry, type ProfileRuleUpdate, type ProfileVersion } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import {
   ProfileRuleMetadata,
@@ -126,6 +126,16 @@ export function ProfilesPage() {
   const [editingRuleKey, setEditingRuleKey] = useState<string | null>(null);
   const [ruleDraft, setRuleDraft] = useState<ProfileRuleUpdate | null>(null);
   const [showRuleChangelog, setShowRuleChangelog] = useState(false);
+  const [showVersions, setShowVersions] = useState(false);
+  const [selectedRequirementIds, setSelectedRequirementIds] = useState<Set<string>>(new Set());
+  const [baseRequirementIds, setBaseRequirementIds] = useState<Set<string>>(new Set());
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [versionLabelDraft, setVersionLabelDraft] = useState("");
+  const [versionActivateDraft, setVersionActivateDraft] = useState(true);
+  const [deletingVersionId, setDeletingVersionId] = useState<number | null>(null);
+  const [scriptUploadKind, setScriptUploadKind] = useState<"audit" | "remediation" | null>(null);
+  const [scriptUploadFiles, setScriptUploadFiles] = useState<File[]>([]);
+  const [scriptRulesFrom, setScriptRulesFrom] = useState("");
 
   const urlProfileId = parseProfileId(searchParams.get("id"));
   const [selectedProfileId, setSelectedProfileId] = useState<number | null>(urlProfileId);
@@ -135,13 +145,21 @@ export function ProfilesPage() {
     queryFn: () => api.profiles(),
   });
 
+  // Empty categories (e.g. UNIX Platform before the first import) are not in `profiles`.
+  const categories = useQuery({
+    queryKey: ["categories"],
+    queryFn: api.categories,
+    enabled: canOperate,
+  });
+
   const categoryOptions = useMemo(() => {
     const names = new Set<string>();
     profiles.data?.forEach((std) => {
       if (std.category_name) names.add(std.category_name);
     });
+    categories.data?.forEach((category) => names.add(category.name));
     return Array.from(names).sort((a, b) => a.localeCompare(b));
-  }, [profiles.data]);
+  }, [profiles.data, categories.data]);
 
   const filteredProfiles = useMemo(() => {
     const list = profiles.data ?? [];
@@ -312,6 +330,8 @@ export function ProfilesPage() {
       } else {
         queryClient.invalidateQueries({ queryKey: ["profiles"] });
         queryClient.invalidateQueries({ queryKey: ["profiles-catalog"] });
+        queryClient.invalidateQueries({ queryKey: ["profile-rules"] });
+        queryClient.invalidateQueries({ queryKey: ["profile-detail"] });
       }
       setSelectedProfileIds(new Set());
       if (result.failed.length > 0) {
@@ -377,11 +397,52 @@ export function ProfilesPage() {
     [profileRules.data]
   );
 
+  const visibleRequirementIds = useMemo(
+    () => new Set((profileRules.data ?? []).map((rule) => rule.requirement_id)),
+    [profileRules.data]
+  );
+
   const ruleChangelog = useQuery({
     queryKey: ["profile-rule-changelog", activeProfileId],
     queryFn: () => api.getProfileRuleChangelog(activeProfileId!),
     enabled: activeProfileId !== null && showRuleChangelog,
   });
+
+  const profileVersions = useQuery({
+    queryKey: ["profile-versions", activeProfileId],
+    queryFn: () => api.getProfileVersions(activeProfileId!),
+    enabled: activeProfileId !== null,
+  });
+
+  const activeVersion = useMemo(
+    () => (profileVersions.data ?? []).find((version) => version.is_active) ?? null,
+    [profileVersions.data]
+  );
+
+  const selectionDirty = useMemo(() => {
+    if (selectedRequirementIds.size !== baseRequirementIds.size) return true;
+    for (const id of selectedRequirementIds) {
+      if (!baseRequirementIds.has(id)) return true;
+    }
+    return false;
+  }, [selectedRequirementIds, baseRequirementIds]);
+
+  const selectedVisibleCount = useMemo(
+    () =>
+      (profileRules.data ?? []).filter((rule) => selectedRequirementIds.has(rule.requirement_id))
+        .length,
+    [profileRules.data, selectedRequirementIds]
+  );
+
+  const selectAllRef = useRef<HTMLInputElement>(null);
+  const visibleRequirementTotal = profileRules.data?.length ?? 0;
+  const allVisibleSelected =
+    visibleRequirementTotal > 0 && selectedVisibleCount === visibleRequirementTotal;
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected;
+
+  useEffect(() => {
+    if (selectAllRef.current) selectAllRef.current.indeterminate = someVisibleSelected;
+  }, [someVisibleSelected, selectionMode]);
 
   const scriptContent = useQuery({
     queryKey: ["profile-script-content", activeProfileId, viewingScript?.id],
@@ -399,6 +460,15 @@ export function ProfilesPage() {
     setEditingRuleKey(null);
     setRuleDraft(null);
     setShowRuleChangelog(false);
+    setScriptUploadKind(null);
+    setScriptUploadFiles([]);
+    setScriptRulesFrom("");
+    setShowVersions(false);
+    setSelectedRequirementIds(new Set());
+    setBaseRequirementIds(new Set());
+    setSelectionMode(false);
+    setVersionLabelDraft("");
+    setVersionActivateDraft(true);
   }, [activeProfileId]);
 
   useEffect(() => {
@@ -410,13 +480,16 @@ export function ProfilesPage() {
   }, [scriptContent.data]);
 
   useEffect(() => {
-    if (!showRuleChangelog) return;
+    if (!showRuleChangelog && !showVersions) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setShowRuleChangelog(false);
+      if (event.key === "Escape") {
+        setShowRuleChangelog(false);
+        setShowVersions(false);
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showRuleChangelog]);
+  }, [showRuleChangelog, showVersions]);
 
   const saveScriptMutation = useMutation({
     mutationFn: () => {
@@ -438,6 +511,48 @@ export function ProfilesPage() {
       setSaveStatus("error");
     },
   });
+
+  const uploadScriptsMutation = useMutation({
+    mutationFn: (payload: { kind: "audit" | "remediation"; files: File[]; rulesFrom: string }) =>
+      api.uploadCheckScripts(
+        activeProfileId!,
+        payload.kind,
+        payload.files,
+        payload.kind === "audit" && payload.rulesFrom ? payload.rulesFrom : undefined
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["profile-detail", activeProfileId] });
+      queryClient.invalidateQueries({ queryKey: ["profiles"] });
+      setScriptUploadKind(null);
+      setScriptUploadFiles([]);
+      setScriptRulesFrom("");
+      toast.success(t("profiles.uploadScriptsSuccess"));
+    },
+    onError: (err) =>
+      toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const deleteScriptMutation = useMutation({
+    mutationFn: (scriptId: number) => api.deleteCheckScript(activeProfileId!, scriptId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["profile-detail", activeProfileId] });
+      queryClient.invalidateQueries({ queryKey: ["profiles"] });
+      toast.success(t("profiles.deleteScriptSuccess"));
+    },
+    onError: (err) =>
+      toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const handleDeleteScript = async (script: CheckScript) => {
+    const ok = await confirm({
+      title: t("common.confirm"),
+      message: t("profiles.deleteScriptConfirm", { name: script.script_file }),
+      confirmLabel: t("common.delete"),
+      variant: "danger",
+    });
+    if (!ok) return;
+    deleteScriptMutation.mutate(script.id);
+  };
 
   const saveRuleMutation = useMutation({
     mutationFn: ({
@@ -464,6 +579,172 @@ export function ProfilesPage() {
     onError: (err) =>
       toast.error(err instanceof Error ? err.message : t("profiles.saveRuleFailed")),
   });
+
+  const createVersionMutation = useMutation({
+    mutationFn: () => {
+      if (!canOperate || activeProfileId == null) {
+        return Promise.reject(new Error("Forbidden"));
+      }
+      return api.createProfileVersion(activeProfileId, {
+        label: versionLabelDraft.trim() || null,
+        requirement_ids: Array.from(selectedRequirementIds),
+        activate: versionActivateDraft,
+      });
+    },
+    onSuccess: () => {
+      setVersionLabelDraft("");
+      setVersionActivateDraft(true);
+      setSelectionMode(false);
+      setSelectedRequirementIds(new Set());
+      setBaseRequirementIds(new Set());
+      queryClient.invalidateQueries({ queryKey: ["profile-versions", activeProfileId] });
+      toast.success(t("profiles.versionCreated"));
+    },
+    onError: (err) =>
+      toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const activateVersionMutation = useMutation({
+    mutationFn: (versionId: number) => {
+      if (!canOperate || activeProfileId == null) {
+        return Promise.reject(new Error("Forbidden"));
+      }
+      return api.activateProfileVersion(activeProfileId, versionId);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["profile-versions", activeProfileId] });
+      setShowVersions(false);
+      setSelectionMode(false);
+      setSelectedRequirementIds(new Set());
+      setBaseRequirementIds(new Set());
+      toast.success(t("profiles.versionActivated"));
+    },
+    onError: (err) =>
+      toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const deleteVersionMutation = useMutation({
+    mutationFn: ({ versionId, cascade }: { versionId: number; cascade: boolean }) => {
+      if (!canOperate || activeProfileId == null) {
+        return Promise.reject(new Error("Forbidden"));
+      }
+      return api.deleteProfileVersion(activeProfileId, versionId, cascade);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["profile-versions", activeProfileId] });
+      // A cascade delete removes the pinned jobs with their runs and results.
+      queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      queryClient.invalidateQueries({ queryKey: ["job-runs"] });
+      queryClient.invalidateQueries({ queryKey: ["runs"] });
+      queryClient.invalidateQueries({ queryKey: ["scheduled-reports"] });
+      queryClient.invalidateQueries({ queryKey: ["waivers"] });
+      toast.success(t("profiles.versionDeleted"));
+    },
+    onError: (err) =>
+      toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+    onSettled: () => setDeletingVersionId(null),
+  });
+
+  const handleDeleteVersion = async (version: ProfileVersion) => {
+    if (activeProfileId == null || !canOperate) return;
+    setDeletingVersionId(version.id);
+    try {
+      const dependencies = await api.getProfileVersionDependencies(
+        activeProfileId,
+        version.id
+      );
+      if (dependencies.active_runs > 0) {
+        toast.error(t("profiles.deleteVersionActiveRuns"));
+        setDeletingVersionId(null);
+        return;
+      }
+      const cascade = dependencies.jobs > 0;
+      const ok = await confirm({
+        title: t("common.confirm"),
+        message: cascade
+          ? t("profiles.deleteVersionCascadeConfirm", {
+              number: version.number,
+              jobs: dependencies.jobs,
+              runs: dependencies.job_runs,
+              results: dependencies.check_results,
+            })
+          : t("profiles.deleteVersionConfirm", { number: version.number }),
+        confirmLabel: t("common.delete"),
+        variant: "danger",
+      });
+      if (!ok) {
+        setDeletingVersionId(null);
+        return;
+      }
+      deleteVersionMutation.mutate({ versionId: version.id, cascade });
+    } catch (err) {
+      setDeletingVersionId(null);
+      toast.error(err instanceof Error ? err.message : t("toast.genericError"));
+    }
+  };
+
+  const toggleRequirement = (requirementId: string) => {
+    setSelectedRequirementIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(requirementId)) next.delete(requirementId);
+      else next.add(requirementId);
+      return next;
+    });
+  };
+
+  const selectAllRequirements = () => {
+    setSelectedRequirementIds(new Set((profileRules.data ?? []).map((rule) => rule.requirement_id)));
+  };
+
+  const clearAllRequirements = () => setSelectedRequirementIds(new Set());
+
+  const startVersionSelection = async () => {
+    if (activeProfileId == null || !canOperate) return;
+    let ids: Set<string>;
+    if (activeVersion) {
+      try {
+        const detail = await api.getProfileVersion(activeProfileId, activeVersion.id);
+        // A resync can retire requirements an older version still lists; keep the visible ones.
+        ids = new Set(detail.requirement_ids.filter((id) => visibleRequirementIds.has(id)));
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : t("toast.genericError"));
+        return;
+      }
+    } else {
+      ids = new Set((profileRules.data ?? []).map((rule) => rule.requirement_id));
+    }
+    setSelectedRequirementIds(new Set(ids));
+    setBaseRequirementIds(ids);
+    setVersionLabelDraft("");
+    setVersionActivateDraft(true);
+    setSelectionMode(true);
+  };
+
+  const cancelVersionSelection = () => {
+    setSelectionMode(false);
+    setSelectedRequirementIds(new Set());
+    setBaseRequirementIds(new Set());
+    setVersionLabelDraft("");
+    setVersionActivateDraft(true);
+  };
+
+  const loadVersionAsBase = async (version: ProfileVersion) => {
+    if (activeProfileId == null || !canOperate) return;
+    try {
+      const detail = await api.getProfileVersion(activeProfileId, version.id);
+      const ids = new Set(
+        detail.requirement_ids.filter((id) => visibleRequirementIds.has(id))
+      );
+      setSelectedRequirementIds(new Set(ids));
+      setBaseRequirementIds(ids);
+      setVersionLabelDraft("");
+      setVersionActivateDraft(true);
+      setSelectionMode(true);
+      setShowVersions(false);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t("toast.genericError"));
+    }
+  };
 
   const importMutation = useMutation({
     mutationFn: (payload: {
@@ -584,6 +865,136 @@ export function ProfilesPage() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [viewingScript, isDirty]);
+
+  const primaryScriptMutation = useMutation({
+    mutationFn: (scriptId: number) => api.setCheckScriptPrimary(activeProfileId!, scriptId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["profile-detail", activeProfileId] });
+    },
+    onError: (err) =>
+      toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const renderScriptRows = (scripts: CheckScript[], kind: "audit" | "remediation") => {
+    const isAudit = kind === "audit";
+    const total =
+      (isAudit ? detail.data?.check_scripts : detail.data?.remediation_scripts)?.length ?? 0;
+    return scripts.map((script) => (
+      <tr key={script.id}>
+        <td className="pf-table__mono">{script.id}</td>
+        <td>{script.name}</td>
+        <td>
+          {script.is_primary ? (
+            <Badge variant="success">{t("profiles.scriptActive")}</Badge>
+          ) : (
+            <span className="pf-table__muted">{t("common.dash")}</span>
+          )}
+        </td>
+        <td>
+          <Badge variant={isAudit ? "info" : "warning"} literal>
+            {formatExecutionType(script.execution_type)}
+          </Badge>
+        </td>
+        <td className="pf-table__mono">
+          <Button variant="link" className="pf-btn--sm" onClick={() => openScriptViewer(script)}>
+            {script.script_file}
+          </Button>
+        </td>
+        {isAudit ? <td>{script.description || t("common.dash")}</td> : null}
+        <td className="pf-table__col-actions">
+          <div className="pf-profiles-row-actions">
+            {!script.is_primary && total > 1 ? (
+              <Button
+                variant="link"
+                className="pf-btn--sm"
+                disabled={primaryScriptMutation.isPending}
+                onClick={() => primaryScriptMutation.mutate(script.id)}
+              >
+                {t("profiles.scriptRunOnly")}
+              </Button>
+            ) : null}
+            <Button variant="secondary" className="pf-btn--sm" onClick={() => openScriptViewer(script)}>
+              {t("profiles.editScript")}
+            </Button>
+            <Button
+              variant="danger-secondary"
+              className="pf-btn--sm"
+              disabled={deleteScriptMutation.isPending}
+              onClick={() => handleDeleteScript(script)}
+            >
+              {t("common.delete")}
+            </Button>
+          </div>
+        </td>
+      </tr>
+    ));
+  };
+
+  const scriptUploadForm = scriptUploadKind ? (
+    <div className="pf-import-panel__section" style={{ margin: "1rem" }}>
+      <p className="pf-form__hint">
+        {scriptUploadKind === "remediation"
+          ? t("profiles.uploadRemediationScriptsHint")
+          : t("profiles.uploadAuditScriptsHint")}
+      </p>
+      {scriptUploadKind === "audit" && (
+        <div className="pf-form__group">
+          <label htmlFor="script-rules-from">{t("profiles.uploadRulesFrom")}</label>
+          <select
+            id="script-rules-from"
+            className="pf-select"
+            value={scriptRulesFrom}
+            onChange={(event) => setScriptRulesFrom(event.target.value)}
+            disabled={uploadScriptsMutation.isPending}
+          >
+            {(detail.data?.check_scripts ?? []).length === 0 && (
+              <option value="">{t("profiles.uploadRulesFromNone")}</option>
+            )}
+            {(detail.data?.check_scripts ?? []).map((script) => (
+              <option key={script.id} value={script.name}>
+                {script.name}
+              </option>
+            ))}
+          </select>
+          <p className="pf-form__hint">{t("profiles.uploadRulesFromHint")}</p>
+        </div>
+      )}
+      <FileUploadZone
+        id="script-variant-files"
+        label={t("profiles.uploadScripts")}
+        accept=".sh,.py,.ps1"
+        formatLabels={[".sh", ".py", ".ps1"]}
+        files={scriptUploadFiles}
+        onFilesChange={setScriptUploadFiles}
+        disabled={uploadScriptsMutation.isPending}
+      />
+      <div className="pf-form__actions">
+        <Button
+          onClick={() =>
+            uploadScriptsMutation.mutate({
+              kind: scriptUploadKind,
+              files: scriptUploadFiles,
+              rulesFrom: scriptRulesFrom,
+            })
+          }
+          disabled={scriptUploadFiles.length === 0 || uploadScriptsMutation.isPending}
+          loading={uploadScriptsMutation.isPending}
+        >
+          {t("profiles.upload")}
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => {
+            setScriptUploadKind(null);
+            setScriptUploadFiles([]);
+            setScriptRulesFrom("");
+          }}
+        >
+          {t("common.cancel")}
+        </Button>
+      </div>
+    </div>
+  ) : null;
 
   return (
     <>
@@ -1117,6 +1528,34 @@ export function ProfilesPage() {
                   <span className="pf-profile-rules__version-value">{detail.data.version}</span>
                 </span>
               ) : null}
+              <span
+                className="pf-profile-rules__version"
+                title={t("profiles.requirementsVersionHint")}
+              >
+                <span className="pf-profile-rules__version-label">
+                  {t("profiles.requirementsVersion")}
+                </span>
+                <span
+                  className={`pf-profile-rules__version-value${
+                    activeVersion ? "" : " pf-profile-rules__version-value--muted"
+                  }`}
+                >
+                  {activeVersion ? (
+                    <>
+                      <span className="pf-profile-rules__version-tag">
+                        v{activeVersion.number}
+                      </span>
+                      {activeVersion.label ? (
+                        <span className="pf-profile-rules__version-name">
+                          {activeVersion.label}
+                        </span>
+                      ) : null}
+                    </>
+                  ) : (
+                    t("profiles.allChecks")
+                  )}
+                </span>
+              </span>
               {profileRules.data ? (
                 <span className="pf-profile-rules__count">
                   {t("profiles.checkItemsCount", { count: profileRules.data.length })}
@@ -1126,10 +1565,26 @@ export function ProfilesPage() {
               <Button
                 variant="secondary"
                 className="pf-btn--sm pf-profile-rules__changelog-btn"
+                onClick={() => setShowVersions(true)}
+              >
+                {t("profiles.versions")}
+              </Button>
+              <Button
+                variant="secondary"
+                className="pf-btn--sm pf-profile-rules__changelog-btn"
                 onClick={() => setShowRuleChangelog(true)}
               >
                 {t("profiles.ruleChangelogShow")}
               </Button>
+              {canOperate && !selectionMode ? (
+                <Button
+                  className="pf-btn--sm"
+                  onClick={startVersionSelection}
+                  disabled={profileVersions.isLoading}
+                >
+                  {t("profiles.createVersionAction")}
+                </Button>
+              ) : null}
             </div>
           }
           noPadding
@@ -1146,7 +1601,73 @@ export function ProfilesPage() {
             </p>
           )}
           {profileRules.data && profileRules.data.length > 0 && (
-            <div className="pf-profile-rules">
+            <>
+              {selectionMode ? (
+                <div className="pf-profile-rules__editor">
+                  <label className="pf-checkbox pf-profile-rules__master">
+                    <input
+                      ref={selectAllRef}
+                      type="checkbox"
+                      className="pf-checkbox-control"
+                      checked={allVisibleSelected}
+                      onChange={() =>
+                        allVisibleSelected ? clearAllRequirements() : selectAllRequirements()
+                      }
+                      aria-label={
+                        allVisibleSelected
+                          ? t("profiles.checksClearAll")
+                          : t("profiles.checksSelectAll")
+                      }
+                    />
+                    <span>
+                      {t("profiles.checksSelected", {
+                        selected: selectedVisibleCount,
+                        total: profileRules.data.length,
+                      })}
+                    </span>
+                  </label>
+                  <input
+                    className="pf-input pf-profile-rules__editor-name"
+                    placeholder={t("profiles.versionLabel")}
+                    aria-label={t("profiles.versionLabel")}
+                    maxLength={128}
+                    value={versionLabelDraft}
+                    onChange={(event) => setVersionLabelDraft(event.target.value)}
+                  />
+                  <label className="pf-checkbox pf-profile-rules__editor-active">
+                    <input
+                      type="checkbox"
+                      className="pf-checkbox-control"
+                      checked={versionActivateDraft}
+                      onChange={(event) => setVersionActivateDraft(event.target.checked)}
+                    />
+                    <span>{t("profiles.versionMakeActive")}</span>
+                  </label>
+                  {selectionDirty ? (
+                    <span className="pf-profile-rules__editor-dirty">
+                      {t("profiles.checksChanged")}
+                    </span>
+                  ) : null}
+                  <div className="pf-profile-rules__editor-actions">
+                    <Button
+                      variant="secondary"
+                      className="pf-btn--sm"
+                      onClick={cancelVersionSelection}
+                    >
+                      {t("common.cancel")}
+                    </Button>
+                    <Button
+                      className="pf-btn--sm"
+                      onClick={() => createVersionMutation.mutate()}
+                      loading={createVersionMutation.isPending}
+                      disabled={selectedVisibleCount === 0}
+                    >
+                      {t("profiles.createVersion")}
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+              <div className="pf-profile-rules">
               {profileRules.data.map((rule, index) => {
                 const ruleKey = profileRuleKey(rule, index);
                 const expanded = expandedRuleKey === ruleKey;
@@ -1155,24 +1676,39 @@ export function ProfilesPage() {
                 const hasDetails = hasProfileRuleMetadata(rule);
                 const canExpand = hasDetails || canOperate;
                 const displayName = profileRuleDisplayName(rule);
+                const selected = selectedRequirementIds.has(rule.requirement_id);
 
                 return (
                   <div
                     key={ruleKey}
-                    className={`pf-profile-rule${expanded ? " pf-profile-rule--expanded" : ""}${
+                    className={`pf-profile-rule${
+                      selectionMode && !selected ? " pf-profile-rule--excluded" : ""
+                    }${expanded ? " pf-profile-rule--expanded" : ""}${
                       editing ? " pf-profile-rule--editing" : ""
                     }`}
                   >
-                    <button
-                      type="button"
-                      className="pf-profile-rule__toggle"
-                      onClick={() => {
-                        if (editing) return;
-                        setExpandedRuleKey(expanded ? null : ruleKey);
-                      }}
-                      aria-expanded={expanded}
-                      disabled={!canExpand}
-                    >
+                    <div className="pf-profile-rule__head">
+                      {selectionMode ? (
+                        <label className="pf-profile-rule__pick">
+                          <input
+                            type="checkbox"
+                            className="pf-checkbox-control"
+                            checked={selected}
+                            onChange={() => toggleRequirement(rule.requirement_id)}
+                            aria-label={t("profiles.pickCheck", { name: displayName })}
+                          />
+                        </label>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="pf-profile-rule__toggle"
+                        onClick={() => {
+                          if (editing) return;
+                          setExpandedRuleKey(expanded ? null : ruleKey);
+                        }}
+                        aria-expanded={expanded}
+                        disabled={!canExpand}
+                      >
                       <span className="pf-profile-rule__chevron" aria-hidden />
                       <span className="pf-profile-rule__number">{displayNumber}</span>
                       <span className="pf-profile-rule__title">{displayName}</span>
@@ -1187,7 +1723,8 @@ export function ProfilesPage() {
                           <ProfileRuleSeverityChip rule={rule} />
                         </span>
                       ) : null}
-                    </button>
+                      </button>
+                    </div>
                     {expanded && canExpand && (
                       <div className="pf-profile-rule__body">
                         {editing && ruleDraft ? (
@@ -1331,6 +1868,7 @@ export function ProfilesPage() {
                 );
               })}
             </div>
+            </>
           )}
         </Panel>
       )}
@@ -1444,101 +1982,198 @@ export function ProfilesPage() {
         </div>
       )}
 
-      {isAdmin && activeProfileId && detail.data && detail.data.check_scripts.length > 0 && (
-        <Panel title={t("profiles.checkScripts")} noPadding>
-          <div className="pf-table-wrap">
-            <table className="pf-table">
-              <thead>
-                <tr>
-                  <th>{t("common.id")}</th>
-                  <th>{t("common.name")}</th>
-                  <th>{t("profiles.executionType")}</th>
-                  <th>{t("profiles.scriptFile")}</th>
-                  <th>{t("profiles.summary")}</th>
-                  <th className="pf-table__col-actions">{t("common.actions")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {detail.data.check_scripts.map((script) => (
-                  <tr key={script.id}>
-                    <td className="pf-table__mono">{script.id}</td>
-                    <td>{script.name}</td>
-                    <td>
-                      <Badge variant="info" literal>
-                        {formatExecutionType(script.execution_type)}
-                      </Badge>
-                    </td>
-                    <td className="pf-table__mono">
-                      <Button
-                        variant="link"
-                        className="pf-btn--sm"
-                        onClick={() => openScriptViewer(script)}
-                      >
-                        {script.script_file}
-                      </Button>
-                    </td>
-                    <td>{script.description || t("common.dash")}</td>
-                    <td className="pf-table__col-actions">
-                      <Button variant="secondary" className="pf-btn--sm" onClick={() => openScriptViewer(script)}>
-                        {t("profiles.editScript")}
-                      </Button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+      {activeProfileId && showVersions && (
+        <div
+          className="pf-modal pf-modal--versions"
+          role="presentation"
+          onClick={() => setShowVersions(false)}
+        >
+          <div
+            className="pf-modal__panel pf-modal__panel--versions"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="profile-versions-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="pf-modal__header">
+              <div>
+                <h3 id="profile-versions-title" className="pf-modal__title">
+                  {t("profiles.versions")}
+                </h3>
+                <p className="pf-modal__subtitle">{t("profiles.requirementsVersionHint")}</p>
+              </div>
+              <Button
+                variant="secondary"
+                className="pf-btn--sm"
+                onClick={() => setShowVersions(false)}
+              >
+                {t("profiles.close")}
+              </Button>
+            </div>
+
+            {(profileVersions.data ?? []).length === 0 ? (
+              <div className="pf-profile-versions__empty">
+                <span className="pf-profile-versions__empty-icon" aria-hidden>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+                    <path d="M4 7.5 12 3l8 4.5-8 4.5-8-4.5Z" />
+                    <path d="m4 12 8 4.5 8-4.5" />
+                    <path d="m4 16.5 8 4.5 8-4.5" />
+                  </svg>
+                </span>
+                <p>{t("profiles.versionsEmpty")}</p>
+              </div>
+            ) : (
+              <div className="pf-profile-version-list">
+                {(profileVersions.data ?? [])
+                  .slice()
+                  .reverse()
+                  .map((version) => (
+                    <article
+                      key={version.id}
+                      className={`pf-profile-version${
+                        version.is_active ? " pf-profile-version--active" : ""
+                      }`}
+                    >
+                      <span className="pf-profile-version__badge">v{version.number}</span>
+                      <div className="pf-profile-version__body">
+                        <div className="pf-profile-version__head">
+                          {version.label ? (
+                            <span className="pf-profile-version__label">{version.label}</span>
+                          ) : null}
+                          {version.is_active ? (
+                            <Badge variant="success">{t("profiles.activeVersion")}</Badge>
+                          ) : null}
+                        </div>
+                        <p className="pf-profile-version__meta">
+                          {t("profiles.checkItemsCount", { count: version.enabled_count })}
+                          {version.created_at ? ` · ${formatChangelogAt(version.created_at)}` : ""}
+                          {version.created_by ? ` · ${version.created_by}` : ""}
+                        </p>
+                      </div>
+                      {canOperate ? (
+                        <div className="pf-profile-version__actions">
+                          <Button
+                            variant="secondary"
+                            className="pf-btn--sm"
+                            onClick={() => loadVersionAsBase(version)}
+                          >
+                            {t("profiles.useVersionAsBase")}
+                          </Button>
+                          {!version.is_active ? (
+                            <>
+                              <Button
+                                className="pf-btn--sm"
+                                loading={activateVersionMutation.isPending}
+                                onClick={() => activateVersionMutation.mutate(version.id)}
+                              >
+                                {t("profiles.activateVersion")}
+                              </Button>
+                              <Button
+                                variant="danger-secondary"
+                                className="pf-btn--sm"
+                                loading={deletingVersionId === version.id}
+                                disabled={
+                                  deletingVersionId !== null && deletingVersionId !== version.id
+                                }
+                                onClick={() => handleDeleteVersion(version)}
+                              >
+                                {t("profiles.deleteVersion")}
+                              </Button>
+                            </>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </article>
+                  ))}
+              </div>
+            )}
           </div>
+        </div>
+      )}
+
+      {isAdmin && activeProfileId && detail.data && (
+        <Panel
+          title={t("profiles.checkScripts")}
+          toolbar={
+            <Button
+              variant="secondary"
+              className="pf-btn--sm"
+              onClick={() => {
+                setScriptUploadKind(scriptUploadKind === "audit" ? null : "audit");
+                setScriptUploadFiles([]);
+                setScriptRulesFrom((detail.data?.check_scripts ?? [])[0]?.name ?? "");
+              }}
+            >
+              {t("profiles.uploadScripts")}
+            </Button>
+          }
+          noPadding
+        >
+          {scriptUploadKind === "audit" && scriptUploadForm}
+          {detail.data.check_scripts.length === 0 ? (
+            <p className="pf-table__muted" style={{ padding: "1rem" }}>
+              {t("profiles.noCheckScripts")}
+            </p>
+          ) : (
+            <div className="pf-table-wrap">
+              <table className="pf-table">
+                <thead>
+                  <tr>
+                    <th>{t("common.id")}</th>
+                    <th>{t("common.name")}</th>
+                    <th>{t("common.status")}</th>
+                    <th>{t("profiles.executionType")}</th>
+                    <th>{t("profiles.scriptFile")}</th>
+                    <th>{t("profiles.summary")}</th>
+                    <th className="pf-table__col-actions">{t("common.actions")}</th>
+                  </tr>
+                </thead>
+                <tbody>{renderScriptRows(detail.data.check_scripts, "audit")}</tbody>
+              </table>
+            </div>
+          )}
         </Panel>
       )}
 
-      {isAdmin && activeProfileId && detail.data && (detail.data.remediation_scripts?.length ?? 0) > 0 && (
-        <Panel title={t("remediation.remediationScripts")} noPadding>
-          <div className="pf-table-wrap">
-            <table className="pf-table">
-              <thead>
-                <tr>
-                  <th>{t("common.id")}</th>
-                  <th>{t("common.name")}</th>
-                  <th>{t("profiles.executionType")}</th>
-                  <th>{t("profiles.scriptFile")}</th>
-                  <th className="pf-table__col-actions">{t("common.actions")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {detail.data.remediation_scripts?.map((script) => (
-                  <tr key={script.id}>
-                    <td className="pf-table__mono">{script.id}</td>
-                    <td>{script.name}</td>
-                    <td>
-                      <Badge variant="warning" literal>
-                        {formatExecutionType(script.execution_type)}
-                      </Badge>
-                    </td>
-                    <td className="pf-table__mono">
-                      <Button
-                        variant="link"
-                        className="pf-btn--sm"
-                        onClick={() => openScriptViewer(script)}
-                      >
-                        {script.script_file}
-                      </Button>
-                    </td>
-                    <td className="pf-table__col-actions">
-                      <Button variant="secondary" className="pf-btn--sm" onClick={() => openScriptViewer(script)}>
-                        {t("profiles.editScript")}
-                      </Button>
-                    </td>
+      {isAdmin && activeProfileId && detail.data && (
+        <Panel
+          title={t("remediation.remediationScripts")}
+          toolbar={
+            <Button
+              variant="secondary"
+              className="pf-btn--sm"
+              onClick={() => {
+                setScriptUploadKind(scriptUploadKind === "remediation" ? null : "remediation");
+                setScriptUploadFiles([]);
+              }}
+            >
+              {t("profiles.uploadScripts")}
+            </Button>
+          }
+          noPadding
+        >
+          {scriptUploadKind === "remediation" && scriptUploadForm}
+          {(detail.data.remediation_scripts?.length ?? 0) === 0 ? (
+            <p className="pf-table__muted" style={{ padding: "1rem" }}>
+              {t("profiles.noRemediationScripts")}
+            </p>
+          ) : (
+            <div className="pf-table-wrap">
+              <table className="pf-table">
+                <thead>
+                  <tr>
+                    <th>{t("common.id")}</th>
+                    <th>{t("common.name")}</th>
+                    <th>{t("common.status")}</th>
+                    <th>{t("profiles.executionType")}</th>
+                    <th>{t("profiles.scriptFile")}</th>
+                    <th className="pf-table__col-actions">{t("common.actions")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
-      )}
-
-      {isAdmin && activeProfileId && detail.data && detail.data.check_scripts.length === 0 && !detail.isLoading && (
-        <Panel title={t("profiles.checkScripts")}>
-          <p className="pf-table__muted">{t("profiles.noCheckScripts")}</p>
+                </thead>
+                <tbody>{renderScriptRows(detail.data.remediation_scripts ?? [], "remediation")}</tbody>
+              </table>
+            </div>
+          )}
         </Panel>
       )}
 

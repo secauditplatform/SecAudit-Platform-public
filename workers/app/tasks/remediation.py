@@ -43,6 +43,7 @@ from app.notify import emit_run_notification
 from secaudit_core.hosts import load_active_hosts, resolve_remediation_host_ids
 from secaudit_core.run_state import claim_pending_run, current_run_status, transition_running_run
 from secaudit_core.result_upsert import upsert_remediation_result
+from secaudit_core.script_selection import select_active_scripts
 from secaudit_core.task_outbox import enqueue_outbox_row
 from secaudit_core.tracing import set_current_span_attributes
 
@@ -177,6 +178,8 @@ def _run_remediation_job(
     scripts = list(db.execute(query).scalars().all())
     if job.remediation_script_id is not None:
         scripts = [script for script in scripts if script.id == job.remediation_script_id]
+    else:
+        scripts = select_active_scripts(scripts)
 
     if not scripts:
         raise ValueError("No remediation scripts found for this job")
@@ -291,6 +294,8 @@ def _run_network_remediation_job(
     scripts = list(db.execute(query).scalars().all())
     if job.remediation_script_id is not None:
         scripts = [script for script in scripts if script.id == job.remediation_script_id]
+    else:
+        scripts = select_active_scripts(scripts)
 
     package_dir = Path(profile.package_path) if profile.package_path else Path(settings.profiles_path)
     remediation_run_id = remediation_run.id

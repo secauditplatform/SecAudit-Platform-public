@@ -454,6 +454,15 @@ export function IconLinux({ className }: IconProps) {
   );
 }
 
+export function IconUnix({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M6.5 9 9 11.5 6.5 14M11.5 14H17" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 export function IconWindows({ className }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 24 24" fill="currentColor" aria-hidden>

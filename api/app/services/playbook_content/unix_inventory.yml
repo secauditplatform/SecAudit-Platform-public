@@ -1,0 +1,114 @@
+---
+- name: UNIX host inventory
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Identity and uptime
+      ansible.builtin.raw: |
+        uname -a
+        whoami
+        id
+        uptime
+      register: identity_uptime
+      changed_when: false
+      failed_when: false
+
+    - name: Local users (system database)
+      ansible.builtin.raw: |
+        awk -F: '{print $1 ":" $3 ":" $7}' /etc/passwd | head -n 80
+      register: local_users
+      changed_when: false
+      failed_when: false
+
+    - name: Recent login activity
+      ansible.builtin.raw: |
+        last 2>/dev/null | head -n 20
+      register: recent_logins
+      changed_when: false
+      failed_when: false
+
+    - name: Installed packages
+      ansible.builtin.raw: |
+        if command -v pkg >/dev/null 2>&1; then
+          pkg info | head -n 100
+        elif command -v pkg_info >/dev/null 2>&1; then
+          pkg_info | head -n 100
+        else
+          echo "No pkg/pkg_info detected"
+        fi
+      register: package_list
+      changed_when: false
+      failed_when: false
+
+    - name: Services
+      ansible.builtin.raw: |
+        if command -v rcctl >/dev/null 2>&1; then
+          rcctl ls on
+        elif [ -d /etc/rc.d ]; then
+          ls /etc/rc.d | head -n 100
+        else
+          echo "No rc service manager detected"
+        fi
+      register: services
+      changed_when: false
+      failed_when: false
+
+    - name: Listening sockets
+      ansible.builtin.raw: |
+        if command -v sockstat >/dev/null 2>&1; then
+          sockstat -4 -l
+        else
+          netstat -an | grep -i listen
+        fi
+      register: listening_ports
+      changed_when: false
+      failed_when: false
+
+    - name: Firewall rules
+      ansible.builtin.raw: |
+        if command -v pfctl >/dev/null 2>&1; then
+          pfctl -sr 2>/dev/null | head -n 100
+        elif command -v ipfw >/dev/null 2>&1; then
+          ipfw list 2>/dev/null | head -n 100
+        elif command -v ipfstat >/dev/null 2>&1; then
+          ipfstat -io 2>/dev/null | head -n 100
+        else
+          echo "No supported firewall tool detected"
+        fi
+      register: firewall_rules
+      changed_when: false
+      failed_when: false
+
+    - name: Disk and memory
+      ansible.builtin.raw: |
+        df -h
+        echo
+        vmstat 2>/dev/null | head -n 5
+      register: disk_memory
+      changed_when: false
+      failed_when: false
+
+    - name: Security logs sample
+      ansible.builtin.raw: |
+        for log in /var/log/auth.log /var/log/secure /var/log/messages; do
+          if [ -f "$log" ]; then
+            tail -n 40 "$log"
+            break
+          fi
+        done
+      register: security_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Inventory summary
+      ansible.builtin.debug:
+        msg:
+          identity_uptime: "{{ identity_uptime.stdout_lines | default([]) }}"
+          local_users: "{{ local_users.stdout_lines | default([]) }}"
+          recent_logins: "{{ recent_logins.stdout_lines | default([]) }}"
+          packages: "{{ package_list.stdout_lines | default([]) }}"
+          services: "{{ services.stdout_lines | default([]) }}"
+          listening_ports: "{{ listening_ports.stdout_lines | default([]) }}"
+          firewall_rules: "{{ firewall_rules.stdout_lines | default([]) }}"
+          disk_memory: "{{ disk_memory.stdout_lines | default([]) }}"
+          security_logs: "{{ security_logs.stdout_lines | default([]) }}"

@@ -3,7 +3,8 @@ import { useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, type AuditMapNode, type AuditMapPayload } from "../api/client";
 import { EmptyState } from "../components/ui/EmptyState";
-import { IconLinux, IconNetwork, IconWindows } from "../components/ui/Icons";
+import { IconLinux, IconNetwork, IconUnix, IconWindows } from "../components/ui/Icons";
+import { isUnixOsType } from "../components/OperationsTabs";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Spinner } from "../components/ui/Spinner";
 import { useTranslation } from "../i18n/I18nProvider";
@@ -115,6 +116,7 @@ function platformLabel(osType: string | null, t: TFunction): string {
   const key = (osType ?? "").toLowerCase();
   if (key === "linux") return t("hosts.osLinux");
   if (key === "windows") return t("hosts.osWindows");
+  if (key === "unix") return t("hosts.osUnix");
   if (key === "network") return t("hosts.osNetwork");
   if (!key || key === "other") return t("auditMap.otherPlatform");
   return osType ?? t("auditMap.otherPlatform");
@@ -124,6 +126,7 @@ function PlatformGlyph({ osType }: { osType: string | null }) {
   const kind = (osType ?? "").toLowerCase();
   if (kind === "windows") return <IconWindows />;
   if (kind === "network") return <IconNetwork />;
+  if (isUnixOsType(kind)) return <IconUnix />;
   return <IconLinux />;
 }
 

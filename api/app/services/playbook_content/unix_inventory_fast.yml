@@ -1,0 +1,41 @@
+---
+- name: UNIX host inventory (fast)
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Host identity
+      ansible.builtin.raw: |
+        uname -srm
+        whoami
+        id
+        uptime
+      register: identity
+      changed_when: false
+      failed_when: false
+
+    - name: Users and disks
+      ansible.builtin.raw: |
+        awk -F: '{print $1 ":" $3 ":" $7}' /etc/passwd | head -n 30
+        echo
+        df -h
+      register: users_disks
+      changed_when: false
+      failed_when: false
+
+    - name: Listening sockets
+      ansible.builtin.raw: |
+        if command -v sockstat >/dev/null 2>&1; then
+          sockstat -4 -l | head -n 30
+        else
+          netstat -an | grep -i listen | head -n 30
+        fi
+      register: listening_ports
+      changed_when: false
+      failed_when: false
+
+    - name: Inventory summary
+      ansible.builtin.debug:
+        msg:
+          identity: "{{ identity.stdout_lines | default([]) }}"
+          users_disks: "{{ users_disks.stdout_lines | default([]) }}"
+          listening_ports: "{{ listening_ports.stdout_lines | default([]) }}"

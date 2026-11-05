@@ -18,6 +18,7 @@ from secaudit_core.transient import reraise_if_transient
 from secaudit_core.host_credentials import linked_credentials
 from secaudit_core.hosts import load_active_hosts, resolve_job_targets
 from secaudit_core.interpreter import apply_interpreter_rules
+from secaudit_core.script_selection import select_active_scripts
 from secaudit_core.oscap import (
     merge_scap_and_script_results,
     resolve_oval_path,
@@ -42,11 +43,12 @@ from secaudit_core.models import (
     NetworkCheckMode,
     NetworkDeviceConfig,
     Playbook,
+    Profile,
+    ProfileVersion,
     Rule,
     ScriptKind,
-    Profile,
 )
-from secaudit_core.enums import CategoryType, JobScope, NetworkVendor
+from secaudit_core.enums import JobScope, NetworkVendor
 from secaudit_core.network_config import parse_network_config
 from secaudit_core.network_scope import host_is_network
 from app.executors.ansible_exec import (
@@ -74,10 +76,7 @@ from app.logging_pub import publish_job_log
 from app.notify import emit_run_notification
 from secaudit_core.credential_auth import ssh_auth_from_credential
 from secaudit_core.secrets import decrypt_secret
-from secaudit_core.service_credentials import (
-    profile_uses_service_credentials,
-    service_env_from_credential,
-)
+from secaudit_core.service_credentials import service_env_from_credential
 from secaudit_core.result_upsert import upsert_check_result
 from secaudit_core.run_state import claim_pending_run, current_run_status, transition_running_run
 from secaudit_core.task_outbox import enqueue_outbox_row
@@ -92,14 +91,60 @@ def _raw_output_limit() -> int:
     return settings.raw_output_max_chars
 
 
-def _remember_profile_snapshot(db: Session, job: Job, job_run: JobRun) -> None:
+def _resolve_profile_version(
+    db: Session, job: Job, job_run: JobRun | None = None
+) -> ProfileVersion | None:
+    if not job.profile_id:
+        return None
+    snapshot = getattr(job_run, "profile_snapshot", None) if job_run else None
+    if isinstance(snapshot, dict) and snapshot.get("version_id"):
+        recorded = db.get(ProfileVersion, snapshot["version_id"])
+        if recorded is not None and recorded.profile_id == job.profile_id:
+            return recorded
+    if job.profile_version_id:
+        version = db.get(ProfileVersion, job.profile_version_id)
+        if version is not None and version.profile_id == job.profile_id:
+            return version
+    return db.execute(
+        select(ProfileVersion).where(
+            ProfileVersion.profile_id == job.profile_id,
+            ProfileVersion.is_active.is_(True),
+        )
+    ).scalars().first()
+
+
+def _allowed_rule_names(version: ProfileVersion | None) -> set[str] | None:
+    """None means every requirement is evaluated (the profile has no versions)."""
+    if version is None:
+        return None
+    allowed: set[str] = set()
+    for requirement_id in version.requirement_ids or []:
+        name = str(requirement_id)
+        allowed.add(name)
+        # SCAP results use Rule.tech_name, which is truncated to 64 characters.
+        allowed.add(name[:64])
+    return allowed
+
+
+def _filter_rule_results(items: list[dict], allowed: set[str] | None) -> list[dict]:
+    if allowed is None:
+        return items
+    return [item for item in items if item.get("tech_name") in allowed]
+
+
+def _remember_profile_snapshot(
+    db: Session, job: Job, job_run: JobRun
+) -> ProfileVersion | None:
     """Record profile identity once, when the run starts. Later edits do not rewrite it."""
-    if job_run.profile_snapshot or not job.profile_id:
-        return
+    if not job.profile_id:
+        return None
+    version = _resolve_profile_version(db, job, job_run)
+    if job_run.profile_snapshot:
+        return version
     profile = db.get(Profile, job.profile_id)
     if profile is None:
-        return
-    snapshot = profile_snapshot_from_profile(profile)
+        return version
+    snapshot = profile_snapshot_from_profile(profile, version)
     db.execute(
         update(JobRun)
         .where(JobRun.id == job_run.id, JobRun.profile_snapshot.is_(None))
@@ -107,6 +152,7 @@ def _remember_profile_snapshot(db: Session, job: Job, job_run: JobRun) -> None:
     )
     db.commit()
     job_run.profile_snapshot = snapshot
+    return version
 
 
 def _safe_status(value: str | CheckStatus) -> CheckStatus:
@@ -258,14 +304,39 @@ def _host_known_hosts_entry(host: Host) -> str | None:
     return host.ssh_known_hosts_entry
 
 
-def _profile_category_type(profile: Profile) -> CategoryType | None:
-    category = profile.category
-    return category.category_type if category is not None else None
+# Env names the worker injects for service audits plus the DB scripts' CLI flags.
+SERVICE_CREDENTIAL_MARKERS = (
+    "SECAUDIT_SERVICE_USER",
+    "SECAUDIT_SERVICE_PASS",
+    "DB_USER",
+    "DB_PASS",
+    "SERVICE_USER",
+    "SERVICE_PASS",
+    "-software_user",
+    "-software_password",
+)
 
 
-def _service_env_for_profile(host: Host, profile: Profile) -> dict[str, str]:
-    """Build service-layer env vars when the profile audits a service (DB, middleware, etc.)."""
-    if not profile_uses_service_credentials(_profile_category_type(profile)):
+def _scripts_need_service_credentials(package_dir: Path, script_files: list[str]) -> bool:
+    """A profile needs service credentials only when an audit script reads them."""
+    for script_file in script_files:
+        try:
+            script_path = resolve_script_under_package(package_dir, script_file)
+            if script_path.stat().st_size > 4_000_000:
+                continue
+            text = script_path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
+            continue
+        if any(marker in text for marker in SERVICE_CREDENTIAL_MARKERS):
+            return True
+    return False
+
+
+def _service_env_for_profile(
+    host: Host, profile: Profile, *, requires_service: bool
+) -> dict[str, str]:
+    """Build service-layer env vars when the profile's audit script consumes them."""
+    if not requires_service:
         return {}
     for cred in linked_credentials(host):
         env = service_env_from_credential(cred, settings)
@@ -565,6 +636,7 @@ def _run_scap_profile_job(
     benchmark_path: Path,
     *,
     mode: str = "xccdf",
+    allowed: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     """Evaluate an XCCDF/OVAL profile via OpenSCAP on target hosts (script fallback for SCE)."""
     content_files = (
@@ -598,7 +670,10 @@ def _run_scap_profile_job(
     ).scalars().all()
     if job.execution_type is not None:
         scripts = [script for script in scripts if script.execution_type == job.execution_type]
-    audit_script = scripts[0] if scripts else None
+    audit_script = select_active_scripts(scripts)[0] if scripts else None
+    requires_service = bool(audit_script) and _scripts_need_service_credentials(
+        package_dir, [audit_script.script_file]
+    )
 
     job_run_id = job_run.id
     raw_limit = _raw_output_limit()
@@ -678,7 +753,9 @@ def _run_scap_profile_job(
                 script_path = resolve_script_under_package(package_dir, audit_script.script_file)
                 rules = _load_interpreter_rules(host_db, audit_script)
                 try:
-                    service_env = _service_env_for_profile(host, profile)
+                    service_env = _service_env_for_profile(
+                        host, profile, requires_service=requires_service
+                    )
                     output = _execute_check(
                         host,
                         script_path,
@@ -698,13 +775,14 @@ def _run_scap_profile_job(
                         level="error",
                     )
 
-            merged = merge_scap_and_script_results(
+            merged_all = merge_scap_and_script_results(
                 db_rules=rules_payload,
                 scap_outcomes=scap_outcomes,
                 script_results=script_parsed,
                 result_kind=result_kind,
             )
-            if not merged and not scap_outcomes and not script_parsed:
+            merged = _filter_rule_results(merged_all, allowed)
+            if not merged_all and not scap_outcomes and not script_parsed:
                 upsert_check_result(
                     host_db,
                     job_run_id=job_run_id,
@@ -895,6 +973,7 @@ def _run_profile_job(
     job_run: JobRun,
     profile: Profile,
     hosts: list[Host],
+    allowed: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     package_dir = Path(profile.package_path) if profile.package_path else Path(settings.profiles_path)
 
@@ -906,7 +985,8 @@ def _run_profile_job(
                 f"Using OpenSCAP executor for XCCDF profile '{profile.profile_name}'",
             )
             return _run_scap_profile_job(
-                db, job, job_run, profile, hosts, package_dir, benchmark_path, mode="xccdf"
+                db, job, job_run, profile, hosts, package_dir, benchmark_path,
+                mode="xccdf", allowed=allowed,
             )
 
     if profile.source_format == "oval":
@@ -917,7 +997,8 @@ def _run_profile_job(
                 f"Using OpenSCAP OVAL evaluator for profile '{profile.profile_name}'",
             )
             return _run_scap_profile_job(
-                db, job, job_run, profile, hosts, package_dir, oval_path, mode="oval"
+                db, job, job_run, profile, hosts, package_dir, oval_path,
+                mode="oval", allowed=allowed,
             )
 
     scripts = db.execute(
@@ -940,7 +1021,11 @@ def _run_profile_job(
                 ),
                 level="warning",
             )
+    scripts = select_active_scripts(scripts)
     package_dir = Path(profile.package_path) if profile.package_path else Path(settings.profiles_path)
+    requires_service = _scripts_need_service_credentials(
+        package_dir, [script.script_file for script in scripts]
+    )
     job_run_id = job_run.id
     raw_limit = _raw_output_limit()
 
@@ -958,7 +1043,9 @@ def _run_profile_job(
             )
             config_path = Path(config_env["SECAUDIT_CONFIG_FILE"]) if config_env.get("SECAUDIT_CONFIG_FILE") else None
             try:
-                service_env = _service_env_for_profile(host, profile)
+                service_env = _service_env_for_profile(
+                    host, profile, requires_service=requires_service
+                )
             except ValueError as exc:
                 message = str(exc)
                 publish_job_log(job_run_id, f"ERROR [{host.name}]: {message}", level="error")
@@ -1005,8 +1092,9 @@ def _run_profile_job(
                         host_results += 1
                         continue
 
-                    parsed = apply_interpreter_rules(output, rules)
-                    if not parsed:
+                    parsed_all = apply_interpreter_rules(output, rules)
+                    parsed = _filter_rule_results(parsed_all, allowed)
+                    if not parsed_all:
                         upsert_check_result(
                             host_db,
                             job_run_id=job_run_id,
@@ -1056,6 +1144,7 @@ def _run_network_compliance_job(
     job: Job,
     job_run: JobRun,
     hosts: list[Host],
+    allowed: set[str] | None = None,
 ) -> tuple[int, list[str]]:
     mode = job.network_check_mode or NetworkCheckMode.BOTH
     configs = db.execute(
@@ -1111,6 +1200,8 @@ def _run_network_compliance_job(
 
         parsed = parse_network_config(config_text, vendor)
         for check in parsed.checks:
+            if allowed is not None and check.rule_tech_name not in allowed:
+                continue
             upsert_check_result(
                 db,
                 job_run_id=job_run.id,
@@ -1200,7 +1291,8 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
             )
             return {"error": "job not found"}
 
-        _remember_profile_snapshot(db, job, job_run)
+        version = _remember_profile_snapshot(db, job, job_run)
+        allowed = _allowed_rule_names(version)
         publish_job_log(job_run_id, f"Job run #{job_run_id} started")
 
         hosts = _resolve_hosts(db, job)
@@ -1240,13 +1332,17 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
                         f"Network job via vendor profile «{profile.profile_name}» "
                         f"(mode={(job.network_check_mode or NetworkCheckMode.BOTH).value})",
                     )
-                    results_count, errors = _run_profile_job(db, job, job_run, profile, hosts)
+                    results_count, errors = _run_profile_job(
+                        db, job, job_run, profile, hosts, allowed
+                    )
                 else:
                     publish_job_log(
                         job_run_id,
                         "WARNING: network job has no vendor profile — using thin network_config baseline",
                     )
-                    results_count, errors = _run_network_compliance_job(db, job, job_run, hosts)
+                    results_count, errors = _run_network_compliance_job(
+                        db, job, job_run, hosts, allowed
+                    )
             elif job.playbook_id:
                 results_count, errors = _run_playbook_job(
                     db,
@@ -1260,7 +1356,9 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
                 profile = db.get(Profile, job.profile_id)
                 if not profile:
                     raise ValueError("Profile not found")
-                results_count, errors = _run_profile_job(db, job, job_run, profile, hosts)
+                results_count, errors = _run_profile_job(
+                    db, job, job_run, profile, hosts, allowed
+                )
             else:
                 raise ValueError("Job has no profile_id or playbook_id")
 

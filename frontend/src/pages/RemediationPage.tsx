@@ -119,7 +119,11 @@ export function RemediationPage({
   }, [presetHosts, operationsPlatform]);
 
   useEffect(() => {
-    if (operationsPlatform === "linux" && jobType !== "ssh" && jobType !== "ansible") {
+    if (
+      (operationsPlatform === "linux" || operationsPlatform === "unix") &&
+      jobType !== "ssh" &&
+      jobType !== "ansible"
+    ) {
       setJobType("ssh");
     } else if (operationsPlatform === "windows" && jobType !== "winrm" && jobType !== "ansible") {
       setJobType("winrm");
@@ -166,10 +170,12 @@ export function RemediationPage({
     const hostOsById = new Map(
       (hosts.data?.items ?? []).map((host) => [host.id, host.os_type] as const)
     );
-    return all.filter((job) =>
-      jobMatchesOperationsPlatform(job, operationsPlatform, { profileCategoryById, hostOsById })
+    return all.filter(
+      (job) =>
+        job.id === urlEditJobId ||
+        jobMatchesOperationsPlatform(job, operationsPlatform, { profileCategoryById, hostOsById })
     );
-  }, [jobs.data, profiles.data, hosts.data, operationsPlatform]);
+  }, [jobs.data, profiles.data, hosts.data, operationsPlatform, urlEditJobId]);
 
   const sortedJobs = useMemo(
     () => [...jobList].sort((a, b) => b.id - a.id),
@@ -547,7 +553,7 @@ export function RemediationPage({
                   setJobType(e.target.value as "ssh" | "winrm" | "python" | "ansible")
                 }
               >
-                {operationsPlatform === "linux" && (
+                {(operationsPlatform === "linux" || operationsPlatform === "unix") && (
                   <>
                     <option value="ssh">{t("jobs.typeSsh")}</option>
                     <option value="ansible">{t("jobs.typePlaybook")}</option>
@@ -592,7 +598,7 @@ export function RemediationPage({
                 }
                 disabled={!activeProfileId || filteredRemediationScripts.length === 0}
               >
-                <option value="">{t("remediation.allScripts")}</option>
+                <option value="">{t("remediation.activeScript")}</option>
                 {filteredRemediationScripts.map((script) => (
                   <option key={script.id} value={script.id}>
                     {script.name}
@@ -887,7 +893,7 @@ export function RemediationPage({
                     <td>{job.name}</td>
                     <td>{profileNameById.get(job.profile_id) ?? job.profile_id}</td>
                     <td className="pf-table__mono">
-                      {job.remediation_script_id ? `#${job.remediation_script_id}` : t("remediation.allScripts")}
+                      {job.remediation_script_id ? `#${job.remediation_script_id}` : t("remediation.activeScript")}
                     </td>
                     <td>
                       {job.is_scheduled

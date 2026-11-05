@@ -7,7 +7,7 @@ import { LoginMfaForm } from "./LoginMfaForm";
 import { MfaRequiredError } from "./mfaErrors";
 
 const DEMO_STAND_REPO_URL = "https://github.com/secauditplatform/SecAudit-Platform-public";
-const LICENSE_URL = "https://polyformproject.org/licenses/noncommercial/1.0.0";
+const LICENSE_URL = "https://fsl.software/";
 
 type LoginPageProps = {
   showKeycloak: boolean;
@@ -232,7 +232,7 @@ export function LoginPage({
               <span className="pf-login-footer__license">
                 {t("auth.demoStandLicense")}{" "}
                 <a href={LICENSE_URL} target="_blank" rel="noopener noreferrer">
-                  PolyForm Noncommercial 1.0.0
+                  FSL-1.1-ALv2
                 </a>
               </span>
             ) : null}

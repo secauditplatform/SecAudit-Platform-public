@@ -1,17 +1,21 @@
 SecAudit Platform
 Copyright 2026 secauditplatform@proton.me
 
-SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+SPDX-License-Identifier: FSL-1.1-ALv2
 
-Required Notice: Copyright 2026 secauditplatform@proton.me
+Licensed under the Functional Source License 1.1, ALv2 Future License.
+See the LICENSE file in this repository and https://fsl.software/
 
-This software is licensed under the PolyForm Noncommercial License 1.0.0.
-See the LICENSE file in this repository and
-https://polyformproject.org/licenses/noncommercial/1.0.0
+Free for any purpose except a Competing Use: making the Software available to
+others in a commercial product or service that substitutes for it. Internal
+use, including inside for-profit companies, requires no license and no payment.
 
-Commercial use requires a separate license from the licensor
-(secauditplatform@proton.me).
+Two years after each version is made available, that version is also available
+under the Apache License, Version 2.0.
+
+Commercial licensing (OEM/embedding, resale, SLA support, custom builds):
+secauditplatform@proton.me
 
 Third-party open-source dependencies retain their own licenses.
-Compliance profile content (CIS/STIG/vendor/regulator packages) is
-licensed separately and is not covered by this NOTICE.
+Compliance profile content (CIS/STIG/vendor/regulator packages) is licensed
+separately and is not covered by this NOTICE.

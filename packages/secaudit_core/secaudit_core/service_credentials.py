@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import shlex
 
-from secaudit_core.enums import CategoryType
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.settings import SecAuditSettings
 
@@ -47,13 +46,6 @@ def service_env_from_credential(
         env["DB_PASS"] = secret
         env["SERVICE_PASS"] = secret
     return env
-
-
-def profile_uses_service_credentials(category_type: CategoryType | None) -> bool:
-    """OS profiles use host login only; service profiles need service credentials."""
-    if category_type is None:
-        return False
-    return category_type != CategoryType.OS
 
 
 def service_script_cli_suffix(env: dict[str, str] | None) -> str:

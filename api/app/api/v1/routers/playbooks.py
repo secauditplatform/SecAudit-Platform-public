@@ -56,7 +56,7 @@ def _playbook_read(playbook: Playbook) -> PlaybookRead:
 @router.get("", response_model=list[PlaybookRead])
 async def list_playbooks(
     scope: JobScope | None = Query(default=None),
-    platform: str | None = Query(default=None, pattern="^(linux|windows|network)$"),
+    platform: str | None = Query(default=None, pattern="^(linux|windows|unix|network)$"),
     kind: str | None = Query(default=None, pattern="^(user|compliance_template)$"),
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_operate),
@@ -94,7 +94,7 @@ async def get_playbook_templates(
 async def list_playbook_runs(
     playbook_id: int | None = Query(default=None),
     scope: JobScope | None = Query(default=None),
-    platform: str | None = Query(default=None, pattern="^(linux|windows|network)$"),
+    platform: str | None = Query(default=None, pattern="^(linux|windows|unix|network)$"),
     limit: int = Query(default=30, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_operate),

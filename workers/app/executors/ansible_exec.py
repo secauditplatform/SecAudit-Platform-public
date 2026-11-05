@@ -103,6 +103,8 @@ def _apply_connection_settings(
     *,
     winrm_cert_validation: str | None = None,
 ) -> None:
+    # Read-only marker for templates; ansible_connection itself is policy-forbidden in content.
+    host_vars["secaudit_connection"] = connection_mode
     if connection_mode == "winrm":
         from app.executors.winrm_exec import normalize_winrm_port, winrm_use_ssl
 

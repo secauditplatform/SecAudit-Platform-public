@@ -16,6 +16,23 @@ from app.services.object_rbac import (
 )
 
 
+UNIX_OS_TYPES = (
+    "unix",
+    "freebsd",
+    "openbsd",
+    "netbsd",
+    "dragonfly",
+    "solaris",
+    "illumos",
+    "hpux",
+    "hp-ux",
+    "sunos",
+    "aix",
+    "macos",
+    "darwin",
+)
+
+
 class PlaybookService:
     @staticmethod
     def _job_matches_platform(platform: str):
@@ -24,8 +41,12 @@ class PlaybookService:
             host_condition = host_os == "network"
         elif platform == "windows":
             host_condition = host_os == "windows"
+        elif platform == "unix":
+            host_condition = host_os.in_(UNIX_OS_TYPES)
         else:
-            host_condition = and_(host_os != "network", host_os != "windows")
+            host_condition = and_(
+                host_os != "network", host_os != "windows", host_os.notin_(UNIX_OS_TYPES)
+            )
 
         return exists(
             select(1)

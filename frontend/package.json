@@ -1,8 +1,8 @@
 {
   "name": "secaudit-frontend",
   "private": true,
-  "version": "1.7.0",
-  "license": "PolyForm-Noncommercial-1.0.0",
+  "version": "1.8.0",
+  "license": "FSL-1.1-ALv2",
   "author": "secauditplatform@proton.me",
   "type": "module",
   "scripts": {

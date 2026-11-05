@@ -252,6 +252,22 @@ def _platform_of(os_type: str | None) -> str:
         return "windows"
     if value in {"network", "network device"}:
         return "network"
+    if value in {
+        "unix",
+        "freebsd",
+        "openbsd",
+        "netbsd",
+        "dragonfly",
+        "solaris",
+        "illumos",
+        "aix",
+        "hpux",
+        "hp-ux",
+        "sunos",
+        "macos",
+        "darwin",
+    }:
+        return "unix"
     if value:
         return "linux"
     return "unknown"

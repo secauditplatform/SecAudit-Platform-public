@@ -11,7 +11,7 @@ from pathlib import Path
 from secaudit_core.profile_packages import package_encoding_hint
 
 
-def profile_snapshot_from_profile(profile) -> dict:
+def profile_snapshot_from_profile(profile, version=None) -> dict:
     encoding = None
     package_path = getattr(profile, "package_path", None)
     if package_path:
@@ -19,10 +19,20 @@ def profile_snapshot_from_profile(profile) -> dict:
             encoding = package_encoding_hint(Path(package_path))
         except OSError:
             encoding = None
-    version = getattr(profile, "version", None)
-    return {
+    version_value = getattr(profile, "version", None)
+    snapshot = {
         "profile_id": profile.id,
         "profile_name": profile.profile_name,
-        "version": str(version) if version else None,
+        "version": str(version_value) if version_value else None,
         "encoding": encoding,
     }
+    if version is not None:
+        snapshot.update(
+            {
+                "version_id": version.id,
+                "version_number": version.number,
+                "version_label": version.label,
+                "enabled_requirement_count": len(version.requirement_ids or []),
+            }
+        )
+    return snapshot

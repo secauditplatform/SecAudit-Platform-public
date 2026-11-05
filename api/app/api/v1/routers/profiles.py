@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,7 +7,7 @@ from app.core.auth import AuthUser, require_roles
 from app.core.roles import require_operate, require_reports
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Profile, UserRole
+from app.models import Profile, ScriptKind, UserRole
 from app.schemas import (
     CheckScriptContentRead,
     CheckScriptContentUpdate,
@@ -22,6 +22,10 @@ from app.schemas import (
     ProfileRuleUpdate,
     ProfileRuleUpdateResult,
     ProfileSyncResult,
+    ProfileVersionCreate,
+    ProfileVersionDependencies,
+    ProfileVersionDetail,
+    ProfileVersionRead,
     ProfilesBulkActionRequest,
     ProfilesBulkActionResult,
     ProfilesBulkActionError,
@@ -31,7 +35,12 @@ from app.schemas import (
     ProfilesCatalogSyncStatus,
 )
 from app.services.scap import preview_xccdf_profiles_from_uploads
-from app.services.profiles import ProfileActiveRunsError, ProfileDependencyError, ProfileService
+from app.services.profiles import (
+    ProfileActiveRunsError,
+    ProfileDependencyError,
+    ProfileService,
+    ProfileVersionInUseError,
+)
 from app.services.audit_log import log_audit_event
 from secaudit_core.profiles_catalog import iter_catalog_entries_from_imports
 
@@ -103,7 +112,7 @@ async def discover_profiles(
 @router.get("/catalog", response_model=list[ProfilesCatalogEntry])
 async def list_profiles_catalog(
     family: str | None = Query(default=None, pattern="^(custom)$"),
-    platform: str | None = Query(default=None, pattern="^(linux|windows|network)$"),
+    platform: str | None = Query(default=None, pattern="^(linux|windows|unix|network)$"),
     os_name: str | None = Query(default=None),
     os_version: str | None = Query(default=None),
     os: str | None = Query(default=None),
@@ -133,7 +142,7 @@ async def get_profiles_catalog_sync_status(
 @router.get("/catalog/stream")
 async def stream_profiles_catalog(
     family: str | None = Query(default=None, pattern="^(custom)$"),
-    platform: str | None = Query(default=None, pattern="^(linux|windows|network)$"),
+    platform: str | None = Query(default=None, pattern="^(linux|windows|unix|network)$"),
     os_name: str | None = Query(default=None),
     os_version: str | None = Query(default=None),
     os: str | None = Query(default=None),
@@ -346,6 +355,160 @@ async def get_profile_rules(
     return [ProfileRuleRead.model_validate(rule) for rule in rules]
 
 
+@router.get("/{profile_id}/versions", response_model=list[ProfileVersionRead])
+async def list_profile_versions(
+    profile_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: AuthUser = Depends(require_reports),
+) -> list[ProfileVersionRead]:
+    try:
+        versions = await profile_service.list_profile_versions(db, profile_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return [ProfileVersionRead.model_validate(version) for version in versions]
+
+
+@router.post("/{profile_id}/versions", response_model=ProfileVersionDetail, status_code=201)
+async def create_profile_version(
+    profile_id: int,
+    data: ProfileVersionCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> ProfileVersionDetail:
+    try:
+        version = await profile_service.create_profile_version(
+            db,
+            profile_id,
+            requirement_ids=data.requirement_ids,
+            label=data.label,
+            activate=data.activate,
+            actor=user.username,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="profile.version.create",
+        resource_type="profile",
+        resource_id=profile_id,
+        resource_name=f"v{version['number']}",
+        metadata={
+            "version_number": version["number"],
+            "enabled_count": version["enabled_count"],
+            "activate": data.activate,
+        },
+    )
+    return ProfileVersionDetail.model_validate(version)
+
+
+@router.get("/{profile_id}/versions/{version_id}", response_model=ProfileVersionDetail)
+async def get_profile_version(
+    profile_id: int,
+    version_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: AuthUser = Depends(require_reports),
+) -> ProfileVersionDetail:
+    try:
+        version = await profile_service.get_profile_version(db, profile_id, version_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    payload = profile_service._profile_version_payload(version) | {
+        "requirement_ids": version.requirement_ids or []
+    }
+    return ProfileVersionDetail.model_validate(payload)
+
+
+@router.post(
+    "/{profile_id}/versions/{version_id}/activate",
+    response_model=ProfileVersionRead,
+)
+async def activate_profile_version(
+    profile_id: int,
+    version_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> ProfileVersionRead:
+    try:
+        version = await profile_service.activate_profile_version(db, profile_id, version_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="profile.version.activate",
+        resource_type="profile",
+        resource_id=profile_id,
+        resource_name=f"v{version['number']}",
+        metadata={"version_number": version["number"]},
+    )
+    return ProfileVersionRead.model_validate(version)
+
+
+@router.get(
+    "/{profile_id}/versions/{version_id}/dependencies",
+    response_model=ProfileVersionDependencies,
+)
+async def get_profile_version_dependencies(
+    profile_id: int,
+    version_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: AuthUser = Depends(require_reports),
+) -> ProfileVersionDependencies:
+    try:
+        dependencies = await profile_service.get_profile_version_dependencies(
+            db, profile_id, version_id
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ProfileVersionDependencies.model_validate(dependencies)
+
+
+@router.delete("/{profile_id}/versions/{version_id}", status_code=204)
+async def delete_profile_version(
+    profile_id: int,
+    version_id: int,
+    request: Request,
+    cascade: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> None:
+    try:
+        version = await profile_service.delete_profile_version(
+            db, profile_id, version_id, cascade=cascade
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ProfileVersionInUseError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="profile.version.delete",
+        resource_type="profile",
+        resource_id=profile_id,
+        resource_name=f"v{version['number']}",
+        metadata={
+            "version_number": version["number"],
+            "enabled_count": version["enabled_count"],
+            "cascade": cascade,
+            "deleted_jobs": version["deleted_jobs"],
+            "deleted_job_runs": version["deleted_job_runs"],
+            "deleted_check_results": version["deleted_check_results"],
+        },
+    )
+
+
 @router.get(
     "/{profile_id}/rules/changelog",
     response_model=list[ProfileRuleChangelogEntry],
@@ -454,6 +617,102 @@ async def update_check_script_content(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return CheckScriptContentRead.model_validate(payload)
+
+
+@router.post(
+    "/{profile_id}/scripts",
+    response_model=list[CheckScriptRead],
+    status_code=201,
+)
+async def upload_check_scripts(
+    profile_id: int,
+    request: Request,
+    script_kind: ScriptKind = Form(...),
+    files: list[UploadFile] = File(...),
+    rules_from: str | None = Form(default=None),
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+) -> list[CheckScriptRead]:
+    uploads = [
+        (upload.filename or "script", await upload.read()) for upload in files
+    ]
+    try:
+        scripts = await profile_service.add_check_scripts(
+            db, profile_id, script_kind, uploads, rules_from=rules_from
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="profile.script.upload",
+        resource_type="profile",
+        resource_id=profile_id,
+        resource_name=", ".join(script.script_file for script in scripts),
+        metadata={
+            "script_kind": script_kind.value,
+            "script_files": [script.script_file for script in scripts],
+            "rules_from": rules_from,
+        },
+    )
+    return [CheckScriptRead.model_validate(script) for script in scripts]
+
+
+@router.delete("/{profile_id}/scripts/{script_id}", status_code=204)
+async def delete_check_script(
+    profile_id: int,
+    script_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+) -> None:
+    try:
+        await profile_service.delete_check_script(db, profile_id, script_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="profile.script.delete",
+        resource_type="profile",
+        resource_id=profile_id,
+        resource_name=str(script_id),
+    )
+
+
+@router.post("/{profile_id}/scripts/{script_id}/primary", response_model=CheckScriptRead)
+async def set_primary_check_script(
+    profile_id: int,
+    script_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+) -> CheckScriptRead:
+    try:
+        script = await profile_service.set_primary_check_script(db, profile_id, script_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="profile.script.primary",
+        resource_type="profile",
+        resource_id=profile_id,
+        resource_name=script.script_file,
+    )
+    return CheckScriptRead.model_validate(script)
 
 
 @router.post("", response_model=ProfileRead, status_code=201)

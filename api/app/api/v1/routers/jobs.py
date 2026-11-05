@@ -17,7 +17,7 @@ from app.core.auth import AuthUser
 from app.core.roles import require_jobs_run, require_reports
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import Host, Job, JobHost, JobRun, JobScope, JobStatus, Profile
+from app.models import Host, Job, JobHost, JobRun, JobScope, JobStatus, Profile, ProfileVersion
 from app.pagination import paginate_scalars, pagination_params
 from app.schemas import (
     CheckResultRead,
@@ -48,11 +48,24 @@ def _revoke_celery_task(task_id: str) -> None:
     revoke_task(task_id, broker_url=settings.celery_broker_url)
 
 
+async def _validate_profile_version(
+    db: AsyncSession, profile_id: int | None, version_id: int | None
+) -> None:
+    if version_id is None:
+        return
+    if profile_id is None:
+        raise HTTPException(status_code=400, detail="profile_version_id requires profile_id")
+    version = await db.get(ProfileVersion, version_id)
+    if version is None or version.profile_id != profile_id:
+        raise HTTPException(status_code=400, detail="Profile version does not belong to the profile")
+
+
 def _job_to_read(job: Job) -> JobRead:
     return JobRead(
         id=job.id,
         name=job.name,
         profile_id=job.profile_id,
+        profile_version_id=job.profile_version_id,
         playbook_id=job.playbook_id,
         execution_type=job.execution_type,
         dynamic_filter=job.dynamic_filter,
@@ -91,6 +104,7 @@ async def create_job(
 ) -> JobRead:
     if not data.profile_id and not data.playbook_id:
         raise HTTPException(status_code=400, detail="profile_id or playbook_id is required")
+    await _validate_profile_version(db, data.profile_id, data.profile_version_id)
     network_check_mode = await validate_job_scope(
         db,
         scope=data.scope,
@@ -160,6 +174,11 @@ async def update_job(
 
     merged_scope = updates.get("scope", job.scope)
     merged_profile_id = updates.get("profile_id", job.profile_id)
+    profile_changed = "profile_id" in updates and updates["profile_id"] != job.profile_id
+    merged_profile_version_id = updates.pop(
+        "profile_version_id", None if profile_changed else job.profile_version_id
+    )
+    await _validate_profile_version(db, merged_profile_id, merged_profile_version_id)
     merged_host_ids = host_ids if host_ids is not None else [jh.host_id for jh in job.job_hosts]
     resolved_network_mode = await validate_job_scope(
         db,
@@ -172,6 +191,7 @@ async def update_job(
 
     for field, value in updates.items():
         setattr(job, field, value)
+    job.profile_version_id = merged_profile_version_id
 
     apply_webhook_fields(
         job,

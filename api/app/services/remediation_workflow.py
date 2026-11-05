@@ -94,6 +94,10 @@ async def build_remediation_suggestion(db: AsyncSession, user: AuthUser, run_id:
     profile = job.profile
     profile_name = profile.profile_name if profile else f"Profile #{job.profile_id}"
     default_exec = _default_execution_type(job, scripts)
+    default_script = next(
+        (script for script in scripts if script.is_primary),
+        scripts[0] if scripts else None,
+    )
 
     return {
         "source_run_id": run_id,
@@ -122,5 +126,5 @@ async def build_remediation_suggestion(db: AsyncSession, user: AuthUser, run_id:
         ],
         "suggested_name": f"Remediate — {job.name} (run #{run_id})",
         "default_execution_type": default_exec,
-        "default_remediation_script_id": scripts[0].id if scripts else None,
+        "default_remediation_script_id": default_script.id if default_script else None,
     }

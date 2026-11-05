@@ -43,11 +43,14 @@ const emptyCred = (): CredDraft => ({
   service_secret: "",
 });
 
-function profilePlatform(profile: Profile): "linux" | "windows" | "network" | "services" | null {
+function profilePlatform(
+  profile: Profile
+): "linux" | "windows" | "unix" | "network" | "services" | null {
   const category = (profile.category_name || "").toLowerCase();
   if (category.includes("windows")) return "windows";
   if (category.includes("network")) return "network";
   if (category.includes("service")) return "services";
+  if (category.includes("unix")) return "unix";
   if (category.includes("linux")) return "linux";
   return null;
 }
@@ -142,6 +145,7 @@ function platformTone(platform: string | null | undefined): string {
   const value = (platform || "").toLowerCase();
   if (value === "windows") return "windows";
   if (value === "network") return "network";
+  if (value === "unix") return "unix";
   if (value === "linux") return "linux";
   return "unknown";
 }

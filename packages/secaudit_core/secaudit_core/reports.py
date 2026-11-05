@@ -741,7 +741,7 @@ REPORT_TEMPLATE = _REPORT_ENV.from_string("""{% macro pdf_spacer(height_pt=8) %}
           <td class="k" width="14%">{{ t.job }}</td>
           <td class="v" width="36%">{{ job_name }}</td>
           <td class="k" width="14%">{{ t.standard }}</td>
-          <td class="v" width="36%">{{ profile_name }}</td>
+          <td class="v" width="36%">{{ profile_name }}{% if profile_version %} <span style="color:#7a8796;">· {{ profile_version }}</span>{% endif %}</td>
         </tr>
         <tr>
           <td class="k" width="14%">{{ t.status }}</td>
@@ -895,6 +895,18 @@ def fetch_run_report_context_sync(
     return job_run, profile, hosts
 
 
+
+
+def _profile_version_label(job_run) -> str:
+    """Requirement-set version captured in the run snapshot, e.g. v2 «Base»."""
+    snapshot = getattr(job_run, "profile_snapshot", None)
+    if not isinstance(snapshot, dict):
+        return ""
+    number = snapshot.get("version_number")
+    if not number:
+        return ""
+    label = str(snapshot.get("version_label") or "").strip()
+    return f"v{number} «{label}»" if label else f"v{number}"
 
 
 def _format_dt(value: datetime | None, locale: str | None = None) -> str:
@@ -1103,6 +1115,11 @@ def render_run_report_html(job_run, profile, hosts: dict, *, for_pdf: bool = Fal
         **font_paths,
         job_name=_soft_break(job_run.job.name, chunk=24) if for_pdf and job_run.job else (job_run.job.name if job_run.job else "—"),
         profile_name=_soft_break(profile.profile_name, chunk=24) if for_pdf and profile else (profile.profile_name if profile else "—"),
+        profile_version=(
+            _soft_break(_profile_version_label(job_run), chunk=24)
+            if for_pdf
+            else _profile_version_label(job_run)
+        ),
         compliance=compliance,
         compliance_bar=compliance_bar,
         compliance_rest=compliance_rest,

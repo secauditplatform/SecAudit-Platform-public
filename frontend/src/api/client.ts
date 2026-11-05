@@ -288,6 +288,7 @@ export interface CheckScript {
   execution_type: string;
   script_file: string;
   script_kind?: "audit" | "remediation";
+  is_primary?: boolean;
   description?: string | null;
   interpreter_rules: InterpreterRule[];
 }
@@ -331,6 +332,28 @@ export interface ProfileRuleUpdateResult {
   rule: ProfileRule;
   profile_version: string;
   changelog_entry: ProfileRuleChangelogEntry;
+}
+
+export interface ProfileVersion {
+  id: number;
+  profile_id: number;
+  number: number;
+  label?: string | null;
+  enabled_count: number;
+  is_active: boolean;
+  created_by?: string | null;
+  created_at: string;
+}
+
+export interface ProfileVersionDetail extends ProfileVersion {
+  requirement_ids: string[];
+}
+
+export interface ProfileVersionDependencies {
+  jobs: number;
+  job_runs: number;
+  check_results: number;
+  active_runs: number;
 }
 
 export interface CheckScriptContent {
@@ -449,7 +472,7 @@ export interface Playbook {
   description?: string;
   content: string;
   scope?: OperationsScope;
-  platform?: "linux" | "windows" | "network";
+  platform?: "linux" | "windows" | "unix" | "network";
   kind?: PlaybookKind;
   version?: string;
   profile_id?: number | null;
@@ -758,6 +781,7 @@ export interface Job {
   id: number;
   name: string;
   profile_id?: number | null;
+  profile_version_id?: number | null;
   playbook_id?: number | null;
   execution_type?: "ssh" | "winrm" | "ansible" | "python" | null;
   scope?: OperationsScope;
@@ -1608,6 +1632,28 @@ export const api = {
   },
   getProfile: (id: number) => request<ProfileDetail>(`/profiles/${id}`),
   getProfileRules: (id: number) => request<ProfileRule[]>(`/profiles/${id}/rules`),
+  getProfileVersions: (id: number) => request<ProfileVersion[]>(`/profiles/${id}/versions`),
+  getProfileVersion: (id: number, versionId: number) =>
+    request<ProfileVersionDetail>(`/profiles/${id}/versions/${versionId}`),
+  createProfileVersion: (
+    id: number,
+    data: { label?: string | null; requirement_ids: string[]; activate?: boolean }
+  ) =>
+    request<ProfileVersionDetail>(`/profiles/${id}/versions`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  activateProfileVersion: (id: number, versionId: number) =>
+    request<ProfileVersion>(`/profiles/${id}/versions/${versionId}/activate`, {
+      method: "POST",
+    }),
+  deleteProfileVersion: (id: number, versionId: number, cascade = false) =>
+    request<void>(
+      `/profiles/${id}/versions/${versionId}${cascade ? "?cascade=true" : ""}`,
+      { method: "DELETE" }
+    ),
+  getProfileVersionDependencies: (id: number, versionId: number) =>
+    request<ProfileVersionDependencies>(`/profiles/${id}/versions/${versionId}/dependencies`),
   getProfileRuleChangelog: (id: number, limit = 100) =>
     request<ProfileRuleChangelogEntry[]>(`/profiles/${id}/rules/changelog${buildQuery({ limit })}`),
   updateProfileRule: (id: number, requirementId: string, data: ProfileRuleUpdate) =>
@@ -1624,6 +1670,27 @@ export const api = {
     request<CheckScriptContent>(`/profiles/${profileId}/scripts/${scriptId}/content`, {
       method: "PUT",
       body: JSON.stringify({ content }),
+    }),
+  uploadCheckScripts: (
+    profileId: number,
+    kind: "audit" | "remediation",
+    files: File[],
+    rulesFrom?: string
+  ) => {
+    const formData = new FormData();
+    formData.append("script_kind", kind);
+    if (rulesFrom) formData.append("rules_from", rulesFrom);
+    for (const file of files) formData.append("files", file, file.name);
+    return request<CheckScript[]>(`/profiles/${profileId}/scripts`, {
+      method: "POST",
+      body: formData,
+    });
+  },
+  deleteCheckScript: (profileId: number, scriptId: number) =>
+    request<void>(`/profiles/${profileId}/scripts/${scriptId}`, { method: "DELETE" }),
+  setCheckScriptPrimary: (profileId: number, scriptId: number) =>
+    request<CheckScript>(`/profiles/${profileId}/scripts/${scriptId}/primary`, {
+      method: "POST",
     }),
   deleteProfile: (id: number, options?: { cascade?: boolean }) => {
     const query = options?.cascade ? "?cascade=true" : "";
@@ -1840,7 +1907,7 @@ export const api = {
     }),
   playbooks: (
     scope?: OperationsScope,
-    platform?: "linux" | "windows" | "network",
+    platform?: "linux" | "windows" | "unix" | "network",
     kind?: PlaybookKind
   ) => request<Playbook[]>(`/playbooks${buildQuery({ scope, platform, kind })}`),
   playbookTemplates: (scope?: OperationsScope) =>
@@ -1849,7 +1916,7 @@ export const api = {
     playbookId?: number;
     limit?: number;
     scope?: OperationsScope;
-    platform?: "linux" | "windows" | "network";
+    platform?: "linux" | "windows" | "unix" | "network";
   }) =>
     request<PlaybookRun[]>(
       `/playbooks/runs${buildQuery({
@@ -1878,7 +1945,7 @@ export const api = {
     description?: string;
     content: string;
     scope?: OperationsScope;
-    platform?: "linux" | "windows" | "network";
+    platform?: "linux" | "windows" | "unix" | "network";
   }) => request<Playbook>("/playbooks", { method: "POST", body: JSON.stringify(data) }),
   updatePlaybook: (
     id: number,
@@ -1886,7 +1953,7 @@ export const api = {
       name: string;
       description: string;
       content: string;
-      platform: "linux" | "windows" | "network";
+      platform: "linux" | "windows" | "unix" | "network";
     }>
   ) => request<Playbook>(`/playbooks/${id}`, { method: "PUT", body: JSON.stringify(data) }),
   updatePlaybookContent: (id: number, content: string) =>
@@ -2017,6 +2084,7 @@ export const api = {
   createJob: (data: {
     name: string;
     profile_id?: number;
+    profile_version_id?: number | null;
     playbook_id?: number;
     execution_type?: "ssh" | "winrm" | "python" | "ansible";
     scope?: OperationsScope;
@@ -2034,6 +2102,7 @@ export const api = {
     data: {
       name?: string;
       profile_id?: number | null;
+      profile_version_id?: number | null;
       playbook_id?: number | null;
       execution_type?: "ssh" | "winrm" | "python" | "ansible" | null;
       network_check_mode?: NetworkCheckMode;

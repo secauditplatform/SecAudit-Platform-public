@@ -20,7 +20,9 @@ _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 AUTO_SELECT_MIN = 70
 AMBIGUITY_GAP = 8
 
-_OS_CATEGORY_SLUGS = frozenset({"linux-platform", "windows-platform", "network-platform"})
+_OS_CATEGORY_SLUGS = frozenset(
+    {"linux-platform", "windows-platform", "unix-platform", "network-platform"}
+)
 _GENERIC_OS_NAMES = frozenset({"linux", "windows", "*", "any", "unix"})
 _GENERIC_LABEL_HINTS = ("pci dss", "pci-dss", "fstek", "fstec")
 
@@ -125,6 +127,35 @@ _LINUX_HINTS = (
     "talos",
 )
 _WINDOWS_HINTS = ("windows", "microsoft windows", "win32", "win64")
+_UNIX_HINTS = (
+    "freebsd",
+    "openbsd",
+    "netbsd",
+    "dragonfly",
+    "solaris",
+    "sunos",
+    "illumos",
+    "hp-ux",
+    "hpux",
+    "aix",
+    "macos",
+    "darwin",
+    "unix",
+)
+_UNIX_FAMILIES = frozenset(
+    {"freebsd", "openbsd", "netbsd", "dragonfly", "solaris", "illumos", "aix", "hpux", "macos"}
+)
+_UNIX_DISPLAY_NAMES = {
+    "freebsd": "FreeBSD",
+    "openbsd": "OpenBSD",
+    "netbsd": "NetBSD",
+    "dragonfly": "DragonFly BSD",
+    "solaris": "Solaris",
+    "illumos": "illumos",
+    "aix": "AIX",
+    "hpux": "HP-UX",
+    "macos": "macOS",
+}
 _NETWORK_HINTS = (
     "cisco",
     "ios-xe",
@@ -189,6 +220,16 @@ _FAMILY_PATTERNS: tuple[tuple[str, str], ...] = (
     ("mi wifi", "xiaomi"),
     ("xiaomi", "xiaomi"),
     ("openwrt", "xiaomi"),
+    ("freebsd", "freebsd"),
+    ("openbsd", "openbsd"),
+    ("netbsd", "netbsd"),
+    ("dragonfly", "dragonfly"),
+    ("solaris", "solaris"),
+    ("sunos", "solaris"),
+    ("illumos", "illumos"),
+    ("hp-ux", "hpux"),
+    ("darwin", "macos"),
+    ("macos", "macos"),
 )
 
 _ID_TO_FAMILY = {
@@ -235,6 +276,17 @@ _ID_TO_FAMILY = {
     "xiaoqiang": "xiaomi",
     "windows": "windows",
     "windows_server": "windows_server",
+    "freebsd": "freebsd",
+    "openbsd": "openbsd",
+    "netbsd": "netbsd",
+    "dragonfly": "dragonfly",
+    "solaris": "solaris",
+    "sunos": "solaris",
+    "illumos": "illumos",
+    "aix": "aix",
+    "hpux": "hpux",
+    "macos": "macos",
+    "darwin": "macos",
 }
 
 _FAMILY_KEYWORDS: tuple[tuple[str, str], ...] = (
@@ -256,6 +308,15 @@ _FAMILY_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("rocky", "rocky"),
     ("sles", "sles"),
     ("suse", "opensuse"),
+    ("freebsd", "freebsd"),
+    ("openbsd", "openbsd"),
+    ("netbsd", "netbsd"),
+    ("dragonfly", "dragonfly"),
+    ("solaris", "solaris"),
+    ("illumos", "illumos"),
+    ("aix", "aix"),
+    ("hpux", "hpux"),
+    ("macos", "macos"),
 )
 
 _VARIANT_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -304,6 +365,8 @@ def infer_platform(text: str, open_ports: list[int] | None = None) -> str | None
         return "windows"
     if any(h in blob for h in _NETWORK_HINTS):
         return "network"
+    if any(h in blob for h in _UNIX_HINTS):
+        return "unix"
     if any(h in blob for h in _LINUX_HINTS):
         return "linux"
     if ports & {5985, 5986, 3389, 445} and 22 not in ports:
@@ -518,7 +581,7 @@ def is_os_profile(profile: ProfileMatchInput) -> bool:
         return False
     if slug in _OS_CATEGORY_SLUGS:
         return True
-    return profile.get("platform") in {"linux", "windows", "network"}
+    return profile.get("platform") in {"linux", "windows", "unix", "network"}
 
 
 def _profile_family(profile: ProfileMatchInput) -> str | None:
@@ -822,6 +885,8 @@ def fingerprint_from_facts(
         "xiaomi",
     }:
         guessed = "network"
+    elif family in _UNIX_FAMILIES:
+        guessed = "unix"
     elif family:
         guessed = "linux"
 
@@ -845,13 +910,18 @@ def fingerprint_from_facts(
         caption_line = (win_caption or "").strip().splitlines()[0].strip() if win_caption else ""
         pretty = caption_line or (f"{os_name} {os_version}".strip() if os_version else os_name)
         family = family or win_family or ("windows_server" if "server" in (pretty or "").lower() else "windows")
-    elif guessed == "linux":
+    elif guessed in {"linux", "unix"}:
         os_version = fields.get("VERSION_ID") or None
         if not os_version:
             ver_src = fields.get("PRETTY_NAME") or auth_blob or (banner or "")
             ver = _VERSION_RE.search(ver_src)
             os_version = ver.group(1) if ver else None
-        os_name = fields.get("NAME") or fields.get("ID") or (family.title() if family else "Linux")
+        default_name = (
+            _UNIX_DISPLAY_NAMES.get(family or "", "UNIX")
+            if guessed == "unix"
+            else (family.title() if family else "Linux")
+        )
+        os_name = fields.get("NAME") or fields.get("ID") or default_name
         vendor = fields.get("HOME_URL")
         pretty = _linux_pretty(fields, os_release or auth_blob or "")
         if not pretty and banner and not _is_port_service_line(banner):
@@ -927,7 +997,7 @@ def rank_application_profiles(
         slug = (profile.get("category_slug") or "").strip().lower()
         if slug and slug != "services":
             continue
-        if slug != "services" and profile.get("platform") in {"linux", "windows", "network"}:
+        if slug != "services" and profile.get("platform") in {"linux", "windows", "unix", "network"}:
             if profile.get("os_name"):
                 continue
         hay = " ".join(

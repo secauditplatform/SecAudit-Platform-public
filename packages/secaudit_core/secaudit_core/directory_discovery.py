@@ -36,6 +36,19 @@ _SERVER_RE = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$"
 )
 _LINUX_MARKERS = ("linux", "ubuntu", "debian", "centos", "red hat", "rhel", "suse", "fedora")
+_UNIX_MARKERS = (
+    "freebsd",
+    "openbsd",
+    "netbsd",
+    "dragonfly",
+    "solaris",
+    "illumos",
+    "aix",
+    "hp-ux",
+    "unix",
+    "macos",
+    "darwin",
+)
 
 
 class DirectoryDiscoveryError(Exception):
@@ -184,6 +197,8 @@ def os_type_from_operating_system(value: str | None) -> str:
     text = (value or "").casefold()
     if any(marker in text for marker in _LINUX_MARKERS):
         return "linux"
+    if any(marker in text for marker in _UNIX_MARKERS):
+        return "unix"
     return "windows"
 
 
@@ -427,7 +442,7 @@ def _plan_create(computer: DirectoryComputer, *, map_ou_to_site: bool) -> Planne
     return PlannedCreate(
         name=computer.cn[:128],
         hostname=hostname,
-        port=_SSH_PORT if os_type == "linux" else _WINRM_PORT,
+        port=_SSH_PORT if os_type in {"linux", "unix"} else _WINRM_PORT,
         os_type=os_type,
         site=site_from_dn(computer.distinguished_name) if map_ou_to_site else None,
         is_active=not computer.disabled,

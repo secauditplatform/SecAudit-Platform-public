@@ -182,6 +182,14 @@ PLAYBOOK_TEMPLATES: list[dict[str, str]] = [
         "content_fast": _load_playbook_content("linux_compliance_fast.yml"),
     },
     {
+        "id": "unix-inventory",
+        "name": "UNIX inventory",
+        "description": "Collect OS facts, users, packages, services, and listening ports on FreeBSD, OpenBSD, NetBSD, and other UNIX hosts",
+        "category": "inventory",
+        "content": _load_playbook_content("unix_inventory.yml"),
+        "content_fast": _load_playbook_content("unix_inventory_fast.yml"),
+    },
+    {
         "id": "windows-inventory",
         "name": "Windows inventory",
         "description": "Collect Windows system info, services, and disk layout via WinRM",

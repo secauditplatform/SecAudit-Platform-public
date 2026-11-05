@@ -24,6 +24,7 @@ from app.models import (
   ScheduledReport,
   ScriptKind,
   Profile,
+  ProfileVersion,
   TaskOutbox,
 )
 from app.schemas import ProfileCreate, ProfileDependencies
@@ -78,6 +79,10 @@ class ProfileActiveRunsError(ValueError):
     self.dependencies = dependencies
     self.code = "profile_has_active_runs"
     super().__init__(message or "Stop all active runs before deleting the profile")
+
+
+class ProfileVersionInUseError(ValueError):
+  """Raised when a profile version cannot be deleted without reassigning jobs."""
 
 
 class ProfileService:
@@ -289,6 +294,224 @@ class ProfileService:
       "content": content,
     }
 
+  async def add_check_scripts(
+    self,
+    db: AsyncSession,
+    profile_id: int,
+    kind: ScriptKind,
+    uploads: list[tuple[str, bytes]],
+    *,
+    rules_from: str | None = None,
+  ) -> list[CheckScript]:
+    """Store uploaded script variants in the package dir and register them like an import would.
+
+    An audit script whose name is not a ``check_script`` in profile_rules.json reuses the
+    interpreter rules of an existing audit script (``rules_from``); the file still runs.
+    """
+    from secaudit_core.package_paths import normalize_shell_script_bytes
+    from secaudit_core.profile_packages import REMEDIATION_SCRIPT_MARKER, execution_type_for_extension
+
+    profile = await self.get_profile(db, profile_id)
+    if not profile:
+      raise LookupError("Profile not found")
+    if not profile.package_path:
+      raise FileNotFoundError("Profile package path not set")
+    package_dir = Path(profile.package_path)
+    if not package_dir.is_dir():
+      raise FileNotFoundError("Profile package directory not found")
+
+    taken = {script.script_file.lower() for script in profile.check_scripts}
+    prepared: list[tuple[str, bytes]] = []
+    for filename, content in uploads:
+      name = Path(filename.replace("\\", "/")).name.strip()
+      suffix = Path(name).suffix.lower()
+      if not name or suffix not in {".sh", ".py", ".ps1"}:
+        raise ValueError(f"Unsupported script file: {filename}")
+      if not content or len(content) > MAX_SCRIPT_CONTENT_BYTES:
+        raise ValueError(f"Script must be 1..{MAX_SCRIPT_CONTENT_BYTES} bytes: {name}")
+      # Discovery decides script kind by the file-name marker, so enforce it here too.
+      if kind is ScriptKind.REMEDIATION and REMEDIATION_SCRIPT_MARKER not in name.lower():
+        raise ValueError(
+          f"Remediation script name must contain '{REMEDIATION_SCRIPT_MARKER}': {name}"
+        )
+      if kind is ScriptKind.AUDIT and REMEDIATION_SCRIPT_MARKER in name.lower():
+        raise ValueError(
+          f"Audit script name must not contain '{REMEDIATION_SCRIPT_MARKER}': {name}"
+        )
+      if (
+        name.lower() in taken
+        or any(item[0].lower() == name.lower() for item in prepared)
+        or (package_dir / name).exists()
+      ):
+        raise ValueError(f"Script already exists: {name}")
+      payload = normalize_shell_script_bytes(content) if suffix == ".sh" else content
+      prepared.append((name, payload))
+
+    written: list[Path] = []
+    bindings: dict[str, list[dict]] = {}
+    try:
+      for name, payload in prepared:
+        target = self._resolve_script_path(str(package_dir), name)
+        target.write_bytes(payload)
+        written.append(target)
+
+      package = load_profile_package(package_dir)
+      items = {
+        item["script_file"]: item
+        for item in (*package["scripts"], *package["remediation_scripts"])
+      }
+      for path in written:
+        item = items.get(path.name)
+        if item is not None:
+          bindings[path.name] = list(item.get("context", []))
+
+      unresolved = [path.name for path in written if path.name not in items]
+      if unresolved and kind is ScriptKind.REMEDIATION:
+        # Reserved/excluded names would never be discovered, so they must not be stored.
+        raise ValueError(
+          "Remediation script is not discoverable in the package (reserved name): "
+          + ", ".join(unresolved)
+        )
+      if unresolved:
+        base = self._rules_base_script(profile, rules_from)
+        base_rules = [
+          {
+            "regex": rule.regex,
+            "extraction_type": rule.extraction_type,
+            "tech_name": rule.tech_name,
+          }
+          for rule in (base.interpreter_rules if base is not None else [])
+        ]
+        for name in unresolved:
+          bindings[name] = base_rules
+    except Exception:
+      for path in written:
+        path.unlink(missing_ok=True)
+      raise
+
+    created: list[CheckScript] = []
+    for name, _ in prepared:
+      item = items.get(name)
+      if item is not None:
+        script = CheckScript(
+          profile_id=profile.id,
+          name=item["name"],
+          execution_type=map_execution_type(item.get("type", "SSH")),
+          script_file=item["script_file"],
+          script_kind=kind,
+          description=item.get("description"),
+        )
+      else:
+        script = CheckScript(
+          profile_id=profile.id,
+          name=Path(name).stem,
+          execution_type=execution_type_for_extension(Path(name)),
+          script_file=name,
+          script_kind=kind,
+          description=None,
+        )
+      rules: list[InterpreterRule] = []
+      for rule in bindings.get(name, []):
+        tech_name = rule.get("tech_name") or rule.get("techName")
+        if not tech_name:
+          continue
+        rules.append(
+          InterpreterRule(
+            regex=rule["regex"],
+            extraction_type=rule.get("extraction_type") or rule.get("extractionType") or "SINGLE",
+            tech_name=tech_name,
+          )
+        )
+      script.interpreter_rules = rules
+      db.add(script)
+      created.append(script)
+    # A profile without an active script of this kind would run nothing, so the first upload takes over.
+    has_active = any(
+      item.script_kind == kind and item.is_primary for item in profile.check_scripts
+    )
+    if created and not has_active:
+      created[0].is_primary = True
+    await db.flush()
+    return created
+
+  def _rules_base_script(self, profile: Profile, rules_from: str | None) -> CheckScript | None:
+    """Pick the audit script whose interpreter rules parse a script with a new name."""
+    audit = [script for script in profile.check_scripts if script.script_kind == ScriptKind.AUDIT]
+    if rules_from:
+      wanted = rules_from.strip()
+      for script in audit:
+        if wanted in {script.name, script.script_file, Path(script.script_file).stem}:
+          return script
+      raise ValueError(f"Rules base script not found: {rules_from}")
+    if len(audit) == 1:
+      return audit[0]
+    if not audit:
+      return None
+    raise ValueError("Choose the audit script whose checks this script provides (rules_from)")
+
+  async def delete_check_script(
+    self,
+    db: AsyncSession,
+    profile_id: int,
+    script_id: int,
+  ) -> None:
+    profile, script = await self._get_script_record(db, profile_id, script_id)
+
+    # A job pinned to this variant would silently fall back to all scripts after removal.
+    in_use = await db.scalar(
+      select(func.count())
+      .select_from(RemediationJob)
+      .where(RemediationJob.remediation_script_id == script.id)
+    )
+    if in_use:
+      raise ValueError(f"Script is used by {in_use} remediation job(s)")
+
+    await db.execute(delete(InterpreterRule).where(InterpreterRule.check_script_id == script.id))
+    await db.execute(delete(CheckScript).where(CheckScript.id == script.id))
+    await db.flush()
+
+    # A profile always keeps one active script per kind; promote the next one after a delete.
+    if script.is_primary:
+      replacement = next(
+        (
+          item
+          for item in profile.check_scripts
+          if item.id != script.id and item.script_kind == script.script_kind
+        ),
+        None,
+      )
+      if replacement is not None:
+        replacement.is_primary = True
+        await db.flush()
+
+    if profile.package_path:
+      try:
+        self._resolve_script_path(profile.package_path, script.script_file).unlink(missing_ok=True)
+      except (OSError, ValueError):
+        pass
+
+  async def set_primary_check_script(
+    self,
+    db: AsyncSession,
+    profile_id: int,
+    script_id: int,
+  ) -> CheckScript:
+    """Make this script the only active one of its kind (audit or remediation)."""
+    profile, script = await self._get_script_record(db, profile_id, script_id)
+
+    for other in profile.check_scripts:
+      if (
+        other.id != script.id
+        and other.script_kind == script.script_kind
+        and other.is_primary
+      ):
+        other.is_primary = False
+    # Free the unique slot before activating the new script in the same transaction.
+    await db.flush()
+    script.is_primary = True
+    await db.flush()
+    return script
+
   async def get_profile_rules(self, db: AsyncSession, profile_id: int) -> list[dict]:
     profile = await self.get_profile(db, profile_id)
     if not profile:
@@ -385,6 +608,162 @@ class ProfileService:
 
     await db.flush()
     return result
+
+  async def active_profile_version(
+    self, db: AsyncSession, profile_id: int
+  ) -> ProfileVersion | None:
+    result = await db.execute(
+      select(ProfileVersion).where(
+        ProfileVersion.profile_id == profile_id,
+        ProfileVersion.is_active.is_(True),
+      )
+    )
+    return result.scalars().first()
+
+  def _profile_version_payload(self, version: ProfileVersion) -> dict:
+    return {
+      "id": version.id,
+      "profile_id": version.profile_id,
+      "number": version.number,
+      "label": version.label,
+      "enabled_count": len(version.requirement_ids or []),
+      "is_active": version.is_active,
+      "created_by": version.created_by,
+      "created_at": version.created_at,
+    }
+
+  async def list_profile_versions(self, db: AsyncSession, profile_id: int) -> list[dict]:
+    exists = await db.execute(select(Profile.id).where(Profile.id == profile_id))
+    if exists.scalar_one_or_none() is None:
+      raise LookupError("Profile not found")
+    result = await db.execute(
+      select(ProfileVersion)
+      .where(ProfileVersion.profile_id == profile_id)
+      .order_by(ProfileVersion.number)
+    )
+    return [self._profile_version_payload(version) for version in result.scalars().all()]
+
+  async def get_profile_version(
+    self, db: AsyncSession, profile_id: int, version_id: int
+  ) -> ProfileVersion:
+    version = await db.get(ProfileVersion, version_id)
+    if not version or version.profile_id != profile_id:
+      raise LookupError("Profile version not found")
+    return version
+
+  async def create_profile_version(
+    self,
+    db: AsyncSession,
+    profile_id: int,
+    *,
+    requirement_ids: list[str] | None,
+    label: str | None,
+    activate: bool,
+    actor: str | None = None,
+  ) -> dict:
+    profile = await self.get_profile(db, profile_id)
+    if not profile:
+      raise LookupError("Profile not found")
+
+    rules = await self.get_profile_rules(db, profile_id)
+    known = {str(rule["requirement_id"]) for rule in rules if rule.get("requirement_id")}
+    if requirement_ids is None:
+      active = await self.active_profile_version(db, profile_id)
+      selected = list(active.requirement_ids or []) if active else []
+      if not selected:
+        selected = [
+          str(rule["requirement_id"]) for rule in rules if rule.get("requirement_id")
+        ]
+    else:
+      selected = [str(rid).strip() for rid in requirement_ids]
+      selected = [rid for rid in dict.fromkeys(selected) if rid]
+    # A package resync can retire requirements that an older version still lists.
+    if known:
+      selected = [rid for rid in selected if rid in known]
+    if not selected:
+      raise ValueError("Select at least one check")
+
+    if activate:
+      existing = await db.execute(
+        select(ProfileVersion).where(ProfileVersion.profile_id == profile_id)
+      )
+      for item in existing.scalars().all():
+        item.is_active = False
+      await db.flush()
+    last_number = (
+      await db.execute(
+        select(func.max(ProfileVersion.number)).where(ProfileVersion.profile_id == profile_id)
+      )
+    ).scalar() or 0
+    version = ProfileVersion(
+      profile_id=profile_id,
+      number=last_number + 1,
+      label=label,
+      requirement_ids=selected,
+      is_active=activate,
+      created_by=actor,
+    )
+    db.add(version)
+    await db.flush()
+    return self._profile_version_payload(version) | {"requirement_ids": version.requirement_ids}
+
+  async def activate_profile_version(
+    self, db: AsyncSession, profile_id: int, version_id: int
+  ) -> dict:
+    target = await self.get_profile_version(db, profile_id, version_id)
+    existing = await db.execute(
+      select(ProfileVersion).where(ProfileVersion.profile_id == profile_id)
+    )
+    # Deactivate first: the partial unique index allows one active row per profile.
+    for item in existing.scalars().all():
+      if item.id != target.id and item.is_active:
+        item.is_active = False
+    await db.flush()
+    target.is_active = True
+    await db.flush()
+    return self._profile_version_payload(target)
+
+  async def get_profile_version_dependencies(
+    self, db: AsyncSession, profile_id: int, version_id: int
+  ) -> dict:
+    version = await self.get_profile_version(db, profile_id, version_id)
+    jobs = await self._load_jobs(db, Job.profile_version_id == version.id)
+    runs = [run for job in jobs for run in job.runs]
+    return {
+      "jobs": len(jobs),
+      "job_runs": len(runs),
+      "check_results": sum(len(run.check_results) for run in runs),
+      "active_runs": sum(
+        1 for run in runs if run.status in (JobStatus.PENDING, JobStatus.RUNNING)
+      ),
+    }
+
+  async def delete_profile_version(
+    self,
+    db: AsyncSession,
+    profile_id: int,
+    version_id: int,
+    *,
+    cascade: bool = False,
+  ) -> dict:
+    version = await self.get_profile_version(db, profile_id, version_id)
+    if version.is_active:
+      raise ProfileVersionInUseError("Active version cannot be deleted")
+
+    jobs = await self._load_jobs(db, Job.profile_version_id == version.id)
+    runs = [run for job in jobs for run in job.runs]
+    if any(run.status in (JobStatus.PENDING, JobStatus.RUNNING) for run in runs):
+      raise ProfileVersionInUseError("Stop active runs before deleting this version")
+    if jobs and not cascade:
+      raise ProfileVersionInUseError(
+        f"Version is used by {len(jobs)} job(s); delete with cascade"
+      )
+
+    counts = await self._cascade_delete_jobs(db, jobs)
+    payload = self._profile_version_payload(version)
+    await db.delete(version)
+    await db.flush()
+    return payload | counts
 
   async def get_profile(self, db: AsyncSession, profile_id: int) -> Profile | None:
     result = await db.execute(
@@ -510,6 +889,7 @@ class ProfileService:
     # Catalog mount (/profiles) is read-only; declare/normalize only on writable storage copy.
     ensure_compliance_playbook_declared(stored_path)
     job_script_files: dict[int, str] = {}
+    primary_by_kind: dict[ScriptKind, tuple[str, str]] = {}
     if profile is None:
       profile = Profile(
         profile_name=name,
@@ -547,6 +927,12 @@ class ProfileService:
       job_script_files = await db.run_sync(
         lambda sync_session: capture_remediation_script_links(sync_session, profile.id)
       )
+      # Selection survives a resync when the selected file is still in the package.
+      primary_by_kind = {
+        item.script_kind: (item.execution_type.value, item.script_file)
+        for item in profile.check_scripts
+        if item.is_primary
+      }
       await db.run_sync(lambda sync_session: detach_remediation_script_links(sync_session, profile.id))
       for script in list(profile.check_scripts):
         await db.execute(delete(InterpreterRule).where(InterpreterRule.check_script_id == script.id))
@@ -555,14 +941,35 @@ class ProfileService:
       await db.flush()
     self._persist_rule_rows(db, profile, package_dir)
 
+    # Keep the operator's choice when its file is still packaged; otherwise the packaged
+    # script is active by default, so one script of each kind always runs.
+    def chosen_primary(items: list[dict], kind: ScriptKind) -> tuple[str, str] | None:
+      previous = primary_by_kind.get(kind)
+      for item in items:
+        key = (map_execution_type(item.get("type", "SSH")).value, item["script_file"])
+        if key == previous:
+          return key
+      if items:
+        first = items[0]
+        return (
+          map_execution_type(first.get("type", "SSH")).value,
+          first["script_file"],
+        )
+      return None
+
+    chosen_audit = chosen_primary(scripts, ScriptKind.AUDIT)
+    chosen_remediation = chosen_primary(remediation_scripts, ScriptKind.REMEDIATION)
+
     for item in scripts:
+      execution_type = map_execution_type(item.get("type", "SSH"))
       script = CheckScript(
         profile_id=profile.id,
         name=item["name"],
-        execution_type=map_execution_type(item.get("type", "SSH")),
+        execution_type=execution_type,
         script_file=item["script_file"],
         script_kind=ScriptKind.AUDIT,
         description=item.get("description"),
+        is_primary=(execution_type.value, item["script_file"]) == chosen_audit,
       )
       db.add(script)
       await db.flush()
@@ -591,6 +998,11 @@ class ProfileService:
         script_file=item["script_file"],
         script_kind=ScriptKind.REMEDIATION,
         description=item.get("description"),
+        is_primary=(
+          map_execution_type(item.get("type", "SSH")).value,
+          item["script_file"],
+        )
+        == chosen_remediation,
       )
       db.add(script)
 
@@ -1095,21 +1507,24 @@ class ProfileService:
       )
     )
 
-  async def _cascade_delete_jobs_for_profile(self, db: AsyncSession, profile_id: int) -> None:
+  async def _load_jobs(self, db: AsyncSession, condition) -> list[Job]:
     result = await db.execute(
       select(Job)
       .options(
         selectinload(Job.runs).selectinload(JobRun.check_results),
         selectinload(Job.job_hosts),
       )
-      .where(Job.profile_id == profile_id)
+      .where(condition)
     )
-    jobs = list(result.scalars().all())
+    return list(result.scalars().all())
+
+  async def _cascade_delete_jobs(self, db: AsyncSession, jobs: list[Job]) -> dict:
     if not jobs:
-      return
+      return {"deleted_jobs": 0, "deleted_job_runs": 0, "deleted_check_results": 0}
 
     job_ids = [job.id for job in jobs]
     run_ids = [run.id for job in jobs for run in job.runs]
+    check_results = sum(len(run.check_results) for job in jobs for run in job.runs)
 
     await self._cancel_dispatchable_outbox(db, callback_kind="job_run", run_ids=run_ids)
 
@@ -1141,6 +1556,15 @@ class ProfileService:
       await db.delete(job)
 
     await db.flush()
+    return {
+      "deleted_jobs": len(jobs),
+      "deleted_job_runs": len(run_ids),
+      "deleted_check_results": check_results,
+    }
+
+  async def _cascade_delete_jobs_for_profile(self, db: AsyncSession, profile_id: int) -> None:
+    jobs = await self._load_jobs(db, Job.profile_id == profile_id)
+    await self._cascade_delete_jobs(db, jobs)
 
   async def _cascade_delete_remediation_jobs_for_profile(self, db: AsyncSession, profile_id: int) -> None:
     result = await db.execute(
@@ -1203,13 +1627,18 @@ class ProfileService:
     self._remove_stored_package(package_path)
 
 
-ALLOWED_CATEGORY_SLUGS = frozenset({"linux-platform", "windows-platform", "network-platform", "services"})
+ALLOWED_CATEGORY_SLUGS = frozenset(
+  {"linux-platform", "windows-platform", "unix-platform", "network-platform", "services"}
+)
 
 SLUG_MIGRATIONS = {
   "os-linux": "linux-platform",
   "linux": "linux-platform",
   "os-windows": "windows-platform",
   "windows": "windows-platform",
+  "os-unix": "unix-platform",
+  "unix": "unix-platform",
+  "bsd": "unix-platform",
   "network": "network-platform",
   "network-services": "network-platform",
 }
@@ -1217,6 +1646,7 @@ SLUG_MIGRATIONS = {
 DEFAULT_CATEGORIES = [
   ("Linux Platform", "linux-platform", "os"),
   ("Windows Platform", "windows-platform", "os"),
+  ("UNIX Platform", "unix-platform", "os"),
   ("Network Platform", "network-platform", "network"),
   ("Services", "services", "other"),
 ]

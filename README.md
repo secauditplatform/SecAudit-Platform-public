@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-PolyForm%20Noncommercial-blue.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--ALv2-blue.svg" alt="License"></a>
   <a href="SECURITY.md"><img src="https://img.shields.io/badge/security-policy-green.svg" alt="Security policy"></a>
   <a href="docs/en/getting-started.md"><img src="https://img.shields.io/badge/docs-getting%20started-informational.svg" alt="Getting started"></a>
 </p>
@@ -219,4 +219,4 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md). Do not open public is
 
 Copyright 2026 secauditplatform@proton.me.
 
-Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use requires a separate license. See [NOTICE](NOTICE).
+Licensed under the [Functional Source License 1.1, ALv2 Future License](LICENSE) (`FSL-1.1-ALv2`). See [NOTICE](NOTICE). Free for any purpose except a Competing Use — internal use, including commercial, needs no license and no payment. Two years after each release, that version is also available under Apache-2.0.

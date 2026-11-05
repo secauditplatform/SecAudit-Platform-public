@@ -328,6 +328,8 @@ def build_evidence_documents(
         "profile_id": snapshot.get("profile_id") if snapshot else None,
         "profile_name": snapshot.get("profile_name") if snapshot else None,
         "version": snapshot.get("version") if snapshot else None,
+        "version_number": snapshot.get("version_number") if snapshot else None,
+        "version_label": snapshot.get("version_label") if snapshot else None,
         "encoding": snapshot.get("encoding") if snapshot else None,
     }
     job = job_run.job
@@ -371,6 +373,8 @@ def build_evidence_documents(
             "profile_name": profile_doc["profile_name"],
             "encoding": profile_doc["encoding"],
             "version": profile_doc["version"],
+            "version_number": profile_doc["version_number"],
+            "version_label": profile_doc["version_label"],
         },
         "totals": totals,
     }

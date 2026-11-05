@@ -1,6 +1,7 @@
 import { Fragment, useMemo, useState, type CSSProperties } from "react";
 import type { AuditMapNode } from "../api/client";
-import { IconLinux, IconNetwork, IconWindows } from "../components/ui/Icons";
+import { IconLinux, IconNetwork, IconUnix, IconWindows } from "../components/ui/Icons";
+import { isUnixOsType } from "../components/OperationsTabs";
 import {
   RADAR_H,
   RADAR_W,
@@ -60,6 +61,7 @@ function PlatformGlyph({ osType }: { osType: string | null }) {
   const kind = (osType ?? "").toLowerCase();
   if (kind === "windows") return <IconWindows />;
   if (kind === "network") return <IconNetwork />;
+  if (isUnixOsType(kind)) return <IconUnix />;
   return <IconLinux />;
 }
 

@@ -70,6 +70,8 @@ def extract_os_metadata(meta: dict) -> dict[str, str | None]:
 def infer_platform(category_slug: str) -> str:
     if category_slug == "windows-platform":
         return "windows"
+    if category_slug == "unix-platform":
+        return "unix"
     if category_slug == "network-platform":
         return "network"
     return "linux"
@@ -128,6 +130,24 @@ def infer_category_slug_quick(package_dir: Path, meta: dict | None = None) -> st
         return "windows-platform"
     if "network" in path or "cisco" in path or "juniper" in path:
         return "network-platform"
+    if any(
+        token in path
+        for token in (
+            "freebsd",
+            "openbsd",
+            "netbsd",
+            "dragonfly",
+            "solaris",
+            "illumos",
+            "hp-ux",
+            "aix",
+            "unix",
+            "bsd",
+            "macos",
+            "darwin",
+        )
+    ):
+        return "unix-platform"
     if any(token in path for token in ("operating system", "operating systems", "/os/", "linux", "rhel", "ubuntu", "centos", "debian")):
         return "linux-platform"
     return "services"

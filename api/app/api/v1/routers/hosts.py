@@ -71,6 +71,25 @@ from secaudit_core.host_csv_import import (
 
 router = APIRouter()
 
+_SSH_FINGERPRINT_OS_TYPES = frozenset(
+    {
+        "linux",
+        "unix",
+        "freebsd",
+        "openbsd",
+        "netbsd",
+        "dragonfly",
+        "solaris",
+        "illumos",
+        "aix",
+        "hpux",
+        "hp-ux",
+        "sunos",
+        "macos",
+        "darwin",
+    }
+)
+
 _HOST_LOAD_OPTIONS = (
     selectinload(Host.tags).selectinload(HostTagLink.tag),
     selectinload(Host.credential_links).selectinload(HostCredentialLink.credential),
@@ -686,10 +705,10 @@ async def scan_host_ssh_fingerprint(
     assert_can_access(user, host.owner_sub, detail="Host not found")
 
     os_type = (host.os_type or "linux").strip().lower()
-    if os_type != "linux":
+    if os_type not in _SSH_FINGERPRINT_OS_TYPES:
         raise HTTPException(
             status_code=400,
-            detail="SSH fingerprint scan is only available for Linux hosts",
+            detail="SSH fingerprint scan is only available for Linux and UNIX hosts",
         )
 
     try:
