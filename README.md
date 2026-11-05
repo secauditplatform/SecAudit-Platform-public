@@ -26,6 +26,14 @@ It is built for security and infrastructure teams that need a controlled, audita
 - **Security built in** — Keycloak OIDC or local users, object-level RBAC, encrypted credentials, audit trail, and SIEM export.
 - **Production-ready packaging** — develop on lab Compose; deploy with hardened Compose or Helm on your infrastructure.
 
+## What's new in v1.8.0
+
+v1.8.0 makes the check set in every run explicit and adds UNIX as a first-class platform.
+
+- **Profile versions and script variants** — build a named check set, make it active, and optionally pin a job to it; every run records the version and evaluates only its checks across reports, CSV, compliance, drift, trends, and waivers. Audit and remediation scripts can be added or removed without re-importing, and deleting a version shows which jobs, runs, and results will be removed with it.
+- **UNIX hosts** — FreeBSD, OpenBSD, NetBSD, Solaris/illumos, AIX, HP-UX, and macOS get their own platform tab, host filter, SSH fingerprint, playbook scope, and inventory playbook.
+- **Service credentials only where needed** — a profile asks for a service login only when its audit script reads one; remote commands also get EOF on stdin, so a waiting tool cannot hold a run until timeout.
+- 
 ## What's new in v1.7.0
 
 v1.7.0 adds AAG, an assistant that sits beside the audit. It can explain a finished check or draft a custom profile. It does not write results, start a job, or start remediation.
