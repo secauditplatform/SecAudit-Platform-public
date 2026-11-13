@@ -75,6 +75,58 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "secaudit.profilesCatalogClaim" -}}
+{{- if .Values.profiles.catalog.existingClaim -}}
+{{- .Values.profiles.catalog.existingClaim -}}
+{{- else -}}
+{{- printf "%s-profiles-catalog" (include "secaudit.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "secaudit.profilesVolumeMounts" -}}
+- name: profiles-data
+  mountPath: /data/profiles
+- name: profiles-catalog
+  mountPath: /profiles
+  {{- if .Values.profiles.catalog.readOnly }}
+  readOnly: true
+  {{- end }}
+{{- end -}}
+
+{{- define "secaudit.profilesVolumes" -}}
+- name: profiles-data
+  {{- if or .Values.profiles.persistence.enabled .Values.profiles.existingClaim }}
+  persistentVolumeClaim:
+    claimName: {{ include "secaudit.profilesClaim" . }}
+  {{- else }}
+  emptyDir: {}
+  {{- end }}
+- name: profiles-catalog
+  {{- if .Values.profiles.catalog.hostPath }}
+  hostPath:
+    path: {{ .Values.profiles.catalog.hostPath | quote }}
+    type: DirectoryOrCreate
+  {{- else if .Values.profiles.catalog.existingClaim }}
+  persistentVolumeClaim:
+    claimName: {{ include "secaudit.profilesCatalogClaim" . }}
+  {{- else }}
+  emptyDir: {}
+  {{- end }}
+{{- end -}}
+
+{{- define "secaudit.celeryLivenessProbe" -}}
+livenessProbe:
+  exec:
+    command:
+      - python
+      - -c
+      - import os; assert any(b"celery" in open(f"/proc/{p}/cmdline","rb").read() for p in os.listdir("/proc") if p.isdigit())
+  initialDelaySeconds: 40
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+{{- end -}}
+
 {{- define "secaudit.env" -}}
 envFrom:
   - configMapRef:

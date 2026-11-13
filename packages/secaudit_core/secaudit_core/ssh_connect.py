@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from secaudit_core.settings import SecAuditSettings
+from secaudit_core.ssh_fingerprint import retarget_known_hosts_entry
 
 
 def _known_hosts_from_entry(entry: str):
@@ -41,8 +42,9 @@ def build_ssh_connect_kwargs(
         "username": username,
     }
 
-    if known_hosts_entry and known_hosts_entry.strip():
-        kwargs["known_hosts"] = _known_hosts_from_entry(known_hosts_entry)
+    pinned = retarget_known_hosts_entry(known_hosts_entry, host)
+    if pinned and pinned.strip():
+        kwargs["known_hosts"] = _known_hosts_from_entry(pinned)
     elif settings.ssh_strict_host_key_checking_effective:
         if settings.ssh_known_hosts_path:
             # Path string is intentional: AsyncSSH opens this as a file.

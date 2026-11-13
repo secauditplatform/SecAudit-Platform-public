@@ -8,7 +8,7 @@ from app.core.database import get_db
 from app.models import UserRole
 from app.core.secrets import encrypt_secret
 from app.models import Credential, CredentialType, Host
-from app.schemas import CredentialCreate, CredentialRead, CredentialUpdate
+from app.schemas import CredentialCreate, CredentialProbeRequest, CredentialRead, CredentialUpdate, PreflightProbeResponse
 from secaudit_core.snmp_discovery import SnmpDiscoveryError, normalize_auth_protocol, normalize_priv_protocol
 from app.services.audit_flow import sweep_orphaned_ephemeral_credentials
 from app.services.audit_log import log_audit_event
@@ -200,6 +200,39 @@ async def update_credential(
         resource_name=credential.name,
     )
     return _credential_to_read(credential)
+
+
+@router.post("/{credential_id}/preflight", response_model=PreflightProbeResponse)
+async def preflight_credential(
+    credential_id: int,
+    data: CredentialProbeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> PreflightProbeResponse:
+    """Probe a credential against a concrete host (TCP + auth)."""
+    from app.services.object_rbac import assert_can_access as _assert_host
+    from app.services.preflight import dispatch_host_probe
+
+    credential = await assert_credential_visible(db, user, credential_id)
+    assert_can_access(user, credential.owner_sub, detail="Credential not found")
+    host = await db.get(Host, data.host_id)
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found")
+    _assert_host(user, host.owner_sub, detail="Host not found")
+
+    payload = await dispatch_host_probe(data.host_id, credential_id)
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="credential.preflight",
+        resource_type="credential",
+        resource_id=credential.id,
+        resource_name=credential.name,
+        metadata={"ok": payload.get("ok"), "host_id": data.host_id},
+    )
+    return PreflightProbeResponse.model_validate(payload)
 
 
 @router.delete("/{credential_id}", status_code=204)

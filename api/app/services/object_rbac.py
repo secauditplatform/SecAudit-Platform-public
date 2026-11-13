@@ -103,12 +103,14 @@ def assign_host_target_scope(obj: object, user: AuthUser) -> None:
 
 async def assert_hosts_accessible(db, user: AuthUser, host_ids: list[int]) -> None:
     from app.models import Host
+    from app.services.demo_exec_targets import assert_demo_exec_host_ids
 
     for host_id in host_ids:
         host = await db.get(Host, host_id)
         if not host:
             raise HTTPException(status_code=404, detail=f"Host {host_id} not found")
         assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_demo_exec_host_ids(db, host_ids)
 
 
 async def assert_job_access(db, user: AuthUser, job_id: int):

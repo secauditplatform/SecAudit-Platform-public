@@ -15,9 +15,10 @@ CORRELATION_KWARG_KEY = "_secaudit_correlation"
 
 WORKER_HEARTBEAT_KEY = "secaudit:worker:heartbeat:last_seen"
 WORKER_HEARTBEAT_ALERT_STATE_KEY = "secaudit:worker:heartbeat:alert_state"
+BEAT_HEARTBEAT_KEY = "secaudit:beat:heartbeat:last_seen"
 CELERY_METRICS_PREFIX = "secaudit:metrics:celery"
 OUTBOX_METRICS_PREFIX = "secaudit:metrics:outbox"
-KNOWN_QUEUES = ("compliance", "remediation", "inventory", "maintenance")
+KNOWN_QUEUES = ("compliance", "remediation", "inventory", "aag", "maintenance")
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,29 @@ def worker_heartbeat_age_seconds(redis_url: str) -> float | None:
     client = redis_client(redis_url)
     try:
         value = client.get(WORKER_HEARTBEAT_KEY)
+        if not value:
+            return None
+        last_seen = datetime.fromisoformat(value)
+        if last_seen.tzinfo is None:
+            last_seen = last_seen.replace(tzinfo=UTC)
+        return (datetime.now(UTC) - last_seen).total_seconds()
+    finally:
+        client.close()
+
+
+def touch_beat_heartbeat(redis_url: str, *, ttl_seconds: int = 300) -> None:
+    """Record that a beat-scheduled maintenance task ran (beat liveness proxy)."""
+    client = redis_client(redis_url)
+    try:
+        client.set(BEAT_HEARTBEAT_KEY, datetime.now(UTC).isoformat(), ex=ttl_seconds)
+    finally:
+        client.close()
+
+
+def beat_heartbeat_age_seconds(redis_url: str) -> float | None:
+    client = redis_client(redis_url)
+    try:
+        value = client.get(BEAT_HEARTBEAT_KEY)
         if not value:
             return None
         last_seen = datetime.fromisoformat(value)

@@ -18,6 +18,7 @@ from app.models import (
     AuditFlowRun,
     AuditFlowStatus,
     CheckResult,
+    CheckScript,
     ComplianceWaiver,
     Credential,
     CredentialType,
@@ -34,6 +35,7 @@ from app.models import (
     PlaybookKind,
     RemediationJobHost,
     RemediationResult,
+    ScriptKind,
 )
 from app.services.dispatch import enqueue_run_dispatch
 from app.services.object_rbac import assign_host_target_scope, assign_owner
@@ -51,6 +53,8 @@ from secaudit_core.audit_flow_scope import (
 )
 from secaudit_core.inventory_scan import validate_scan_target
 from secaudit_core.reports import build_report_summary_dict
+from secaudit_core.script_selection import select_active_scripts
+from secaudit_core.waivers import load_active_waivers_for_profiles, waived_ids_by_run
 
 TTL = timedelta(hours=24)
 _ALLOWED_CRED_TYPES = {CredentialType.SSH_PASSWORD, CredentialType.SSH_KEY, CredentialType.WINRM}
@@ -172,18 +176,35 @@ async def collect_run_summaries(db: AsyncSession, run: AuditFlowRun) -> dict[int
     if not job_run_ids:
         return {}
     unique_ids = list(dict.fromkeys(job_run_ids))
-    runs = (
-        await db.execute(select(JobRun).where(JobRun.id.in_(unique_ids)))
-    ).scalars().all()
+    runs = list(
+        (
+            await db.execute(
+                select(JobRun)
+                .options(selectinload(JobRun.job))
+                .where(JobRun.id.in_(unique_ids))
+            )
+        ).scalars().all()
+    )
     checks = (
         await db.execute(select(CheckResult).where(CheckResult.job_run_id.in_(unique_ids)))
     ).scalars().all()
     by_run: dict[int, list] = {run_id: [] for run_id in unique_ids}
     for check in checks:
         by_run.setdefault(check.job_run_id, []).append(check)
+    profile_ids = {
+        job_run.job.profile_id
+        for job_run in runs
+        if job_run.job is not None and job_run.job.profile_id is not None
+    }
+    waivers = await load_active_waivers_for_profiles(db, profile_ids)
+    waived_by_run = waived_ids_by_run(runs, by_run, waivers)
     payload: dict[int, dict] = {}
     for job_run in runs:
-        summary = build_report_summary_dict(job_run.id, by_run.get(job_run.id, []))
+        summary = build_report_summary_dict(
+            job_run.id,
+            by_run.get(job_run.id, []),
+            waived_check_ids=waived_by_run.get(job_run.id),
+        )
         status = job_run.status.value if hasattr(job_run.status, "value") else job_run.status
         summary["job_status"] = status
         summary["error_message"] = job_run.error_message
@@ -351,7 +372,14 @@ async def execute_run(db: AsyncSession, user: AuthUser, run: AuditFlowRun) -> tu
             for item in (row.extra_runs_json or [])
             if item.get("profile_id")
         }
-        pending_extras: list = []
+        pending_extras = [
+            item
+            for item in (row.extra_profiles_json or [])
+            if item.get("selected")
+            and item.get("profile_id") is not None
+            and int(item["profile_id"]) not in launched_extra_ids
+            and (row.profile_id is None or int(item["profile_id"]) != row.profile_id)
+        ]
         if row.job_run_id and not pending_extras:
             continue
         if not row.job_run_id and not row.profile_id and not pending_extras:
@@ -530,7 +558,7 @@ def _pin_host_key(host: Host, row: AuditFlowHost) -> None:
         host.ssh_host_key_fingerprint = row.ssh_host_key_fingerprint
 
 
-async def _playbook_for_profile(db: AsyncSession, profile_id: int) -> Playbook:
+async def _playbook_for_profile(db: AsyncSession, profile_id: int) -> Playbook | None:
     playbook_result = await db.execute(
         select(Playbook).where(
             Playbook.profile_id == profile_id,
@@ -538,10 +566,19 @@ async def _playbook_for_profile(db: AsyncSession, profile_id: int) -> Playbook:
             Playbook.is_active.is_(True),
         )
     )
-    playbook = playbook_result.scalars().first()
-    if playbook is None:
-        raise ValueError("No compliance playbook for the selected profile")
-    return playbook
+    return playbook_result.scalars().first()
+
+
+async def _primary_audit_script(db: AsyncSession, profile_id: int) -> CheckScript | None:
+    result = await db.execute(
+        select(CheckScript).where(
+            CheckScript.profile_id == profile_id,
+            CheckScript.script_kind == ScriptKind.AUDIT,
+        )
+    )
+    scripts = list(result.scalars().all())
+    active = select_active_scripts(scripts)
+    return active[0] if active else None
 
 
 async def _make_ephemeral_credential(
@@ -698,12 +735,19 @@ async def _launch_profile_job(
     host: Host,
 ) -> tuple[JobRun, int]:
     playbook = await _playbook_for_profile(db, profile_id)
+    execution_type = None
+    if playbook is None:
+        audit_script = await _primary_audit_script(db, profile_id)
+        if audit_script is None:
+            raise ValueError("No compliance playbook or audit script for the selected profile")
+        execution_type = audit_script.execution_type
     os_type = row.platform or host.os_type or "linux"
     stamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M")
     job = Job(
         name=f"AuditFlow {row.ip_address} ({stamp})"[:256],
         profile_id=profile_id,
-        playbook_id=playbook.id,
+        playbook_id=playbook.id if playbook else None,
+        execution_type=execution_type,
         is_active=False,
         is_scheduled=False,
         scope=JobScope.NETWORK if os_type == "network" else JobScope.STANDARD,
@@ -873,6 +917,7 @@ def template_to_read(template) -> dict:
         "save_to_inventory": bool(template.save_to_inventory),
         "cron_expression": template.cron_expression,
         "is_scheduled": bool(template.is_scheduled),
+        "auto_execute": bool(getattr(template, "auto_execute", False)),
         "last_scheduled_at": template.last_scheduled_at,
         "is_active": bool(template.is_active),
         "owner_sub": template.owner_sub,

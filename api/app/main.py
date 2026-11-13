@@ -181,11 +181,18 @@ async def lifespan(app: FastAPI):
 
 _tracing_enabled = configure_tracing("secaudit-api", settings=settings)
 
+_docs_url = None if settings.app_env == "production" else "/docs"
+_redoc_url = None if settings.app_env == "production" else "/redoc"
+_openapi_url = None if settings.app_env == "production" else "/openapi.json"
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     debug=settings.api_debug,
     lifespan=lifespan,
+    docs_url=_docs_url,
+    redoc_url=_redoc_url,
+    openapi_url=_openapi_url,
 )
 
 if _tracing_enabled:
@@ -213,9 +220,11 @@ app.include_router(api_router, prefix="/api/v1")
 
 @app.get("/")
 async def root() -> dict:
-    return {
+    payload = {
         "app": settings.app_name,
         "version": settings.app_version,
-        "docs": "/docs",
         "api": "/api/v1",
     }
+    if _docs_url:
+        payload["docs"] = _docs_url
+    return payload

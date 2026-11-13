@@ -9,10 +9,23 @@ is started with an allowlisted environment and returns only runner results.
 from __future__ import annotations
 
 import json
+import signal
 import sys
 from pathlib import Path
 
 import ansible_runner
+
+
+def _request_parent_death_signal() -> None:
+    """If the Celery worker dies, kill this child (avoids orphaned ansible/SSH)."""
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # PR_SET_PDEATHSIG = 1
+        libc.prctl(1, int(signal.SIGKILL))
+    except Exception:
+        pass
 
 
 def _read_stdout(stream: object) -> str:
@@ -25,6 +38,7 @@ def _read_stdout(stream: object) -> str:
 
 
 def main() -> int:
+    _request_parent_death_signal()
     payload = json.load(sys.stdin)
     run_kwargs = dict(payload["run_kwargs"])
     cancel_path = Path(payload["cancel_path"])

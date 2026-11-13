@@ -6,7 +6,7 @@ import { Breadcrumbs } from "./Breadcrumbs";
 import { GlobalSearch } from "./GlobalSearch";
 import { ScrollToTop, scrollAppToTop } from "./ScrollToTop";
 import { SettingsPanel } from "./SettingsPanel";
-import { APP_VERSION } from "../constants/version";
+import { APP_REPO_URL, APP_VERSION } from "../constants/version";
 import { useTranslation } from "../i18n/I18nProvider";
 import {
   filterNavGroups,
@@ -194,7 +194,16 @@ export function Layout() {
               </section>
             ))}
           </nav>
-          <div className="pf-sidebar__footer">v{APP_VERSION}</div>
+          <div className="pf-sidebar__footer">
+            <a
+              className="pf-sidebar__version"
+              href={APP_REPO_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              v{APP_VERSION}
+            </a>
+          </div>
         </aside>
 
         <main className="pf-main">

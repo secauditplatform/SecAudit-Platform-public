@@ -95,6 +95,7 @@ export interface RemediationSuggestion {
   failed_count: number;
   failed_checks: Array<{
     host_id: number;
+    host_name?: string | null;
     rule_tech_name: string;
     status: string;
     message?: string | null;
@@ -115,6 +116,17 @@ export interface RemediationFromRunResult {
   baseline_run_id: number | null;
   source_run_id: number;
   source_job_id: number;
+}
+
+export interface RemediationWorkflow {
+  source_run_id: number;
+  source_job_id: number | null;
+  remediation_job_id: number;
+  remediation_run_id: number | null;
+  reaudit_run_id: number | null;
+  reaudit_completed: boolean;
+  check_mode?: boolean;
+  auto_recheck_failed?: boolean;
 }
 
 export interface PaginatedResponse<T> {
@@ -198,16 +210,68 @@ export interface Profile {
   needs_update?: boolean;
   is_active: boolean;
   created_at?: string;
+  rules_count?: number;
+  audit_scripts_count?: number;
+  remediation_scripts_count?: number;
+}
+
+export interface HostsSummary {
+  total: number;
+  active: number;
+  inactive: number;
+}
+
+export interface PreflightCheckResult {
+  name: string;
+  status: "ok" | "fail" | "skip";
+  detail?: string | null;
+}
+
+export interface PreflightProbeResponse {
+  ok: boolean;
+  target: string;
+  credential_id?: number | null;
+  platform?: string | null;
+  checks: PreflightCheckResult[];
+  duration_ms: number;
+  error?: string | null;
+}
+
+export interface ProfileApplicabilityHost {
+  host_id: number;
+  host_name: string;
+  os_type?: string | null;
+  applicable: boolean;
+  reason?: string | null;
+}
+
+export interface ProfileApplicability {
+  profile_id: number;
+  profile_name: string;
+  profile_platform: string;
+  rules_count: number;
+  hosts_total: number;
+  hosts_applicable: number;
+  hosts_inapplicable: number;
+  hosts: ProfileApplicabilityHost[];
 }
 
 export interface ProfileDependencies {
   jobs: number;
   remediation_jobs: number;
   waivers: number;
+  playbooks: number;
   job_runs: number;
   check_results: number;
   remediation_runs: number;
   active_runs: number;
+}
+
+export interface ProfileDeleteOptions {
+  delete_playbooks?: boolean;
+  delete_jobs?: boolean;
+  delete_reports?: boolean;
+  cascade?: boolean;
 }
 
 export interface ProfilesBulkActionResult {
@@ -413,6 +477,8 @@ export type NotificationEventType =
   | "dispatch_failed"
   | "worker_heartbeat_stale"
   | "worker_heartbeat_recovered"
+  | "compliance_regressed"
+  | "waiver_expiring"
   | "audit_event"
   | "audit_failed";
 
@@ -632,6 +698,7 @@ export interface AuditFlowTemplate {
   save_to_inventory: boolean;
   cron_expression?: string | null;
   is_scheduled: boolean;
+  auto_execute: boolean;
   last_scheduled_at?: string | null;
   is_active: boolean;
   owner_sub?: string | null;
@@ -816,6 +883,8 @@ export interface JobTemplate {
   owner_sub?: string | null;
 }
 
+export type JobRunSubset = "failed" | "skipped" | "selected" | "all";
+
 export interface JobRun {
   id: number;
   job_id: number;
@@ -825,6 +894,18 @@ export interface JobRun {
   created_at?: string;
   error_message?: string;
   check_mode?: boolean;
+  host_ids?: number[] | null;
+  is_partial?: boolean;
+  subset_kind?: "failed" | "skipped" | "selected" | null;
+  source_run_id?: number | null;
+}
+
+export interface JobRunRerunTargets {
+  source_run_id: number;
+  is_partial: boolean;
+  host_ids: number[];
+  failed_host_ids: number[];
+  skipped_host_ids: number[];
 }
 
 export interface CveRef {
@@ -1222,6 +1303,18 @@ export interface AuditLog {
   metadata_json?: Record<string, unknown> | null;
 }
 
+export interface SystemHealthComponent {
+  status: "ok" | "error";
+  detail?: string | null;
+}
+
+export interface SystemHealth {
+  status: "ok" | "error";
+  components: Record<string, SystemHealthComponent>;
+  queues: Record<string, number>;
+  retention_days: number;
+}
+
 export interface AuditMetricPoint {
   label: string;
   count: number;
@@ -1500,6 +1593,14 @@ export interface AagArtifact {
 
 export const api = {
   health: () => request<{ status: string; app_name: string }>("/health"),
+  systemHealth: () => request<SystemHealth>("/health/system"),
+  updateSystemHealthSettings: (payload: { retention_days: number }) =>
+    request<{ retention_days: number }>("/health/system/settings", {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }),
+  exportAuditLogs: (format: "csv" | "json" = "csv") =>
+    downloadFile(`/audit-logs/export${buildQuery({ format })}`, `audit-logs.${format}`),
   categories: () => request<Category[]>("/categories"),
   search: (params: { q: string; limit?: number; per_type?: number }) =>
     request<SearchResponse>(`/search${buildQuery(params)}`),
@@ -1692,8 +1793,19 @@ export const api = {
     request<CheckScript>(`/profiles/${profileId}/scripts/${scriptId}/primary`, {
       method: "POST",
     }),
-  deleteProfile: (id: number, options?: { cascade?: boolean }) => {
-    const query = options?.cascade ? "?cascade=true" : "";
+  deleteProfile: (id: number, options?: ProfileDeleteOptions) => {
+    const params = new URLSearchParams();
+    if (options?.cascade) params.set("cascade", "true");
+    if (options?.delete_playbooks != null) {
+      params.set("delete_playbooks", String(Boolean(options.delete_playbooks)));
+    }
+    if (options?.delete_jobs != null) {
+      params.set("delete_jobs", String(Boolean(options.delete_jobs)));
+    }
+    if (options?.delete_reports != null) {
+      params.set("delete_reports", String(Boolean(options.delete_reports)));
+    }
+    const query = params.toString() ? `?${params}` : "";
     return request<void>(`/profiles/${id}${query}`, { method: "DELETE" });
   },
   getProfileDependencies: (id: number) =>
@@ -1710,10 +1822,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ profile_ids: profileIds }),
     }),
-  bulkDeleteProfiles: (profileIds: number[], options?: { cascade?: boolean }) =>
+  bulkDeleteProfiles: (profileIds: number[], options?: ProfileDeleteOptions) =>
     request<ProfilesBulkActionResult>("/profiles/bulk/delete", {
       method: "POST",
-      body: JSON.stringify({ profile_ids: profileIds, cascade: Boolean(options?.cascade) }),
+      body: JSON.stringify({
+        profile_ids: profileIds,
+        cascade: Boolean(options?.cascade),
+        delete_playbooks: options?.delete_playbooks,
+        delete_jobs: options?.delete_jobs,
+        delete_reports: options?.delete_reports,
+      }),
     }),
   bulkSyncProfiles: (profileIds: number[]) =>
     request<ProfilesBulkActionResult>("/profiles/bulk/sync", {
@@ -1977,8 +2095,11 @@ export const api = {
       os_type?: string;
       criticality?: string;
       active_only?: boolean;
+      is_active?: boolean;
+      search?: string;
     },
   ) => request<PaginatedResponse<Host>>(`/hosts${buildQuery(params)}`),
+  hostsSummary: () => request<HostsSummary>("/hosts/summary"),
   getHost: (id: number) => request<Host>(`/hosts/${id}`),
   hostTags: () => request<{ id: number; name: string; created_at: string }[]>("/hosts/tags"),
   setHostTags: (hostId: number, tagNames: string[]) =>
@@ -1993,7 +2114,7 @@ export const api = {
   },
   createHost: (data: Omit<Host, "id">) =>
     request<Host>("/hosts", { method: "POST", body: JSON.stringify(data) }),
-  updateHost: (id: number, data: Partial<Omit<Host, "id">>) =>
+  updateHost: (id: number, data: Partial<Omit<Host, "id">> & { clear_ssh_host_key?: boolean }) =>
     request<Host>(`/hosts/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   linkHostCredential: (hostId: number, credentialId: number) =>
     request<Host>(`/hosts/${hostId}/credentials`, {
@@ -2006,6 +2127,24 @@ export const api = {
   scanHostSshFingerprint: (id: number) =>
     request<{ fingerprint: string; saved: boolean }>(`/hosts/${id}/scan-ssh-fingerprint`, {
       method: "POST",
+    }),
+  preflightHost: (id: number, credentialId?: number) =>
+    request<PreflightProbeResponse>(
+      `/hosts/${id}/preflight${buildQuery({ credential_id: credentialId })}`,
+      { method: "POST" }
+    ),
+  preflightCredential: (credentialId: number, hostId: number) =>
+    request<PreflightProbeResponse>(`/credentials/${credentialId}/preflight`, {
+      method: "POST",
+      body: JSON.stringify({ host_id: hostId }),
+    }),
+  profileApplicability: (
+    profileId: number,
+    data: { host_ids: number[]; profile_version_id?: number | null }
+  ) =>
+    request<ProfileApplicability>(`/profiles/${profileId}/applicability`, {
+      method: "POST",
+      body: JSON.stringify(data),
     }),
   bulkDeleteHosts: (hostIds: number[]) =>
     request<{ deleted: number[]; conflicts: { host_id: number; detail: string }[] }>(
@@ -2024,6 +2163,17 @@ export const api = {
     ),
   auditMap: (params?: { site?: string; environment?: string; criticality?: string; tag?: string; profile?: string }) =>
     request<AuditMapPayload>(`/audit-map${buildQuery(params)}`),
+  saveAuditMapLayout: (
+    view: AuditMapViewName,
+    positions: Array<{ host_id: number; x: number; y: number }>
+  ) =>
+    request<Partial<Record<AuditMapViewName, { host_id: number; x: number; y: number }[]>>>(
+      "/audit-map/layout",
+      {
+        method: "PUT",
+        body: JSON.stringify({ view, positions }),
+      }
+    ),
   confirmAuditMapService: (hostId: number, port: number) =>
     request<AuditMapService>("/audit-map/services", {
       method: "POST",
@@ -2119,6 +2269,13 @@ export const api = {
   jobRuns: (params?: ListParams) =>
     request<PaginatedResponse<JobRun>>(`/jobs/runs${listQuery(params)}`),
   runJob: (jobId: number) => request<JobRun>(`/jobs/${jobId}/run`, { method: "POST" }),
+  getJobRunRerunTargets: (runId: number) =>
+    request<JobRunRerunTargets>(`/jobs/runs/${runId}/rerun-targets`),
+  rerunJobRun: (runId: number, body: { subset: JobRunSubset; host_ids?: number[] }) =>
+    request<JobRun>(`/jobs/runs/${runId}/rerun`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   stopJobRun: (runId: number) => request<JobRun>(`/jobs/runs/${runId}/stop`, { method: "POST" }),
   deleteJobRun: (runId: number) => request<void>(`/jobs/runs/${runId}`, { method: "DELETE" }),
   deleteJob: (jobId: number) => request<void>(`/jobs/${jobId}`, { method: "DELETE" }),
@@ -2155,7 +2312,8 @@ export const api = {
     id: number,
     data?: { name?: string; host_ids?: number[]; dynamic_filter?: DynamicHostFilter | null; run_after_create?: boolean }
   ) => request<Job>(`/job-templates/${id}/apply`, { method: "POST", body: JSON.stringify(data ?? {}) }),
-  getJobRun: (runId: number) => request<JobRunDetail>(`/jobs/runs/${runId}`),
+  getJobRun: (runId: number, opts?: { include_raw?: boolean }) =>
+    request<JobRunDetail>(`/jobs/runs/${runId}${buildQuery({ include_raw: opts?.include_raw ? true : undefined })}`),
   getJobRunLogs: (runId: number) => request<JobRunLogEntry[]>(`/ws/job-runs/${runId}/logs`),
   runSummary: (runId: number) => request<ReportSummary>(`/reports/runs/${runId}/summary`),
   getRemediationSuggestions: (runId: number) =>
@@ -2166,10 +2324,20 @@ export const api = {
     remediation_script_id?: number;
     run_remediation?: boolean;
     set_baseline?: boolean;
+    rule_tech_names?: string[];
+    check_mode?: boolean;
+    auto_recheck_failed?: boolean;
   }) =>
     request<RemediationFromRunResult>("/remediations/from-run", {
       method: "POST",
       body: JSON.stringify(data),
+    }),
+  getRemediationWorkflow: (sourceRunId: number) =>
+    request<RemediationWorkflow>(`/remediations/workflow/${sourceRunId}`),
+  setRemediationWorkflowReaudit: (sourceRunId: number, reauditRunId: number) =>
+    request<RemediationWorkflow>(`/remediations/workflow/${sourceRunId}/reaudit`, {
+      method: "PATCH",
+      body: JSON.stringify({ reaudit_run_id: reauditRunId }),
     }),
   getRunDrift: (runId: number, baselineRunId: number) =>
     request<DriftReport>(`/reports/runs/${runId}/drift?baseline_run_id=${baselineRunId}`),
@@ -2449,6 +2617,7 @@ export const api = {
     inventory_scope?: { tags: string[]; site?: string | null } | null;
     cron_expression?: string;
     is_scheduled?: boolean;
+    auto_execute?: boolean;
     is_active?: boolean;
   }) => request<AuditFlowTemplate>("/audit-flow/templates", { method: "POST", body: JSON.stringify(data) }),
   updateAuditFlowTemplate: (
@@ -2470,6 +2639,7 @@ export const api = {
       inventory_scope?: { tags: string[]; site?: string | null } | null;
       cron_expression?: string | null;
       is_scheduled?: boolean;
+      auto_execute?: boolean;
       is_active?: boolean;
     }
   ) => request<AuditFlowTemplate>(`/audit-flow/templates/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
@@ -2515,6 +2685,19 @@ export const api = {
     request<AuditFlowRun>(`/audit-flow/runs/${id}/credentials`, {
       method: "POST",
       body: JSON.stringify(data),
+    }),
+  addAuditFlowCatalogCredential: (id: number, data: { credential_id: number; host_id?: number }) =>
+    request<AuditFlowRun>(`/audit-flow/runs/${id}/credentials/from-catalog`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+  reprobeAuditFlow: (
+    id: number,
+    data?: { host_ids?: number[]; credential_id?: number }
+  ) =>
+    request<AuditFlowRun>(`/audit-flow/runs/${id}/reprobe`, {
+      method: "POST",
+      body: JSON.stringify(data ?? {}),
     }),
   executeAuditFlow: (id: number) =>
     request<AuditFlowRun>(`/audit-flow/runs/${id}/execute`, { method: "POST" }),

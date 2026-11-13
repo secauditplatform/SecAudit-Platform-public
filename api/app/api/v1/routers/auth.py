@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.auth import (
     AuthUser,
     _decode_local_refresh_token,
+    _decode_local_token,
     create_local_token_pair,
     create_mfa_challenge_token,
     decode_mfa_challenge_token,
@@ -521,8 +522,9 @@ async def demo_logout(
 async def local_logout(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: AsyncSession = Depends(get_db),
 ) -> None:
-    """Revoke the local access token and release the idle session."""
+    """Revoke local sessions: bump token_version for DB users, blacklist this access jti."""
     token = credentials.credentials if credentials else None
     if not token:
         auth = request.headers.get("authorization") or ""
@@ -531,11 +533,38 @@ async def local_logout(
     jti = extract_local_token_jti(token or "")
     if settings.demo_mode:
         await release_demo_session(jti)
-    else:
-        await release_auth_session(jti)
-        if jti and token:
-            # Blacklist until access token expiry (best-effort from configured TTL).
-            await revoke_auth_token(jti, ttl_seconds=settings.local_auth_token_ttl_seconds)
+        return None
+
+    token_user = _decode_local_token(token or "")
+    if token_user and token_user.local_source in (None, "database") and token_user.username:
+        result = await db.execute(select(User).where(User.username == token_user.username))
+        db_user = result.scalar_one_or_none()
+        if db_user is not None:
+            # Same counter as password change: every refresh/access with the old ver dies.
+            db_user.token_version = int(db_user.token_version or 0) + 1
+            await log_audit_event(
+                db,
+                request,
+                user=AuthUser(
+                    sub=f"local:{db_user.username}",
+                    username=db_user.username,
+                    roles=[db_user.role.value],
+                    auth_mode="local",
+                    local_source="database",
+                    token_version=int(db_user.token_version or 0),
+                ),
+                action="auth.logout",
+                resource_type="auth",
+                resource_id=db_user.username,
+                resource_name=db_user.username,
+                metadata={"token_version": int(db_user.token_version or 0)},
+            )
+            await db.commit()
+
+    await release_auth_session(jti)
+    if jti and token:
+        # Blacklist until access token expiry (covers the gap before ver is checked).
+        await revoke_auth_token(jti, ttl_seconds=settings.local_auth_token_ttl_seconds)
     return None
 
 

@@ -24,8 +24,9 @@ from app.schemas import (
     ReportSummary,
 )
 from app.services.cve_feed import load_feed_entries, references_for_check
-from app.services.reports import build_report_summary
+from app.services.reports import build_report_summary, resolve_run_waived_map, waived_check_ids_for_runs
 from secaudit_core.sensitive_data import redact_sensitive
+from secaudit_core.waivers import waiver_matches_check
 
 RUN_PACK_SCHEMA = "secaudit.run-pack.v1"
 EVIDENCE_PACK_SCHEMA = "secaudit.evidence-pack.v1"
@@ -71,10 +72,12 @@ def render_check_results_csv(
     host_id_filter: int | None = None,
     rule_filter: str | None = None,
     cve_ids_by_check_id: dict[int, list[str]] | None = None,
+    waived_by_check_id: dict[int, object] | None = None,
 ) -> str:
     status_norm = status_filter.strip().lower() if status_filter else None
     severity_norm = _normalize_severity(severity_filter)
     rule_query = rule_filter.strip().lower() if rule_filter else None
+    waived_map = waived_by_check_id or {}
 
     header = [
         "run_id",
@@ -85,6 +88,8 @@ def render_check_results_csv(
         "status",
         "message",
         "created_at",
+        "is_waived",
+        "waiver_id",
     ]
     if cve_ids_by_check_id is not None:
         header.append("cve_ids")
@@ -103,6 +108,7 @@ def render_check_results_csv(
             continue
 
         host = hosts.get(check.host_id)
+        waiver = waived_map.get(check.id)
         values: list[object] = [
             run_id,
             check.host_id,
@@ -112,6 +118,8 @@ def render_check_results_csv(
             status_value,
             check.message or "",
             check.created_at.isoformat() if check.created_at else "",
+            "true" if waiver is not None else "false",
+            getattr(waiver, "id", "") if waiver is not None else "",
         ]
         if cve_ids_by_check_id is not None:
             # Advisory column only. The status cell stays the check result.
@@ -177,6 +185,12 @@ async def fetch_run_csv(
 
     profile_id = job_run.job.profile_id if job_run.job else None
     severity_by_rule = await _severity_by_tech_name(db, profile_id)
+    waived_by_check_id = await resolve_run_waived_map(
+        db,
+        checks=list(job_run.check_results),
+        profile_id=profile_id,
+        job_id=job_run.job_id,
+    )
     feed_entries = await load_feed_entries(db)
     cve_ids_by_check_id: dict[int, list[str]] | None = None
     if feed_entries:
@@ -204,6 +218,7 @@ async def fetch_run_csv(
         host_id_filter=host_id,
         rule_filter=rule,
         cve_ids_by_check_id=cve_ids_by_check_id,
+        waived_by_check_id=waived_by_check_id,
     )
     filename = f"report-{run_id}.csv"
     return content, filename
@@ -310,17 +325,32 @@ def build_evidence_documents(
     from secaudit_core.sensitive_data import redact_sensitive
 
     checks = list(job_run.check_results or [])
-    totals = {"PASS": 0, "FAIL": 0, "ERROR": 0, "SKIP": 0}
+    totals = {"PASS": 0, "FAIL": 0, "ERROR": 0, "SKIP": 0, "WAIVED": 0}
     for check in checks:
         key = _status_value(check.status).upper()
         if key in totals:
             totals[key] += 1
 
+    planned_ids = {
+        int(host_id)
+        for host_id in (job_run.host_ids or [])
+        if host_id is not None
+    } or {check.host_id for check in checks}
     host_rows = [
         {"id": host_id, "name": hosts[host_id].name if host_id in hosts else None}
-        for host_id in sorted({check.host_id for check in checks})
+        for host_id in sorted(planned_ids)
     ]
     snapshot = job_run.profile_snapshot if isinstance(job_run.profile_snapshot, dict) else None
+    excluded_by_version = []
+    if snapshot and isinstance(snapshot.get("excluded_by_version"), list):
+        excluded_by_version = [
+            {
+                "rule_tech_name": str(item.get("rule_tech_name") or ""),
+                "version_label": item.get("version_label"),
+            }
+            for item in snapshot["excluded_by_version"]
+            if isinstance(item, dict) and item.get("rule_tech_name")
+        ]
     profile_doc = {
         "schema": EVIDENCE_PACK_SCHEMA,
         "run_id": job_run.id,
@@ -331,6 +361,7 @@ def build_evidence_documents(
         "version_number": snapshot.get("version_number") if snapshot else None,
         "version_label": snapshot.get("version_label") if snapshot else None,
         "encoding": snapshot.get("encoding") if snapshot else None,
+        "excluded_by_version": excluded_by_version,
     }
     job = job_run.job
     profile_id = snapshot.get("profile_id") if snapshot else (job.profile_id if job else None)
@@ -342,6 +373,22 @@ def build_evidence_documents(
         job_id=job_run.job_id,
         at=moment,
     )
+    if profile_id is not None:
+        totals["WAIVED"] = sum(
+            1
+            for check in checks
+            if _status_value(check.status) == CheckStatus.FAIL.value
+            and any(
+                waiver_matches_check(
+                    waiver,
+                    profile_id=profile_id,
+                    rule_tech_name=check.rule_tech_name,
+                    host_id=check.host_id,
+                    job_id=job_run.job_id,
+                )
+                for waiver in affecting
+            )
+        )
     waiver_rows = []
     for waiver in affecting:
         reason = redact_sensitive(waiver.reason or "")
@@ -367,6 +414,9 @@ def build_evidence_documents(
         "finished_at": _iso(job_run.finished_at),
         "initiator": initiator,
         "mode": "check_mode" if job_run.check_mode else "live",
+        "is_partial": bool(getattr(job_run, "is_partial", False)),
+        "subset_kind": getattr(job_run, "subset_kind", None),
+        "source_run_id": getattr(job_run, "source_run_id", None),
         "hosts": host_rows,
         "profile": {
             "profile_id": profile_doc["profile_id"],
@@ -497,11 +547,17 @@ def build_multi_run_compare(
     runs: list[JobRun],
     checks_by_run: dict[int, list[CheckResult]],
     severity_by_rule: dict[str, str],
+    waived_by_run: dict[int, set[int]] | None = None,
 ) -> MultiRunCompareReport:
     ordered_ids = [run.id for run in runs]
+    waived_lookup = waived_by_run or {}
     run_summaries: list[MultiRunCompareRunSummary] = []
     for run in runs:
-        summary: ReportSummary = build_report_summary(run.id, checks_by_run.get(run.id, []))
+        summary: ReportSummary = build_report_summary(
+            run.id,
+            checks_by_run.get(run.id, []),
+            waived_check_ids=waived_lookup.get(run.id),
+        )
         run_summaries.append(
             MultiRunCompareRunSummary(
                 run_id=run.id,
@@ -581,11 +637,13 @@ async def fetch_multi_run_compare(db: AsyncSession, run_ids: list[int]) -> Multi
 
     profile_id = runs[0].job.profile_id if runs[0].job else None
     severity_by_rule = await _severity_by_tech_name(db, profile_id)
+    waived_by_run = await waived_check_ids_for_runs(db, runs, checks_by_run)
     return build_multi_run_compare(
         job_id=job_id,
         runs=runs,
         checks_by_run=checks_by_run,
         severity_by_rule=severity_by_rule,
+        waived_by_run=waived_by_run,
     )
 
 

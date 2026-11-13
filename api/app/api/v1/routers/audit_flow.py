@@ -9,13 +9,24 @@ from app.core.auth import AuthUser, require_roles
 from app.core.roles import require_operate
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import AuditFlowCredential, AuditFlowRun, AuditFlowStatus, AuditFlowTemplate, Profile, UserRole
+from app.models import (
+    AuditFlowCredential,
+    AuditFlowRun,
+    AuditFlowStatus,
+    AuditFlowTemplate,
+    Credential,
+    CredentialType,
+    Profile,
+    UserRole,
+)
 from app.schemas import (
+    AuditFlowCatalogCredentialAdd,
     AuditFlowCreate,
     AuditFlowCredentialAdd,
     AuditFlowHostsPatch,
     AuditFlowInventoryDriftReport,
     AuditFlowLogEntry,
+    AuditFlowReprobe,
     AuditFlowRunRead,
     AuditFlowTemplateCreate,
     AuditFlowTemplateRead,
@@ -24,11 +35,11 @@ from app.schemas import (
 from app.services.audit_flow import (
     EDITABLE_STATUSES,
     attach_snapshot_credentials,
-    cleanup_expired,
     clear_retryable_skip,
     apply_host_selection,
     delete_run_artifacts,
     encrypt_flow_secret,
+    enqueue_reprobe,
     execute_run,
     load_run,
     present_run,
@@ -61,7 +72,6 @@ async def list_audit_flow_runs(
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_operate),
 ) -> list[AuditFlowRunRead]:
-    await cleanup_expired(db)
     stmt = select(AuditFlowRun).order_by(AuditFlowRun.created_at.desc()).limit(50)
     stmt = apply_owner_scope(stmt, AuditFlowRun.owner_sub, user)
     result = await db.execute(stmt)
@@ -340,11 +350,131 @@ async def add_audit_flow_credential(
     )
     db.add(credential)
     await db.flush()
+    outbox_id: int | None = None
     if host_row is not None:
         host_row.credential_id = credential.id
         host_row.selected = True
         clear_retryable_skip(host_row)
+        outbox_id = await enqueue_reprobe(
+            db, run, credential_id=credential.id, host_ids=[host_row.id]
+        )
+    else:
+        outbox_id = await enqueue_reprobe(db, run, credential_id=credential.id)
     await db.commit()
+    if outbox_id is not None:
+        await try_dispatch_outbox_immediate(
+            outbox_id,
+            broker_url=settings.celery_broker_url,
+            database_url=settings.database_url_sync,
+            metrics_redis_url=settings.redis_url,
+        )
+    run = await load_run(db, run_id)
+    return AuditFlowRunRead.model_validate(await present_run(db, run))
+
+
+@router.post("/runs/{run_id}/credentials/from-catalog", response_model=AuditFlowRunRead)
+async def add_audit_flow_catalog_credential(
+    run_id: int,
+    data: AuditFlowCatalogCredentialAdd,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(_OPERATE),
+) -> AuditFlowRunRead:
+    run = await load_run(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="AuditFlow run not found")
+    assert_can_access(user, run.owner_sub)
+    if run.status not in EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="Credentials can only be added after the scan finishes")
+    cat = await db.get(Credential, data.credential_id)
+    if not cat or cat.is_ephemeral:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    assert_can_access(user, cat.owner_sub)
+    if cat.credential_type not in (CredentialType.SSH_PASSWORD, CredentialType.SSH_KEY, CredentialType.WINRM):
+        raise HTTPException(status_code=400, detail="Credential type is not supported by AuditFlow")
+    if len(run.credentials) >= 20:
+        raise HTTPException(status_code=400, detail="At most 20 credential pairs are allowed")
+    host_row = None
+    if data.host_id is not None:
+        host_row = next((row for row in run.hosts if row.id == data.host_id), None)
+        if host_row is None:
+            raise HTTPException(status_code=404, detail=f"Host {data.host_id} not found")
+        if host_row.job_run_id:
+            raise HTTPException(status_code=409, detail="Host already launched")
+    username = cat.username or ""
+    # Catalog secrets are already encrypted with the same key; copy as-is.
+    credential = AuditFlowCredential(
+        run_id=run.id,
+        label=(cat.name or username)[:128],
+        credential_type=cat.credential_type,
+        username=username,
+        encrypted_secret=cat.encrypted_secret,
+        encrypted_key_passphrase=cat.encrypted_key_passphrase,
+        service_username=cat.service_username,
+        encrypted_service_secret=cat.encrypted_service_secret,
+    )
+    db.add(credential)
+    await db.flush()
+    if host_row is not None:
+        host_row.credential_id = credential.id
+        host_row.selected = True
+        clear_retryable_skip(host_row)
+        outbox_id = await enqueue_reprobe(
+            db, run, credential_id=credential.id, host_ids=[host_row.id]
+        )
+    else:
+        outbox_id = await enqueue_reprobe(db, run, credential_id=credential.id)
+    await db.commit()
+    if outbox_id is not None:
+        await try_dispatch_outbox_immediate(
+            outbox_id,
+            broker_url=settings.celery_broker_url,
+            database_url=settings.database_url_sync,
+            metrics_redis_url=settings.redis_url,
+        )
+    run = await load_run(db, run_id)
+    return AuditFlowRunRead.model_validate(await present_run(db, run))
+
+
+@router.post("/runs/{run_id}/reprobe", response_model=AuditFlowRunRead)
+async def reprobe_audit_flow(
+    run_id: int,
+    data: AuditFlowReprobe | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(_OPERATE),
+) -> AuditFlowRunRead:
+    run = await load_run(db, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="AuditFlow run not found")
+    assert_can_access(user, run.owner_sub)
+    if run.status not in EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail="Hosts can only be re-probed after the scan finishes")
+    payload = data or AuditFlowReprobe()
+    if payload.credential_id is not None:
+        if not any(c.id == payload.credential_id for c in run.credentials):
+            raise HTTPException(status_code=404, detail="Credential not found")
+    if payload.host_ids:
+        known = {h.id for h in run.hosts}
+        missing = [hid for hid in payload.host_ids if hid not in known]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"Host {missing[0]} not found")
+        launched = [h.id for h in run.hosts if h.id in set(payload.host_ids) and h.job_run_id]
+        if launched:
+            raise HTTPException(status_code=409, detail="Host already launched")
+    outbox_id = await enqueue_reprobe(
+        db,
+        run,
+        credential_id=payload.credential_id,
+        host_ids=payload.host_ids,
+    )
+    if outbox_id is None:
+        raise HTTPException(status_code=409, detail="No hosts available to re-probe")
+    await db.commit()
+    await try_dispatch_outbox_immediate(
+        outbox_id,
+        broker_url=settings.celery_broker_url,
+        database_url=settings.database_url_sync,
+        metrics_redis_url=settings.redis_url,
+    )
     run = await load_run(db, run_id)
     return AuditFlowRunRead.model_validate(await present_run(db, run))
 
@@ -468,6 +598,7 @@ async def create_audit_flow_template(
         save_to_inventory=bool(data.save_to_inventory),
         cron_expression=data.cron_expression if data.is_scheduled else None,
         is_scheduled=bool(data.is_scheduled),
+        auto_execute=bool(data.auto_execute),
         is_active=bool(data.is_active),
     )
     assign_owner(template, user)
@@ -529,6 +660,8 @@ async def update_audit_flow_template(
         template.description = (payload["description"] or "").strip() or None
     if "save_to_inventory" in payload:
         template.save_to_inventory = bool(payload["save_to_inventory"])
+    if "auto_execute" in payload:
+        template.auto_execute = bool(payload["auto_execute"])
     if "is_active" in payload:
         template.is_active = bool(payload["is_active"])
 

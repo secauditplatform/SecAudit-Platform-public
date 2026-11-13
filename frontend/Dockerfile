@@ -33,10 +33,10 @@ RUN npm run build
 FROM node:22-alpine AS development
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install
+RUN npm ci
 COPY . .
 EXPOSE 5173
-CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+CMD ["sh", "-c", "npm ci && npm run dev -- --host 0.0.0.0"]
 
 FROM nginx:1.27-alpine AS production
 RUN apk add --no-cache curl \

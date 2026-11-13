@@ -64,21 +64,14 @@ def _resolve_category(db: Session, category_slug: str | None) -> Category:
 
 
 def _persist_rule_rows(db: Session, profile: Profile, package_dir: Path) -> None:
+    from secaudit_core.rule_tech_names import allocate_rule_tech_name
+
     seen: set[str] = set()
     for meta in load_profile_rules_metadata(package_dir):
         base = str(meta.get("requirement_id") or meta.get("tech_name") or "").strip()
         if not base:
             continue
-        tech_name = base[:64]
-        if tech_name in seen:
-            suffix = 2
-            while True:
-                candidate = f"{base[:60]}_{suffix}"[:64]
-                if candidate not in seen:
-                    tech_name = candidate
-                    break
-                suffix += 1
-        seen.add(tech_name)
+        tech_name = allocate_rule_tech_name(base, seen)
         title = meta.get("title") or meta.get("summary") or None
         if isinstance(title, str):
             title = title.strip()[:512] or None

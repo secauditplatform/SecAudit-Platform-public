@@ -168,7 +168,7 @@ class Rule(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), nullable=False)
-    tech_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    tech_name: Mapped[str] = mapped_column(String(256), nullable=False)
     title: Mapped[str | None] = mapped_column(String(512))
     description: Mapped[str | None] = mapped_column(Text)
     severity: Mapped[str | None] = mapped_column(String(32))
@@ -184,7 +184,7 @@ class InterpreterRule(Base):
     check_script_id: Mapped[int] = mapped_column(ForeignKey("check_scripts.id"), nullable=False)
     regex: Mapped[str] = mapped_column(String(512), nullable=False)
     extraction_type: Mapped[str] = mapped_column(String(32), default="SINGLE")
-    tech_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    tech_name: Mapped[str] = mapped_column(String(256), nullable=False)
 
     check_script: Mapped["CheckScript"] = relationship(back_populates="interpreter_rules")
 
@@ -609,6 +609,14 @@ class JobRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     check_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     profile_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Explicit host set for this run. Null until the worker snapshots targets (full run)
+    # or the API sets a partial restart subset. Never mutates job_hosts / dynamic_filter.
+    host_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    is_partial: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    subset_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    source_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped["Job"] = relationship(back_populates="runs", foreign_keys=[job_id])
@@ -629,7 +637,7 @@ class CheckResult(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     job_run_id: Mapped[int] = mapped_column(ForeignKey("job_runs.id"), nullable=False, index=True)
     host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id"), nullable=False, index=True)
-    rule_tech_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    rule_tech_name: Mapped[str] = mapped_column(String(256), nullable=False)
     status: Mapped[CheckStatus] = mapped_column(
         Enum(CheckStatus, name="checkstatus", **_PG_ENUM_KW), nullable=False
     )
@@ -646,7 +654,7 @@ class ComplianceWaiver(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("profiles.id"), nullable=False, index=True)
-    rule_tech_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    rule_tech_name: Mapped[str] = mapped_column(String(256), nullable=False)
     host_id: Mapped[int | None] = mapped_column(ForeignKey("hosts.id"), nullable=True, index=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
@@ -702,6 +710,16 @@ class RemediationJob(Base):
         default=JobScope.STANDARD,
         nullable=False,
     )
+    source_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    workflow_reaudit_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    # Optional rule-scoped remediation (rule_tech_name list). Empty/null = all scripts.
+    rule_tech_names: Mapped[list | None] = mapped_column(JSON)
+    check_mode: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    auto_recheck_failed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     profile: Mapped["Profile"] = relationship(back_populates="remediation_jobs")
@@ -925,6 +943,8 @@ class AuditFlowTemplate(Base):
     save_to_inventory: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     cron_expression: Mapped[str | None] = mapped_column(String(128))
     is_scheduled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # After scan reaches READY, launch compliance for auto-selected (high-confidence) hosts.
+    auto_execute: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)

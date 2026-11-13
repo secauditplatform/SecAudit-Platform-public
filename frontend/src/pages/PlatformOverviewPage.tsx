@@ -1,4 +1,4 @@
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api/client";
@@ -149,7 +149,7 @@ export function PlatformOverviewPage() {
 
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: () => api.profiles() });
   const categories = useQuery({ queryKey: ["categories"], queryFn: api.categories });
-  const hosts = useQuery({ queryKey: ["hosts"], queryFn: () => api.hosts({ limit: 200 }) });
+  const hostsSummary = useQuery({ queryKey: ["hosts-summary"], queryFn: api.hostsSummary });
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs() });
   const remediations = useQuery({ queryKey: ["remediations"], queryFn: () => api.remediations() });
   const runs = useQuery({
@@ -159,8 +159,7 @@ export function PlatformOverviewPage() {
   });
 
   const runItems = runs.data?.items ?? [];
-  const hostItems = hosts.data?.items ?? [];
-  const activeHosts = hostItems.filter((host) => host.is_active).length;
+  const activeHosts = hostsSummary.data?.active ?? 0;
 
   const runStats = useMemo(() => {
     const list = runItems;
@@ -186,29 +185,13 @@ export function PlatformOverviewPage() {
     [runItems]
   );
 
-  const rulesQueries = useQueries({
-    queries: (profiles.data ?? []).map((profile) => ({
-      queryKey: ["profile-rules", profile.id],
-      queryFn: () => api.getProfileRules(profile.id),
-      staleTime: 120_000,
-    })),
-  });
-
-  const detailQueries = useQueries({
-    queries: (profiles.data ?? []).map((profile) => ({
-      queryKey: ["profile-detail", profile.id],
-      queryFn: () => api.getProfile(profile.id),
-      staleTime: 120_000,
-    })),
-  });
-
   const rulesCountByProfileId = useMemo(() => {
     const map = new Map<number, number>();
-    (profiles.data ?? []).forEach((profile, index) => {
-      map.set(profile.id, rulesQueries[index]?.data?.length ?? 0);
+    (profiles.data ?? []).forEach((profile) => {
+      map.set(profile.id, profile.rules_count ?? 0);
     });
     return map;
-  }, [profiles.data, rulesQueries]);
+  }, [profiles.data]);
 
   const totalRules = useMemo(
     () => Array.from(rulesCountByProfileId.values()).reduce((sum, n) => sum + n, 0),
@@ -218,15 +201,15 @@ export function PlatformOverviewPage() {
   const scriptCounts = useMemo(() => {
     let audit = 0;
     let remediation = 0;
-    detailQueries.forEach((query) => {
-      audit += query.data?.check_scripts.length ?? 0;
-      remediation += query.data?.remediation_scripts?.length ?? 0;
+    (profiles.data ?? []).forEach((profile) => {
+      audit += profile.audit_scripts_count ?? 0;
+      remediation += profile.remediation_scripts_count ?? 0;
     });
     return { audit, remediation };
-  }, [detailQueries]);
+  }, [profiles.data]);
 
-  const rulesLoading = rulesQueries.some((q) => q.isLoading);
-  const scriptsLoading = detailQueries.some((q) => q.isLoading);
+  const rulesLoading = profiles.isLoading;
+  const scriptsLoading = profiles.isLoading;
 
   const trendsTimeline = useQuery({
     queryKey: ["platform-overview-trends-timeline", platformTrendsDays],
@@ -352,8 +335,8 @@ export function PlatformOverviewPage() {
       runStats.total > 0 ? Math.round((runStats.completed / runStats.total) * 100) : null;
 
     const profileTotal = profiles.data?.length ?? 0;
-    const profilesWithRemediation = detailQueries.filter(
-      (query) => (query.data?.remediation_scripts?.length ?? 0) > 0
+    const profilesWithRemediation = (profiles.data ?? []).filter(
+      (profile) => (profile.remediation_scripts_count ?? 0) > 0
     ).length;
     const remediationReady =
       !scriptsLoading && profileTotal > 0
@@ -382,7 +365,6 @@ export function PlatformOverviewPage() {
     runStats.total,
     platformComplianceSnapshot,
     profiles.data,
-    detailQueries,
     scriptsLoading,
   ]);
 
@@ -397,7 +379,7 @@ export function PlatformOverviewPage() {
     };
   }, [trendsByProfile.data]);
 
-  const isLoading = profiles.isLoading || jobs.isLoading || hosts.isLoading;
+  const isLoading = profiles.isLoading || jobs.isLoading || hostsSummary.isLoading;
 
   const periodControl = (
     <div className="pf-audit-period" role="group" aria-label={t("platformOverview.periodAria")}>
@@ -628,7 +610,7 @@ export function PlatformOverviewPage() {
                 <HeroMetricTile
                   value={activeHosts}
                   label={t("platformOverview.flowHosts")}
-                  hint={t("platformOverview.flowHostsHint", { total: hostItems.length })}
+                  hint={t("platformOverview.flowHostsHint", { total: hostsSummary.data?.total ?? 0 })}
                   to="/hosts"
                   accent="cyan"
                 />

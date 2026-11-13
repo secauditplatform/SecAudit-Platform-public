@@ -12,7 +12,16 @@ from secaudit_core.celery_reliability import (
     STALE_RUN_ERROR_MESSAGE,
     WORKER_LOST_ERROR_MESSAGE,
 )
-from secaudit_core.models import JobRun, JobStatus, RemediationRun
+from secaudit_core.enums import AuditFlowStatus
+from secaudit_core.models import (
+    AagArtifact,
+    AuditFlowRun,
+    DirectorySync,
+    InventoryScan,
+    JobRun,
+    JobStatus,
+    RemediationRun,
+)
 
 
 def sweep_stale_job_runs(db: Session, cutoff: datetime) -> list[int]:
@@ -91,6 +100,93 @@ def sweep_orphan_pending_remediation_runs(db: Session, cutoff: datetime) -> list
     return affected
 
 
+def sweep_stale_inventory_scans(db: Session, cutoff: datetime) -> list[int]:
+    scans = db.execute(
+        select(InventoryScan).where(
+            InventoryScan.status == JobStatus.RUNNING,
+            InventoryScan.started_at.isnot(None),
+            InventoryScan.started_at < cutoff,
+        ).with_for_update(skip_locked=True)
+    ).scalars().all()
+    now = datetime.now(UTC)
+    affected: list[int] = []
+    for scan in scans:
+        scan.status = JobStatus.FAILED
+        scan.error_message = STALE_RUN_ERROR_MESSAGE
+        scan.finished_at = now
+        affected.append(scan.id)
+    return affected
+
+
+def sweep_stale_directory_syncs(
+    db: Session,
+    running_cutoff: datetime,
+    *,
+    pending_cutoff: datetime | None = None,
+) -> list[int]:
+    """Fail RUNNING and orphan PENDING directory syncs that block new LDAP imports."""
+    pending_cutoff = pending_cutoff or running_cutoff
+    running = db.execute(
+        select(DirectorySync).where(
+            DirectorySync.status == JobStatus.RUNNING,
+            DirectorySync.started_at.isnot(None),
+            DirectorySync.started_at < running_cutoff,
+        ).with_for_update(skip_locked=True)
+    ).scalars().all()
+    pending = db.execute(
+        select(DirectorySync).where(
+            DirectorySync.status == JobStatus.PENDING,
+            DirectorySync.started_at.is_(None),
+            DirectorySync.created_at < pending_cutoff,
+        ).with_for_update(skip_locked=True)
+    ).scalars().all()
+    now = datetime.now(UTC)
+    affected: list[int] = []
+    for sync in (*running, *pending):
+        sync.status = JobStatus.FAILED
+        sync.error_message = (
+            STALE_RUN_ERROR_MESSAGE if sync.started_at is not None else PENDING_ORPHAN_ERROR_MESSAGE
+        )
+        sync.finished_at = now
+        affected.append(sync.id)
+    return affected
+
+
+def sweep_stale_audit_flow_runs(db: Session, cutoff: datetime) -> list[int]:
+    runs = db.execute(
+        select(AuditFlowRun).where(
+            AuditFlowRun.status.in_((AuditFlowStatus.SCANNING, AuditFlowStatus.RUNNING)),
+            AuditFlowRun.started_at.isnot(None),
+            AuditFlowRun.started_at < cutoff,
+        ).with_for_update(skip_locked=True)
+    ).scalars().all()
+    now = datetime.now(UTC)
+    affected: list[int] = []
+    for run in runs:
+        run.status = AuditFlowStatus.FAILED
+        run.error_message = STALE_RUN_ERROR_MESSAGE
+        run.finished_at = now
+        affected.append(run.id)
+    return affected
+
+
+def sweep_stale_aag_artifacts(db: Session, cutoff: datetime) -> list[int]:
+    artifacts = db.execute(
+        select(AagArtifact).where(
+            AagArtifact.status == "pending",
+            AagArtifact.created_at < cutoff,
+        ).with_for_update(skip_locked=True)
+    ).scalars().all()
+    now = datetime.now(UTC)
+    affected: list[int] = []
+    for artifact in artifacts:
+        artifact.status = "failed"
+        artifact.error_message = PENDING_ORPHAN_ERROR_MESSAGE
+        artifact.finished_at = now
+        affected.append(artifact.id)
+    return affected
+
+
 def _sweep_worker_lost_runs(
     db: Session,
     model: type[JobRun] | type[RemediationRun],
@@ -145,13 +241,15 @@ def sweep_stale_runs(
 ) -> dict[str, list[int]]:
     """Sweep RUNNING and orphan PENDING runs. Returns ids grouped by kind."""
     pending_cutoff = pending_cutoff or running_cutoff
-    job_ids = sweep_stale_job_runs(db, running_cutoff)
-    remediation_ids = sweep_stale_remediation_runs(db, running_cutoff)
-    pending_job_ids = sweep_orphan_pending_job_runs(db, pending_cutoff)
-    pending_remediation_ids = sweep_orphan_pending_remediation_runs(db, pending_cutoff)
     return {
-        "job_runs": job_ids,
-        "remediation_runs": remediation_ids,
-        "pending_job_runs": pending_job_ids,
-        "pending_remediation_runs": pending_remediation_ids,
+        "job_runs": sweep_stale_job_runs(db, running_cutoff),
+        "remediation_runs": sweep_stale_remediation_runs(db, running_cutoff),
+        "pending_job_runs": sweep_orphan_pending_job_runs(db, pending_cutoff),
+        "pending_remediation_runs": sweep_orphan_pending_remediation_runs(db, pending_cutoff),
+        "inventory_scans": sweep_stale_inventory_scans(db, running_cutoff),
+        "directory_syncs": sweep_stale_directory_syncs(
+            db, running_cutoff, pending_cutoff=pending_cutoff
+        ),
+        "audit_flow_runs": sweep_stale_audit_flow_runs(db, running_cutoff),
+        "aag_artifacts": sweep_stale_aag_artifacts(db, pending_cutoff),
     }

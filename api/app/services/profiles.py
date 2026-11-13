@@ -17,6 +17,7 @@ from app.models import (
   JobRun,
   JobStatus,
   JobTemplate,
+  Playbook,
   RemediationJob,
   RemediationResult,
   RemediationRun,
@@ -27,7 +28,7 @@ from app.models import (
   ProfileVersion,
   TaskOutbox,
 )
-from app.schemas import ProfileCreate, ProfileDependencies
+from app.schemas import ProfileCreate, ProfileDeleteOptions, ProfileDependencies
 from secaudit_core.enums import OutboxStatus
 from secaudit_core.models import ScheduledReportDeliveryAttempt
 from app.services.interpreter import (
@@ -43,6 +44,7 @@ from app.services.interpreter import (
   read_package_text_file,
   update_profile_rule_in_package,
 )
+from secaudit_core.profile_packages import count_profile_rules_metadata
 from app.services.scap import prepare_upload_package
 from app.services.profiles_catalog import build_catalog, discover_importable_package_dirs
 from secaudit_core.profiles_catalog import (
@@ -179,7 +181,61 @@ class ProfileService:
 
     return await db.run_sync(_run)
 
-  def enrich_profile_read(self, profile: Profile, latest_versions: dict[str, str] | None = None) -> dict:
+  async def list_profile_counts(
+    self, db: AsyncSession, profiles: list[Profile]
+  ) -> dict[int, dict[str, int]]:
+    """Batch rules/script counts for list endpoints (avoids N+1 detail fetches)."""
+    if not profiles:
+      return {}
+    profile_ids = [profile.id for profile in profiles]
+    script_rows = (
+      await db.execute(
+        select(CheckScript.profile_id, CheckScript.script_kind, func.count())
+        .where(CheckScript.profile_id.in_(profile_ids))
+        .group_by(CheckScript.profile_id, CheckScript.script_kind)
+      )
+    ).all()
+    audit: dict[int, int] = {pid: 0 for pid in profile_ids}
+    remediation: dict[int, int] = {pid: 0 for pid in profile_ids}
+    for profile_id, kind, count in script_rows:
+      if kind == ScriptKind.REMEDIATION:
+        remediation[profile_id] = int(count)
+      else:
+        audit[profile_id] = int(count)
+
+    interp_rows = (
+      await db.execute(
+        select(CheckScript.profile_id, func.count(InterpreterRule.id))
+        .join(InterpreterRule, InterpreterRule.check_script_id == CheckScript.id)
+        .where(CheckScript.profile_id.in_(profile_ids))
+        .group_by(CheckScript.profile_id)
+      )
+    ).all()
+    interp_counts = {profile_id: int(count) for profile_id, count in interp_rows}
+
+    counts: dict[int, dict[str, int]] = {}
+    for profile in profiles:
+      rules_count = 0
+      if profile.package_path:
+        package_dir = Path(profile.package_path)
+        if package_dir.is_dir():
+          rules_count = count_profile_rules_metadata(package_dir)
+      if not rules_count:
+        rules_count = interp_counts.get(profile.id, 0)
+      counts[profile.id] = {
+        "rules_count": rules_count,
+        "audit_scripts_count": audit.get(profile.id, 0),
+        "remediation_scripts_count": remediation.get(profile.id, 0),
+      }
+    return counts
+
+  def enrich_profile_read(
+    self,
+    profile: Profile,
+    latest_versions: dict[str, str] | None = None,
+    *,
+    counts: dict[str, int] | None = None,
+  ) -> dict:
     payload = {
       "id": profile.id,
       "profile_name": profile.profile_name,
@@ -200,7 +256,14 @@ class ProfileService:
       "created_at": profile.created_at,
       "package_version": None,
       "needs_update": False,
+      "rules_count": 0,
+      "audit_scripts_count": 0,
+      "remediation_scripts_count": 0,
     }
+    if counts:
+      payload["rules_count"] = int(counts.get("rules_count", 0))
+      payload["audit_scripts_count"] = int(counts.get("audit_scripts_count", 0))
+      payload["remediation_scripts_count"] = int(counts.get("remediation_scripts_count", 0))
     if latest_versions and profile.profile_name in latest_versions:
       latest = latest_versions[profile.profile_name]
       payload["package_version"] = latest
@@ -590,16 +653,17 @@ class ProfileService:
     if isinstance(title, str):
       title = title.strip()[:512] or None
 
-    # Match persisted Rule rows: tech_name may be truncated requirement_id.
+    from secaudit_core.rule_tech_names import RULE_TECH_NAME_MAX
+
+    # Match persisted Rule rows (full id, legacy 64-char truncation, or collision suffix).
     rid = str(rule_meta.get("requirement_id") or requirement_id).strip()
-    candidates = [rid[:64]]
+    candidates = [rid[:RULE_TECH_NAME_MAX]]
+    if len(rid) > 64:
+      candidates.append(rid[:64])
     db_result = await db.execute(
       select(Rule).where(Rule.profile_id == profile.id, Rule.tech_name.in_(candidates))
     )
     db_rule = db_result.scalar_one_or_none()
-    if db_rule is None and len(rid) > 64:
-      # Collided names use suffix; try exact prefix match fallback by scap/title not needed.
-      pass
     if db_rule is not None:
       db_rule.title = title
       db_rule.description = rule_meta.get("explanation")
@@ -807,21 +871,14 @@ class ProfileService:
     return category
 
   def _persist_rule_rows(self, db: AsyncSession, profile: Profile, package_dir: Path) -> None:
+    from secaudit_core.rule_tech_names import allocate_rule_tech_name
+
     seen: set[str] = set()
     for meta in load_profile_rules_metadata(package_dir):
       base = str(meta.get("requirement_id") or meta.get("tech_name") or "").strip()
       if not base:
         continue
-      tech_name = base[:64]
-      if tech_name in seen:
-        suffix = 2
-        while True:
-          candidate = f"{base[:60]}_{suffix}"[:64]
-          if candidate not in seen:
-            tech_name = candidate
-            break
-          suffix += 1
-      seen.add(tech_name)
+      tech_name = allocate_rule_tech_name(base, seen)
       title = meta.get("title") or None
       if isinstance(title, str):
         title = title.strip()[:512] or None
@@ -974,6 +1031,8 @@ class ProfileService:
       db.add(script)
       await db.flush()
 
+      from secaudit_core.rule_tech_names import RULE_TECH_NAME_MAX
+
       for rule in item.get("context", []):
         tech_name = rule.get("techName") or rule.get("tech_name")
         if not tech_name:
@@ -983,7 +1042,7 @@ class ProfileService:
             check_script_id=script.id,
             regex=rule["regex"],
             extraction_type=rule.get("extractionType", "SINGLE"),
-            tech_name=tech_name,
+            tech_name=str(tech_name).strip()[:RULE_TECH_NAME_MAX],
           )
         )
 
@@ -1195,6 +1254,7 @@ class ProfileService:
     profile_ids: list[int],
     *,
     cascade: bool = False,
+    options: ProfileDeleteOptions | None = None,
   ) -> dict:
     succeeded: list[int] = []
     failed: list[dict] = []
@@ -1205,7 +1265,7 @@ class ProfileService:
         continue
       seen.add(profile_id)
       try:
-        await self.delete_profile(db, profile_id, cascade=cascade)
+        await self.delete_profile(db, profile_id, cascade=cascade, options=options)
         succeeded.append(profile_id)
       except LookupError:
         failed.append({"profile_id": profile_id, "message": "Profile not found"})
@@ -1401,9 +1461,23 @@ class ProfileService:
     if not profile:
       raise LookupError("Profile not found")
 
-    jobs_count = (
-      await db.execute(select(func.count()).select_from(Job).where(Job.profile_id == profile_id))
-    ).scalar_one()
+    playbook_ids = list(
+      (await db.execute(select(Playbook.id).where(Playbook.profile_id == profile_id))).scalars().all()
+    )
+    job_ids = list(
+      (await db.execute(select(Job.id).where(Job.profile_id == profile_id))).scalars().all()
+    )
+    if playbook_ids:
+      playbook_job_ids = list(
+        (
+          await db.execute(select(Job.id).where(Job.playbook_id.in_(playbook_ids)))
+        )
+        .scalars()
+        .all()
+      )
+      job_ids = list({*job_ids, *playbook_job_ids})
+
+    jobs_count = len(job_ids)
     remediation_count = (
       await db.execute(
         select(func.count()).select_from(RemediationJob).where(RemediationJob.profile_id == profile_id)
@@ -1415,9 +1489,6 @@ class ProfileService:
       )
     ).scalar_one()
 
-    job_ids = list(
-      (await db.execute(select(Job.id).where(Job.profile_id == profile_id))).scalars().all()
-    )
     remediation_ids = list(
       (
         await db.execute(select(RemediationJob.id).where(RemediationJob.profile_id == profile_id))
@@ -1473,10 +1544,13 @@ class ProfileService:
         )
       ).scalar_one()
 
+    playbooks_count = len(playbook_ids)
+
     return ProfileDependencies(
       jobs=jobs_count,
       remediation_jobs=remediation_count,
       waivers=waivers_count,
+      playbooks=playbooks_count,
       job_runs=job_runs,
       check_results=check_results,
       remediation_runs=remediation_runs,
@@ -1591,31 +1665,98 @@ class ProfileService:
       await db.delete(job)
     await db.flush()
 
+  async def _cascade_delete_playbooks_for_profile(self, db: AsyncSession, profile_id: int) -> None:
+    """Remove compliance/user playbooks bound to the profile and their playbook jobs."""
+    playbook_ids = list(
+      (await db.execute(select(Playbook.id).where(Playbook.profile_id == profile_id))).scalars().all()
+    )
+    if not playbook_ids:
+      return
+
+    jobs = await self._load_jobs(db, Job.playbook_id.in_(playbook_ids))
+    await self._cascade_delete_jobs(db, jobs)
+    await db.execute(
+      update(JobTemplate).where(JobTemplate.playbook_id.in_(playbook_ids)).values(playbook_id=None)
+    )
+    await db.execute(delete(Playbook).where(Playbook.id.in_(playbook_ids)))
+    await db.flush()
+
+  async def _detach_jobs_for_profile(self, db: AsyncSession, profile_id: int) -> None:
+    await db.execute(update(Job).where(Job.profile_id == profile_id).values(profile_id=None))
+    await db.execute(
+      update(JobTemplate).where(JobTemplate.profile_id == profile_id).values(profile_id=None)
+    )
+    await db.flush()
+
+  async def _purge_reports_for_profile(self, db: AsyncSession, profile_id: int) -> None:
+    """Delete run history for profile jobs without removing the jobs themselves."""
+    jobs = await self._load_jobs(db, Job.profile_id == profile_id)
+    if not jobs:
+      return
+    job_ids = [job.id for job in jobs]
+    run_ids = [run.id for job in jobs for run in job.runs]
+    await self._cancel_dispatchable_outbox(db, callback_kind="job_run", run_ids=run_ids)
+    if run_ids:
+      await db.execute(
+        delete(ScheduledReportDeliveryAttempt).where(
+          ScheduledReportDeliveryAttempt.job_run_id.in_(run_ids)
+        )
+      )
+      await db.execute(
+        update(ScheduledReport)
+        .where(ScheduledReport.last_delivered_run_id.in_(run_ids))
+        .values(last_delivered_run_id=None)
+      )
+      await db.execute(update(Job).where(Job.id.in_(job_ids)).values(baseline_run_id=None))
+    await db.execute(delete(ScheduledReport).where(ScheduledReport.job_id.in_(job_ids)))
+    for job in jobs:
+      for job_run in list(job.runs):
+        for check in list(job_run.check_results):
+          await db.delete(check)
+        await db.delete(job_run)
+    await db.flush()
+
   async def delete_profile(
     self,
     db: AsyncSession,
     profile_id: int,
     *,
     cascade: bool = False,
+    options: ProfileDeleteOptions | None = None,
   ) -> None:
     profile = await self.get_profile(db, profile_id)
     if not profile:
       raise LookupError("Profile not found")
 
     dependencies = await self.get_profile_dependencies(db, profile_id)
-    if dependencies.has_blocking and not cascade:
+    opts = options or ProfileDeleteOptions()
+    if cascade:
+      opts = ProfileDeleteOptions(delete_playbooks=True, delete_jobs=True, delete_reports=True)
+
+    # Legacy clients: dependencies still require an explicit cascade / options.
+    if dependencies.has_blocking and not cascade and options is None:
       raise ProfileDependencyError(dependencies)
 
-    if cascade and dependencies.active_runs > 0:
+    if dependencies.active_runs > 0:
       raise ProfileActiveRunsError(dependencies)
 
-    if cascade:
+    if opts.delete_jobs:
       await self._cascade_delete_jobs_for_profile(db, profile_id)
       await self._cascade_delete_remediation_jobs_for_profile(db, profile_id)
       await db.execute(delete(ComplianceWaiver).where(ComplianceWaiver.profile_id == profile_id))
       await db.execute(
         update(JobTemplate).where(JobTemplate.profile_id == profile_id).values(profile_id=None)
       )
+    else:
+      if opts.delete_reports:
+        await self._purge_reports_for_profile(db, profile_id)
+      # Remediation jobs and waivers cannot outlive the profile (NOT NULL FKs).
+      await self._cascade_delete_remediation_jobs_for_profile(db, profile_id)
+      await db.execute(delete(ComplianceWaiver).where(ComplianceWaiver.profile_id == profile_id))
+      await self._detach_jobs_for_profile(db, profile_id)
+
+    if opts.delete_playbooks:
+      await self._cascade_delete_playbooks_for_profile(db, profile_id)
 
     package_path = profile.package_path
     for script in profile.check_scripts:

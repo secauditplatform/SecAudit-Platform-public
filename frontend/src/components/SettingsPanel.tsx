@@ -6,6 +6,7 @@ import { useTheme, type ThemePreference } from "../theme/ThemeProvider";
 import { LanguagePicker } from "./LanguagePicker";
 import { MfaSettings } from "./MfaSettings";
 import { NotificationsSettings } from "./NotificationsSettings";
+import { SystemHealthSettings } from "./SystemHealthSettings";
 import {
   IconBell,
   IconCheck,
@@ -13,6 +14,7 @@ import {
   IconMoon,
   IconSettings,
   IconSun,
+  IconSystemHealth,
 } from "./ui/Icons";
 
 const THEME_OPTIONS: Array<{
@@ -41,10 +43,10 @@ const THEME_OPTIONS: Array<{
   },
 ];
 
-type TabId = "general" | "notifications";
+type TabId = "general" | "notifications" | "system";
 
 export function SettingsPanel() {
-  const { isAuditorPortal } = useAuth();
+  const { isAdmin, isAuditorPortal } = useAuth();
   const { preference, setPreference } = useTheme();
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
@@ -52,6 +54,8 @@ export function SettingsPanel() {
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
   const showNotifications = !isAuditorPortal;
+  const showSystem = isAdmin;
+  const showTabs = showNotifications || showSystem;
 
   useEffect(() => {
     if (!open) return;
@@ -71,7 +75,10 @@ export function SettingsPanel() {
     if (!showNotifications && tab === "notifications") {
       setTab("general");
     }
-  }, [open, showNotifications, tab]);
+    if (!showSystem && tab === "system") {
+      setTab("general");
+    }
+  }, [open, showNotifications, showSystem, tab]);
 
   const openSettings = () => {
     setTab("general");
@@ -130,7 +137,7 @@ export function SettingsPanel() {
                   </button>
                 </header>
 
-                {showNotifications ? (
+                {showTabs ? (
                   <div className="pf-settings-modal__nav">
                     <nav className="pf-settings-modal__tabs" aria-label={t("settings.title")}>
                       <div className="pf-segmented pf-settings-modal__segmented" role="tablist">
@@ -143,20 +150,38 @@ export function SettingsPanel() {
                         >
                           <span className="pf-segmented__label">{t("settings.general")}</span>
                         </button>
-                        <button
-                          type="button"
-                          role="tab"
-                          className={`pf-segmented__option pf-settings-modal__tab${tab === "notifications" ? " is-active" : ""}`}
-                          aria-selected={tab === "notifications"}
-                          onClick={() => setTab("notifications")}
-                        >
-                          <IconBell className="pf-settings-modal__tab-icon" aria-hidden />
-                          <span className="pf-segmented__label">{t("settings.notifications")}</span>
-                        </button>
+                        {showNotifications ? (
+                          <button
+                            type="button"
+                            role="tab"
+                            className={`pf-segmented__option pf-settings-modal__tab${tab === "notifications" ? " is-active" : ""}`}
+                            aria-selected={tab === "notifications"}
+                            onClick={() => setTab("notifications")}
+                          >
+                            <IconBell className="pf-settings-modal__tab-icon" aria-hidden />
+                            <span className="pf-segmented__label">{t("settings.notifications")}</span>
+                          </button>
+                        ) : null}
+                        {showSystem ? (
+                          <button
+                            type="button"
+                            role="tab"
+                            className={`pf-segmented__option pf-settings-modal__tab${tab === "system" ? " is-active" : ""}`}
+                            aria-selected={tab === "system"}
+                            onClick={() => setTab("system")}
+                          >
+                            <IconSystemHealth className="pf-settings-modal__tab-icon" aria-hidden />
+                            <span className="pf-segmented__label">{t("settings.system")}</span>
+                          </button>
+                        ) : null}
                       </div>
                     </nav>
                     <p className="pf-settings-modal__pane-desc">
-                      {tab === "general" ? t("settings.generalDesc") : t("notifications.description")}
+                      {tab === "general"
+                        ? t("settings.generalDesc")
+                        : tab === "system"
+                          ? t("settings.systemDesc")
+                          : t("notifications.description")}
                     </p>
                   </div>
                 ) : null}
@@ -164,9 +189,9 @@ export function SettingsPanel() {
 
                 <div className="pf-settings-modal__body">
                   <div
-                    className={`pf-settings-modal__pane${tab === "general" || !showNotifications ? " is-active" : ""}`}
+                    className={`pf-settings-modal__pane${tab === "general" || !showTabs ? " is-active" : ""}`}
                     role="tabpanel"
-                    aria-hidden={showNotifications && tab !== "general"}
+                    aria-hidden={showTabs && tab !== "general"}
                   >
                     <div className="pf-settings-general">
                       <section className="pf-settings-block" aria-labelledby="settings-language-heading">
@@ -229,6 +254,16 @@ export function SettingsPanel() {
                       aria-hidden={tab !== "notifications"}
                     >
                       <NotificationsSettings />
+                    </div>
+                  ) : null}
+
+                  {showSystem ? (
+                    <div
+                      className={`pf-settings-modal__pane${tab === "system" ? " is-active" : ""}`}
+                      role="tabpanel"
+                      aria-hidden={tab !== "system"}
+                    >
+                      <SystemHealthSettings />
                     </div>
                   ) : null}
                 </div>

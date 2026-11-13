@@ -16,14 +16,12 @@ _DEMO_WRITE_ALLOW_PREFIXES = (
 )
 
 # Mutating methods against these prefixes are rejected in demo mode.
+# Jobs / job-templates / remediations / playbooks / audit-map stay open so guests
+# can run seeded lab targets; execution itself is limited to DEMO_EXEC_ALLOWED_CIDRS.
 _DEMO_BLOCK_WRITE_PREFIXES = (
-    "/api/v1/jobs",
-    "/api/v1/job-templates",
-    "/api/v1/remediations",
     "/api/v1/audit-flow",
-    "/api/v1/audit-map",
     "/api/v1/inventory",
-    "/api/v1/playbooks",
+    "/api/v1/directory",
     "/api/v1/credentials",
     "/api/v1/hosts",
     "/api/v1/profiles",
@@ -38,6 +36,7 @@ _DEMO_BLOCK_WRITE_PREFIXES = (
     "/api/v1/reports",
     "/api/v1/ws",
     "/api/v1/aag",
+    "/api/v1/cve-feed",
 )
 
 
@@ -55,7 +54,7 @@ def _bearer_is_demo_operator(request: Request) -> bool:
 
 
 class DemoModeGuardMiddleware(BaseHTTPMiddleware):
-    """Refuse execute / mutate operations when DEMO_MODE is enabled."""
+    """Refuse mutate operations when DEMO_MODE is enabled (except operators)."""
 
     def __init__(self, app, *, enabled: bool):
         super().__init__(app)
@@ -81,8 +80,10 @@ class DemoModeGuardMiddleware(BaseHTTPMiddleware):
                 content={
                     "detail": (
                         "Demo stand: this action is disabled. "
-                        "Compliance jobs, remediation, scanning, credentials, "
-                        "and other execute/mutate APIs are not available."
+                        "Hosts, credentials, users, scans, and other "
+                        "infrastructure mutate APIs are not available. "
+                        "Compliance, remediation, and playbook runs are limited "
+                        "to local lab networks."
                     )
                 },
             )

@@ -10,6 +10,12 @@ from pathlib import Path
 
 import asyncssh
 from secaudit_core.oscap import parse_oval_results_xml, parse_xccdf_results_xml
+from secaudit_core.oval_worker_eval import (
+    build_fact_collection_script,
+    build_probe_plan,
+    evaluate_definitions,
+    parse_fact_collection_output,
+)
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.ssh_connect import build_ssh_connect_kwargs
 from secaudit_core.tracing import start_span
@@ -78,6 +84,51 @@ async def _ensure_oscap(conn: asyncssh.SSHClientConnection) -> None:
         )
 
 
+def _oval_xml_for_worker_side(benchmark_path: Path, content_files: list[Path], mode: str) -> bytes | None:
+    """Pick OVAL definitions XML for worker-side evaluation when remote oscap is missing."""
+    if mode == "oval" and benchmark_path.is_file():
+        return benchmark_path.read_bytes()
+    for path in content_files:
+        name = path.name.lower()
+        if path.is_file() and ("oval" in name or name.endswith("-oval.xml")):
+            return path.read_bytes()
+    return None
+
+
+async def _run_worker_side_oval_async(
+    conn: asyncssh.SSHClientConnection,
+    oval_xml: bytes,
+    *,
+    timeout: int,
+) -> tuple[dict[str, str], str]:
+    """Collect remote facts over SSH and evaluate a limited OVAL subset on the worker."""
+    plan = build_probe_plan(oval_xml)
+    if not plan.definition_ids:
+        raise RuntimeError("OVAL definitions XML contains no definitions for worker-side evaluation")
+
+    script = build_fact_collection_script(plan)
+    remote_path = f"/tmp/secaudit_oval_facts_{uuid.uuid4().hex}.sh"
+    async with conn.start_sftp_client() as sftp:
+        async with sftp.open(remote_path, "w") as remote_file:
+            await remote_file.write(script)
+    result = await conn.run(
+        f"trap 'rm -f {shlex.quote(remote_path)}' EXIT; "
+        f"chmod +x {shlex.quote(remote_path)} && sh {shlex.quote(remote_path)}",
+        timeout=timeout,
+        stdin=asyncssh.DEVNULL,
+    )
+    combined = (result.stdout or "") + (result.stderr or "")
+    facts = parse_fact_collection_output(combined)
+    outcomes = evaluate_definitions(plan, facts)
+    if not outcomes:
+        raise RuntimeError("Worker-side OVAL evaluation produced no definition results")
+    header = (
+        f"[secaudit] worker-side OVAL eval "
+        f"(defs={len(outcomes)} files={len(plan.files)} packages={len(plan.packages)})\n"
+    )
+    return outcomes, header + combined
+
+
 async def _upload_content(
     conn: asyncssh.SSHClientConnection,
     remote_dir: str,
@@ -139,7 +190,18 @@ async def _run_oscap_eval_async(
         watcher = asyncio.create_task(_watch_cancel(conn, cancel_event))
         try:
             raise_if_cancelled()
-            await _ensure_oscap(conn)
+            try:
+                await _ensure_oscap(conn)
+            except OscapNotAvailableError:
+                # Worker-side path evaluates OVAL definition ids; only safe for oval mode
+                # (XCCDF scap_rule_id values are rule ids, not definition ids).
+                if mode != "oval":
+                    raise
+                oval_xml = _oval_xml_for_worker_side(benchmark_path, content_files, mode)
+                if oval_xml is None:
+                    raise
+                return await _run_worker_side_oval_async(conn, oval_xml, timeout=timeout)
+
             await _upload_content(conn, remote_dir, content_files)
 
             subcommand = "oval eval" if mode == "oval" else "xccdf eval"

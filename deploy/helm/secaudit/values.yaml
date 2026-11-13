@@ -145,8 +145,14 @@ profiles:
     size: 20Gi
     storageClass: ""
     accessMode: ReadWriteMany
-  # Optional hostPath / existing PVC
+  # Optional hostPath / existing PVC for writable /data/profiles
   existingClaim: ""
+  # Read-only profile catalog mounted at PROFILES_PATH (/profiles).
+  catalog:
+    # hostPath on the node (air-gap / shared NFS bind), or leave empty for emptyDir.
+    hostPath: ""
+    existingClaim: ""
+    readOnly: true
 
 ingress:
   enabled: false
@@ -178,6 +184,10 @@ securityContext:
 networkPolicy:
   # Default-deny + allow frontend→api, api/worker/beat→DB/Redis/DNS (+ limited egress).
   enabled: true
+  # Extra worker egress TCP/UDP ports (non-standard SSH, LLM, etc.).
+  workerExtraEgressPorts: []
+  # CIDRs reached with all protocols (needed for ICMP ping; NetworkPolicy cannot name ICMP).
+  workerTargetCIDRs: []
 
 serviceAccount:
   create: true

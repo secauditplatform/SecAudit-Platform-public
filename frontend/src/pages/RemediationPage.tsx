@@ -1,7 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, useSearchParams } from "react-router-dom";
-import { api, type CheckScript, type RemediationJob } from "../api/client";
+import { api, type CheckScript, type DynamicHostFilter, type RemediationJob } from "../api/client";
+import {
+  DynamicHostFilterFields,
+  EMPTY_DYNAMIC_FILTER,
+  TargetModeToggle,
+  type TargetMode,
+} from "../components/DynamicHostFilterFields";
 import { useAuth } from "../auth/AuthProvider";
 import { HostPicker } from "../components/HostPicker";
 import {
@@ -31,7 +37,7 @@ import { useConfirm } from "../components/ui/ConfirmDialog";
 import { useToast } from "../components/ui/Toast";
 import { useTranslation } from "../i18n/I18nProvider";
 import { sliceOpsList, OPS_LIST_MAX } from "../utils/opsListLimit";
-import { RUN_STATUS_KEYS, runStatusLabel, runStatusVariant } from "../utils/statusVariant";
+import { RUN_STATUS_KEYS, checkStatusVariant, runStatusLabel, runStatusVariant } from "../utils/statusVariant";
 import {
   buildCronExpression,
   DEFAULT_SCHEDULE,
@@ -66,6 +72,8 @@ export function RemediationPage({
   const [remediationScriptId, setRemediationScriptId] = useState<number | "">("");
   const [jobType, setJobType] = useState<"ssh" | "winrm" | "python" | "ansible">("ssh");
   const [hostIds, setHostIds] = useState<number[]>([]);
+  const [targetMode, setTargetMode] = useState<TargetMode>("hosts");
+  const [dynamicFilter, setDynamicFilter] = useState<DynamicHostFilter>(EMPTY_DYNAMIC_FILTER);
   const [isScheduled, setIsScheduled] = useState(false);
   const [scheduleConfig, setScheduleConfig] = useState<ScheduleConfig>(DEFAULT_SCHEDULE);
   const [selectedJobId, setSelectedJobId] = useState<number | null>(null);
@@ -289,6 +297,21 @@ export function RemediationPage({
     return jobRuns[0]?.id ?? null;
   }, [activeJobId, runs.data]);
 
+  const runDetail = useQuery({
+    queryKey: ["remediation-run", selectedRunId],
+    queryFn: () => api.getRemediationRun(selectedRunId!),
+    enabled: selectedRunId != null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "pending" || status === "running" ? 3000 : false;
+    },
+  });
+
+  const hostNameById = useMemo(
+    () => new Map((hosts.data?.items ?? []).map((host) => [host.id, host.name] as const)),
+    [hosts.data]
+  );
+
   const editorScript = useMemo(() => {
     if (editorScriptId == null) return null;
     return remediationScripts.find((script) => script.id === editorScriptId) ?? null;
@@ -412,6 +435,8 @@ export function RemediationPage({
     setRemediationScriptId("");
     setJobType("ssh");
     setHostIds([]);
+    setTargetMode("hosts");
+    setDynamicFilter(EMPTY_DYNAMIC_FILTER);
     setIsScheduled(false);
     setScheduleConfig(DEFAULT_SCHEDULE);
   };
@@ -424,6 +449,8 @@ export function RemediationPage({
     setRemediationScriptId(job.remediation_script_id ?? "");
     setJobType(job.execution_type);
     setHostIds(job.host_ids);
+    setTargetMode(job.dynamic_filter ? "dynamic" : "hosts");
+    setDynamicFilter(job.dynamic_filter ?? EMPTY_DYNAMIC_FILTER);
     setIsScheduled(job.is_scheduled);
     setScheduleConfig(parseCronExpression(job.cron_expression));
     if (options?.updateUrl !== false) {
@@ -458,7 +485,7 @@ export function RemediationPage({
 
   const isEditing = editingId !== null;
   const cronExpression = buildCronExpression(scheduleConfig);
-  const hasTarget = hostIds.length > 0;
+  const hasTarget = targetMode === "dynamic" || hostIds.length > 0;
   const isFormValid = !!name && profileId !== "" && hasTarget;
 
   const buildPayload = () => ({
@@ -468,8 +495,9 @@ export function RemediationPage({
     // Network Platform remediations use Python (Netmiko) on the worker — not Ansible.
     execution_type: isNetwork ? ("python" as const) : jobType,
     scope: operationsScope,
-    host_ids: hostIds,
-    dynamic_filter: null,
+    ...(targetMode === "dynamic"
+      ? { host_ids: [] as number[], dynamic_filter: dynamicFilter }
+      : { host_ids: hostIds, dynamic_filter: null }),
     is_scheduled: isScheduled,
     cron_expression: isScheduled ? cronExpression : undefined,
   });
@@ -531,7 +559,7 @@ export function RemediationPage({
         ref={jobFormPanelRef}
         title={isEditing ? t("remediation.editTitle", { name }) : t("remediation.createJob")}
       >
-        <div className="pf-form pf-form--wide">
+        <div className="pf-form pf-form--wide pf-job-composer">
           <div className="pf-form__row">
             <div className="pf-form__group">
               <label htmlFor="remediation-name">{t("remediation.jobName")}</label>
@@ -608,15 +636,25 @@ export function RemediationPage({
             </div>
           </div>
 
-          <HostPicker
-            hosts={availableHosts}
-            selectedIds={hostIds}
-            onToggle={(id) =>
-              setHostIds((prev) => (prev.includes(id) ? prev.filter((h) => h !== id) : [...prev, id]))
-            }
-            onSelectAll={(ids) => setHostIds(ids)}
-            onClearAll={() => setHostIds([])}
+          <TargetModeToggle
+            mode={targetMode}
+            onChange={setTargetMode}
+            hostsLabel={t("jobs.targetHosts")}
+            dynamicLabel={t("jobs.targetDynamic")}
           />
+          {targetMode === "dynamic" ? (
+            <DynamicHostFilterFields value={dynamicFilter} onChange={setDynamicFilter} idPrefix="remediation-dynamic" />
+          ) : (
+            <HostPicker
+              hosts={availableHosts}
+              selectedIds={hostIds}
+              onToggle={(id) =>
+                setHostIds((prev) => (prev.includes(id) ? prev.filter((h) => h !== id) : [...prev, id]))
+              }
+              onSelectAll={(ids) => setHostIds(ids)}
+              onClearAll={() => setHostIds([])}
+            />
+          )}
 
           <JobSchedulePicker
             enabled={isScheduled}
@@ -762,10 +800,10 @@ export function RemediationPage({
                   ? formatScheduleLabel(selectedJob.cron_expression, scheduleLabels)
                   : t("jobs.manualRun")}
               </Badge>
-              <Badge variant="neutral">
-                {selectedJob.host_ids.length > 0
-                  ? t("remediation.hostsCount", { count: selectedJob.host_ids.length })
-                  : t("common.all")}
+              <Badge variant={selectedJob.dynamic_filter || selectedJob.host_ids.length === 0 ? "neutral" : "info"}>
+                {selectedJob.dynamic_filter
+                  ? t("common.all")
+                  : t("remediation.hostsCount", { count: selectedJob.host_ids.length })}
               </Badge>
             </div>
             <p className="pf-selected-job__hint">{t("remediation.selectedJobHint")}</p>
@@ -1090,6 +1128,58 @@ export function RemediationPage({
       </Panel>
 
       <RemediationRunLogs key={selectedRunId ?? "none"} runId={selectedRunId} />
+      {selectedRunId != null && (
+        <Panel title={t("remediation.resultsTitle")} noPadding>
+          {runDetail.isLoading ? (
+            <Spinner />
+          ) : runDetail.isError ? (
+            <QueryErrorState
+              title={t("common.listLoadError")}
+              message={runDetail.error instanceof Error ? runDetail.error.message : undefined}
+              onRetry={() => runDetail.refetch()}
+            />
+          ) : (runDetail.data?.results.length ?? 0) === 0 ? (
+            <EmptyState title={t("remediation.noResults")} />
+          ) : (
+            <div className="pf-table-wrap">
+              <table className="pf-table">
+                <thead>
+                  <tr>
+                    <th>{t("remediation.host")}</th>
+                    <th>{t("remediation.script")}</th>
+                    <th>{t("remediation.status")}</th>
+                    <th>{t("remediation.message")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {runDetail.data!.results.map((result) => (
+                    <tr key={result.id}>
+                      <td>{hostNameById.get(result.host_id) ?? result.host_id}</td>
+                      <td className="pf-table__mono">{result.script_name}</td>
+                      <td>
+                        <Badge variant={checkStatusVariant(result.status)}>
+                          {runStatusLabel(t, result.status)}
+                        </Badge>
+                      </td>
+                      <td>
+                        {result.message ?? t("common.dash")}
+                        {result.raw_output ? (
+                          <details>
+                            <summary>{t("remediation.rawOutput")}</summary>
+                            <pre style={{ whiteSpace: "pre-wrap", maxHeight: "16rem", overflow: "auto" }}>
+                              {result.raw_output}
+                            </pre>
+                          </details>
+                        ) : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+      )}
       {isNetwork && selectedRunId ? <NetworkRemediationConfigPanel runId={selectedRunId} /> : null}
     </>
   );

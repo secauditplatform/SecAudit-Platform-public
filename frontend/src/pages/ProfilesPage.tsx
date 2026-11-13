@@ -2,7 +2,16 @@ import Editor from "@monaco-editor/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { api, type CheckScript, type ProfileDependencies, type ProfileRule, type ProfileRuleChangelogEntry, type ProfileRuleUpdate, type ProfileVersion } from "../api/client";
+import {
+  api,
+  type CheckScript,
+  type ProfileDeleteOptions,
+  type ProfileDependencies,
+  type ProfileRule,
+  type ProfileRuleChangelogEntry,
+  type ProfileRuleUpdate,
+  type ProfileVersion,
+} from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import {
   ProfileRuleMetadata,
@@ -97,7 +106,7 @@ function groupChangelogByVersion(entries: ProfileRuleChangelogEntry[]): Changelo
 
 export function ProfilesPage() {
   const { t } = useTranslation();
-  const { confirm } = useConfirm();
+  const { confirm, confirmChoices } = useConfirm();
   const toast = useToast();
   const { isAdmin, canOperate } = useAuth();
   const isMobile = useIsMobileViewport();
@@ -219,39 +228,65 @@ export function ProfilesPage() {
     queryClient.invalidateQueries({ queryKey: ["waivers"] });
     queryClient.invalidateQueries({ queryKey: ["scheduled-reports"] });
     queryClient.invalidateQueries({ queryKey: ["job-templates"] });
+    queryClient.invalidateQueries({ queryKey: ["playbooks"] });
   };
 
   const hasDeleteDependencies = (deps: ProfileDependencies) =>
-    deps.jobs > 0 || deps.remediation_jobs > 0 || deps.waivers > 0;
+    deps.jobs > 0 ||
+    deps.remediation_jobs > 0 ||
+    deps.waivers > 0 ||
+    (deps.playbooks ?? 0) > 0 ||
+    deps.job_runs + deps.remediation_runs > 0;
 
-  const confirmCascadeDelete = async (
+  const confirmProfileDeleteChoices = async (
     deps: ProfileDependencies,
     options: { name?: string; count?: number }
-  ) => {
+  ): Promise<ProfileDeleteOptions | null> => {
     const jobsTotal = deps.jobs + deps.remediation_jobs;
-    return confirm({
+    const reportsTotal = deps.job_runs + deps.remediation_runs;
+    const playbooksTotal = deps.playbooks ?? 0;
+    const selected = await confirmChoices({
       title: t("common.confirm"),
       message:
         options.name != null
-          ? t("profiles.deleteCascadeConfirm", {
-              name: options.name,
-              jobs: jobsTotal,
-              runs: deps.job_runs + deps.remediation_runs,
-              results: deps.check_results,
-              waivers: deps.waivers,
-            })
-          : t("profiles.bulkDeleteCascadeConfirm", {
-              count: options.count ?? 0,
-              jobs: jobsTotal,
-              runs: deps.job_runs + deps.remediation_runs,
-              results: deps.check_results,
-              waivers: deps.waivers,
-            }),
-      subtitle: t("profiles.deleteCascadeWarning"),
-      confirmLabel: t("profiles.deleteCascadeAction"),
+          ? t("profiles.deleteWithChoices", { name: options.name })
+          : t("profiles.bulkDeleteWithChoices", { count: options.count ?? 0 }),
+      subtitle: t("profiles.deleteChoicesHint"),
+      confirmLabel: t("profiles.deleteConfirmAction"),
       cancelLabel: t("common.cancel"),
       variant: "danger",
+      choices: [
+        {
+          id: "playbooks",
+          label: t("profiles.deleteChoicePlaybooks", { count: playbooksTotal }),
+          hint: t("profiles.deleteChoicePlaybooksHint"),
+          defaultChecked: playbooksTotal > 0,
+          disabled: playbooksTotal === 0,
+        },
+        {
+          id: "jobs",
+          label: t("profiles.deleteChoiceJobs", { count: jobsTotal }),
+          hint: t("profiles.deleteChoiceJobsHint"),
+          defaultChecked: jobsTotal > 0,
+          disabled: jobsTotal === 0,
+        },
+        {
+          id: "reports",
+          label: t("profiles.deleteChoiceReports", { count: reportsTotal }),
+          hint: t("profiles.deleteChoiceReportsHint"),
+          defaultChecked: reportsTotal > 0,
+          disabled: reportsTotal === 0,
+        },
+      ],
     });
+    if (!selected) return null;
+    const deleteJobs = Boolean(selected.jobs);
+    return {
+      delete_playbooks: Boolean(selected.playbooks),
+      delete_jobs: deleteJobs,
+      // Runs are removed with jobs; keep the reports flag only when jobs are kept.
+      delete_reports: deleteJobs || Boolean(selected.reports),
+    };
   };
 
   const runBulkAction = async (
@@ -259,73 +294,71 @@ export function ProfilesPage() {
   ) => {
     const ids = Array.from(selectedProfileIds);
     if (ids.length === 0) return;
+
+    let deleteOptions: ProfileDeleteOptions | undefined;
     if (action === "delete") {
-      const ok = await confirm({
-        title: t("common.confirm"),
-        message: t("profiles.bulkDeleteConfirm", { count: ids.length }),
-        variant: "danger",
-        confirmLabel: t("common.delete"),
-      });
-      if (!ok) return;
+      try {
+        const depsList = await Promise.all(ids.map((id) => api.getProfileDependencies(id)));
+        const aggregated: ProfileDependencies = {
+          jobs: 0,
+          remediation_jobs: 0,
+          waivers: 0,
+          playbooks: 0,
+          job_runs: 0,
+          check_results: 0,
+          remediation_runs: 0,
+          active_runs: 0,
+        };
+        for (const deps of depsList) {
+          aggregated.jobs += deps.jobs;
+          aggregated.remediation_jobs += deps.remediation_jobs;
+          aggregated.waivers += deps.waivers;
+          aggregated.playbooks += deps.playbooks ?? 0;
+          aggregated.job_runs += deps.job_runs;
+          aggregated.check_results += deps.check_results;
+          aggregated.remediation_runs += deps.remediation_runs;
+          aggregated.active_runs += deps.active_runs;
+        }
+        if (aggregated.active_runs > 0) {
+          toast.error(t("profiles.deleteActiveRunsBlock"));
+          return;
+        }
+        if (hasDeleteDependencies(aggregated)) {
+          const chosen = await confirmProfileDeleteChoices(aggregated, { count: ids.length });
+          if (!chosen) return;
+          deleteOptions = chosen;
+        } else {
+          const ok = await confirm({
+            title: t("common.confirm"),
+            message: t("profiles.bulkDeleteConfirm", { count: ids.length }),
+            variant: "danger",
+            confirmLabel: t("common.delete"),
+          });
+          if (!ok) return;
+          deleteOptions = {
+            delete_playbooks: false,
+            delete_jobs: false,
+            delete_reports: false,
+          };
+        }
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : t("toast.genericError"));
+        return;
+      }
     }
+
     setBulkPending(true);
     try {
-      let result =
+      const result =
         action === "enable"
           ? await api.bulkEnableProfiles(ids)
           : action === "disable"
             ? await api.bulkDisableProfiles(ids)
             : action === "delete"
-              ? await api.bulkDeleteProfiles(ids)
+              ? await api.bulkDeleteProfiles(ids, deleteOptions)
               : await api.bulkSyncProfiles(ids);
 
       if (action === "delete") {
-        const blocked = result.failed.filter(
-          (item) => item.code === "profile_has_dependencies" && item.dependencies
-        );
-        if (blocked.length > 0) {
-          const aggregated: ProfileDependencies = {
-            jobs: 0,
-            remediation_jobs: 0,
-            waivers: 0,
-            job_runs: 0,
-            check_results: 0,
-            remediation_runs: 0,
-            active_runs: 0,
-          };
-          for (const item of blocked) {
-            const deps = item.dependencies!;
-            aggregated.jobs += deps.jobs;
-            aggregated.remediation_jobs += deps.remediation_jobs;
-            aggregated.waivers += deps.waivers;
-            aggregated.job_runs += deps.job_runs;
-            aggregated.check_results += deps.check_results;
-            aggregated.remediation_runs += deps.remediation_runs;
-            aggregated.active_runs += deps.active_runs;
-          }
-          if (aggregated.active_runs > 0) {
-            toast.error(t("profiles.deleteActiveRunsBlock"));
-            invalidateAfterProfileDelete();
-            setSelectedProfileIds(new Set());
-            return;
-          }
-          const cascadeOk = await confirmCascadeDelete(aggregated, {
-            count: blocked.length,
-          });
-          if (cascadeOk) {
-            const cascadeResult = await api.bulkDeleteProfiles(
-              blocked.map((item) => item.profile_id),
-              { cascade: true }
-            );
-            result = {
-              succeeded: [...result.succeeded, ...cascadeResult.succeeded],
-              failed: [
-                ...result.failed.filter((item) => item.code !== "profile_has_dependencies"),
-                ...cascadeResult.failed,
-              ],
-            };
-          }
-        }
         invalidateAfterProfileDelete();
       } else {
         queryClient.invalidateQueries({ queryKey: ["profiles"] });
@@ -773,8 +806,8 @@ export function ProfilesPage() {
   });
 
   const deleteMutation = useMutation({
-    mutationFn: ({ id, cascade }: { id: number; cascade: boolean }) =>
-      api.deleteProfile(id, { cascade }),
+    mutationFn: ({ id, options }: { id: number; options: ProfileDeleteOptions }) =>
+      api.deleteProfile(id, options),
     onSuccess: (_data, variables) => {
       invalidateAfterProfileDelete();
       if (activeProfileId === variables.id) {
@@ -794,9 +827,9 @@ export function ProfilesPage() {
         return;
       }
       if (hasDeleteDependencies(deps)) {
-        const ok = await confirmCascadeDelete(deps, { name });
-        if (!ok) return;
-        deleteMutation.mutate({ id, cascade: true });
+        const options = await confirmProfileDeleteChoices(deps, { name });
+        if (!options) return;
+        deleteMutation.mutate({ id, options });
         return;
       }
       const ok = await confirm({
@@ -806,7 +839,10 @@ export function ProfilesPage() {
         variant: "danger",
       });
       if (!ok) return;
-      deleteMutation.mutate({ id, cascade: false });
+      deleteMutation.mutate({
+        id,
+        options: { delete_playbooks: false, delete_jobs: false, delete_reports: false },
+      });
     } catch (err) {
       toast.error(err instanceof Error ? err.message : t("toast.genericError"));
     }

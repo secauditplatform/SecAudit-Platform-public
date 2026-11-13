@@ -39,3 +39,4 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.beat.resources | nindent 12 }}
+          {{- include "secaudit.celeryLivenessProbe" . | nindent 10 }}

@@ -40,6 +40,14 @@ export function IconPlatformOverview({ className }: IconProps) {
   );
 }
 
+export function IconSystemHealth({ className }: IconProps) {
+  return (
+    <StrokeIcon className={className}>
+      <path d="M22 12h-4l-3 7L9 5l-3 7H2" />
+    </StrokeIcon>
+  );
+}
+
 export function IconTemplates({ className }: IconProps) {
   return (
     <StrokeIcon className={className}>

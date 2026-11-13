@@ -67,14 +67,18 @@ from app.executors.python_exec import (
     run_script_locally_with_resource_env,
     run_script_over_ssh as run_script_over_python,
 )
-from app.executors.ssh import run_script_over_ssh
+from app.executors.ssh import run_package_script_over_ssh, run_script_over_ssh
 from app.executors.winrm_exec import run_script_over_winrm
 from app.executors.network_exec import fetch_running_config
+from app.host_lock_guard import hold_host_lock, host_tcp_ready, wrap_process_host
 from app.host_parallel import run_hosts_parallel
 from secaudit_core.connectivity_playbook import upgrade_connectivity_check_content
 from app.logging_pub import publish_job_log
 from app.notify import emit_run_notification
 from secaudit_core.credential_auth import ssh_auth_from_credential
+from secaudit_core.drift_alert import detect_compliance_regression
+from secaudit_core.enums import NotificationEventType
+from secaudit_core.notifications import enqueue_run_notification
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.service_credentials import service_env_from_credential
 from secaudit_core.result_upsert import upsert_check_result
@@ -85,6 +89,101 @@ from secaudit_core.task_outbox import enqueue_outbox_row
 engine = create_engine(settings.database_url_sync)
 SessionLocal = sessionmaker(bind=engine)
 logger = logging.getLogger(__name__)
+
+
+HOST_BUSY_MESSAGE = "Host locked by another job or remediation run"
+HOST_UNREACHABLE_RULE = "HOST_UNREACHABLE"
+
+
+def _skip_host_busy(job_run_id: int, host: Host) -> tuple[int, list[str]]:
+    with SessionLocal() as host_db:
+        publish_job_log(
+            job_run_id,
+            f"SKIP [{host.name}]: {HOST_BUSY_MESSAGE}",
+            level="warning",
+        )
+        upsert_check_result(
+            host_db,
+            job_run_id=job_run_id,
+            host_id=host.id,
+            rule_tech_name="HOST_BUSY",
+            status=CheckStatus.SKIP,
+            message=HOST_BUSY_MESSAGE,
+        )
+        host_db.commit()
+    return 1, []
+
+
+def _skip_host_unreachable(
+    job_run_id: int, host: Host, detail: str
+) -> tuple[int, list[str]]:
+    message = f"Host unreachable before run: {detail}"
+    with SessionLocal() as host_db:
+        publish_job_log(
+            job_run_id,
+            f"SKIP [{host.name}]: {message}",
+            level="warning",
+        )
+        upsert_check_result(
+            host_db,
+            job_run_id=job_run_id,
+            host_id=host.id,
+            rule_tech_name=HOST_UNREACHABLE_RULE,
+            status=CheckStatus.SKIP,
+            message=message[:500],
+        )
+        host_db.commit()
+    return 1, []
+
+
+def _locked_process_host(job_run_id: int, process_host):
+    return wrap_process_host(
+        settings,
+        process_host,
+        label=f"job_run:{job_run_id}",
+        on_busy=lambda host: _skip_host_busy(job_run_id, host),
+        on_unreachable=lambda host, detail: _skip_host_unreachable(
+            job_run_id, host, detail
+        ),
+    )
+
+
+def _emit_compliance_regression_if_needed(
+    db: Session,
+    *,
+    job: Job,
+    job_run_id: int,
+) -> None:
+    if not job.baseline_run_id:
+        return
+    baseline_checks = list(
+        db.execute(
+            select(CheckResult).where(CheckResult.job_run_id == job.baseline_run_id)
+        ).scalars()
+    )
+    current_checks = list(
+        db.execute(select(CheckResult).where(CheckResult.job_run_id == job_run_id)).scalars()
+    )
+    regressed, detail = detect_compliance_regression(
+        baseline_checks,
+        current_checks,
+        baseline_run_id=job.baseline_run_id,
+        current_run_id=job_run_id,
+    )
+    if not regressed:
+        return
+    enqueue_run_notification(
+        broker_url=settings.celery_broker_url,
+        settings=settings,
+        trigger_events=[NotificationEventType.COMPLIANCE_REGRESSED.value],
+        run_kind="job",
+        run_id=job_run_id,
+        job_id=job.id,
+        job_name=job.name,
+        status=JobStatus.COMPLETED.value,
+        error_message=detail,
+        owner_sub=job.owner_sub,
+    )
 
 
 def _raw_output_limit() -> int:
@@ -121,8 +220,9 @@ def _allowed_rule_names(version: ProfileVersion | None) -> set[str] | None:
     for requirement_id in version.requirement_ids or []:
         name = str(requirement_id)
         allowed.add(name)
-        # SCAP results use Rule.tech_name, which is truncated to 64 characters.
-        allowed.add(name[:64])
+        # Legacy Rule.tech_name rows may still be truncated to 64 characters.
+        if len(name) > 64:
+            allowed.add(name[:64])
     return allowed
 
 
@@ -144,7 +244,12 @@ def _remember_profile_snapshot(
     profile = db.get(Profile, job.profile_id)
     if profile is None:
         return version
-    snapshot = profile_snapshot_from_profile(profile, version)
+    rule_names = list(
+        db.execute(select(Rule.tech_name).where(Rule.profile_id == profile.id)).scalars().all()
+    )
+    snapshot = profile_snapshot_from_profile(
+        profile, version, all_rule_tech_names=rule_names
+    )
     db.execute(
         update(JobRun)
         .where(JobRun.id == job_run.id, JobRun.profile_snapshot.is_(None))
@@ -260,7 +365,22 @@ def _load_interpreter_rules(db: Session, script: CheckScript) -> list[dict]:
     return []
 
 
-def _resolve_hosts(db: Session, job: Job) -> list[Host]:
+def _assert_demo_exec_hosts(hosts: list[Host]) -> None:
+    if not getattr(settings, "demo_mode", False) or not hosts:
+        return
+    from secaudit_core.demo_exec_guard import assert_hostnames_in_demo_cidrs
+
+    assert_hostnames_in_demo_cidrs(
+        [host.hostname for host in hosts],
+        allowed_cidrs_raw=getattr(settings, "demo_exec_allowed_cidrs", ""),
+    )
+
+
+def _resolve_hosts(db: Session, job: Job, job_run: JobRun | None = None) -> list[Host]:
+    if job_run is not None and job_run.host_ids:
+        hosts = load_active_hosts(db, [int(host_id) for host_id in job_run.host_ids])
+        _assert_demo_exec_hosts(hosts)
+        return hosts
     host_ids = resolve_job_targets(
         db,
         job.id,
@@ -268,10 +388,20 @@ def _resolve_hosts(db: Session, job: Job) -> list[Host]:
         owner_sub=job.owner_sub,
         enforce_owner_scope=job.enforce_host_owner_scope,
     )
-    return load_active_hosts(db, host_ids)
+    hosts = load_active_hosts(db, host_ids)
+    # Snapshot the full target set on the run so reports know which hosts were intended.
+    if job_run is not None and job_run.host_ids is None and hosts:
+        job_run.host_ids = [host.id for host in hosts]
+        db.flush()
+    _assert_demo_exec_hosts(hosts)
+    return hosts
 
 
 def _is_run_cancelled(db: Session, job_run_id: int) -> bool:
+    from secaudit_core.run_cancel import is_run_cancel_requested
+
+    if is_run_cancel_requested(settings.redis_url, "job", job_run_id):
+        return True
     return current_run_status(db, JobRun, job_run_id) == JobStatus.CANCELLED
 
 
@@ -428,6 +558,14 @@ def _run_with_progress_logs(
     return result["value"]
 
 
+def _package_has_sidecars(package_dir: Path, script_path: Path) -> bool:
+    script_resolved = script_path.resolve()
+    for path in package_dir.rglob("*"):
+        if path.is_file() and path.resolve() != script_resolved:
+            return True
+    return False
+
+
 def _execute_check(
     host: Host,
     script_path: Path,
@@ -435,6 +573,8 @@ def _execute_check(
     job_run_id: int,
     *,
     extra_env: dict[str, str] | None = None,
+    package_dir: Path | None = None,
+    script_file: str | None = None,
 ) -> str:
     creds = linked_credentials(host)
     cred = creds[0] if creds else None
@@ -447,6 +587,12 @@ def _execute_check(
 
     publish_job_log(job_run_id, f"[{host.name}] Running {execution_type.value}: {script_path.name}")
     known_hosts_entry = _host_known_hosts_entry(host)
+    use_package = bool(
+        package_dir
+        and script_file
+        and package_dir.is_dir()
+        and _package_has_sidecars(package_dir, script_path)
+    )
 
     def _dispatch() -> str:
         if execution_type == ExecutionType.SSH:
@@ -456,6 +602,19 @@ def _execute_check(
             last_error: Exception | None = None
             for attempt_cred, attempt_user, password, private_key, key_passphrase in attempts:
                 try:
+                    if use_package:
+                        return run_package_script_over_ssh(
+                            hostname=host.hostname.strip(),
+                            port=host.port,
+                            username=attempt_user,
+                            password=password,
+                            private_key=private_key,
+                            package_dir=package_dir,
+                            script_file=script_file,
+                            known_hosts_entry=known_hosts_entry,
+                            key_passphrase=key_passphrase,
+                            extra_env=extra_env,
+                        )
                     return run_script_over_ssh(
                         hostname=host.hostname.strip(),
                         port=host.port,
@@ -477,13 +636,14 @@ def _execute_check(
             raise last_error or ValueError("SSH authentication failed for all linked credentials")
 
         if execution_type == ExecutionType.WINRM:
-            if not cred or cred.credential_type != CredentialType.WINRM:
+            winrm_cred = next((item for item in creds if item.credential_type == CredentialType.WINRM), None)
+            if not winrm_cred:
                 raise ValueError("WinRM checks require winrm credential")
             return run_script_over_winrm(
                 hostname=host.hostname.strip(),
                 port=host.port,
-                username=username,
-                password=secret,
+                username=winrm_cred.username or "root",
+                password=_credential_secret(winrm_cred),
                 script_path=script_path,
                 server_cert_validation=settings.winrm_server_cert_validation_effective,
                 extra_env=extra_env,
@@ -762,6 +922,8 @@ def _run_scap_profile_job(
                         audit_script.execution_type,
                         job_run_id,
                         extra_env=service_env or None,
+                        package_dir=package_dir,
+                        script_file=audit_script.script_file,
                     )
                     script_parsed = apply_interpreter_rules(output, rules)
                 except InterruptedError:
@@ -813,8 +975,8 @@ def _run_scap_profile_job(
 
     host_results = run_hosts_parallel(
         hosts,
-        settings.job_host_concurrency,
-        process_host,
+        settings.job_host_concurrency_for(len(hosts)),
+        _locked_process_host(job_run_id, process_host),
         should_cancel=lambda: _is_run_cancelled(db, job_run_id),
     )
     results_count = sum(count for count, _ in host_results)
@@ -823,10 +985,10 @@ def _run_scap_profile_job(
 
 
 def _playbook_credentials(host: Host) -> dict | None:
-    if not host.credential:
+    cred = _primary_credential(host)
+    if not cred:
         return None
 
-    cred = host.credential
     secret = _credential_secret(cred)
     credentials: dict[str, str] = {}
     if cred.username:
@@ -892,7 +1054,7 @@ def _run_playbook_job(
             if _is_run_cancelled(host_db, job_run_id):
                 raise InterruptedError("Job run cancelled")
 
-            if not host.credential:
+            if not linked_credentials(host):
                 message = f"Host '{host.name}' has no credential assigned"
                 publish_job_log(job_run_id, f"ERROR [{host.name}]: {message}", level="error")
                 upsert_check_result(
@@ -958,8 +1120,8 @@ def _run_playbook_job(
 
     host_results = run_hosts_parallel(
         hosts,
-        settings.job_host_concurrency,
-        process_host,
+        settings.job_host_concurrency_for(len(hosts)),
+        _locked_process_host(job_run_id, process_host),
         should_cancel=lambda: _is_run_cancelled(db, job_run_id),
     )
     results_count = sum(count for count, _ in host_results)
@@ -1074,6 +1236,8 @@ def _run_profile_job(
                             script.execution_type,
                             job_run_id,
                             extra_env=merged_env,
+                            package_dir=package_dir,
+                            script_file=script.script_file,
                         )
                     except InterruptedError:
                         raise
@@ -1130,8 +1294,8 @@ def _run_profile_job(
 
     host_results = run_hosts_parallel(
         hosts,
-        settings.job_host_concurrency,
-        process_host,
+        settings.job_host_concurrency_for(len(hosts)),
+        _locked_process_host(job_run_id, process_host),
         should_cancel=lambda: _is_run_cancelled(db, job_run_id),
     )
     results_count = sum(count for count, _ in host_results)
@@ -1156,64 +1320,110 @@ def _run_network_compliance_job(
     for host in hosts:
         if _is_run_cancelled(db, job_run.id):
             break
-        host_configs = [c for c in configs if c.host_id in (None, host.id)]
-        config_text: str | None = None
-        vendor: NetworkVendor = NetworkVendor.GENERIC
-
-        if mode in {NetworkCheckMode.CONFIG_UPLOAD, NetworkCheckMode.BOTH} and host_configs:
-            latest = host_configs[0]
-            config_text = latest.content
-            vendor = latest.vendor
-            publish_job_log(job_run.id, f"Parsing uploaded config for {host.name} ({latest.filename})")
-
-        if config_text is None and mode in {NetworkCheckMode.REMOTE, NetworkCheckMode.BOTH}:
-            if not host.credential:
-                errors.append(f"{host.name}: no credential for remote check")
+        ok, detail = host_tcp_ready(host)
+        if not ok:
+            skipped, _ = _skip_host_unreachable(job_run.id, host, detail)
+            results_count += skipped
+            continue
+        with hold_host_lock(settings, host.id, label=f"job_run:{job_run.id}") as acquired:
+            if not acquired:
+                skipped, _ = _skip_host_busy(job_run.id, host)
+                results_count += skipped
                 continue
-            cred = host.credential
+            host_results, host_errors = _network_compliance_for_host(
+                db,
+                job=job,
+                job_run=job_run,
+                host=host,
+                configs=configs,
+                mode=mode,
+                allowed=allowed,
+            )
+            results_count += host_results
+            errors.extend(host_errors)
+
+    db.commit()
+    return results_count, errors
+
+
+def _network_compliance_for_host(
+    db: Session,
+    *,
+    job: Job,
+    job_run: JobRun,
+    host: Host,
+    configs: list,
+    mode: NetworkCheckMode,
+    allowed: set[str] | None,
+) -> tuple[int, list[str]]:
+    results_count = 0
+    errors: list[str] = []
+    host_configs = [c for c in configs if c.host_id in (None, host.id)]
+    config_text: str | None = None
+    vendor: NetworkVendor = NetworkVendor.GENERIC
+
+    if mode in {NetworkCheckMode.CONFIG_UPLOAD, NetworkCheckMode.BOTH} and host_configs:
+        latest = host_configs[0]
+        config_text = latest.content
+        vendor = latest.vendor
+        publish_job_log(job_run.id, f"Parsing uploaded config for {host.name} ({latest.filename})")
+
+    if config_text is None and mode in {NetworkCheckMode.REMOTE, NetworkCheckMode.BOTH}:
+        password_creds = [
+            cred
+            for cred in linked_credentials(host)
+            if cred.credential_type == CredentialType.SSH_PASSWORD
+        ]
+        if not password_creds:
+            return 0, [f"{host.name}: remote network check requires ssh_password credential"]
+        vendor = NetworkVendor.GENERIC
+        if host_configs:
+            vendor = host_configs[0].vendor
+        last_error: Exception | None = None
+        for cred in password_creds:
             secret = _credential_secret(cred)
             username = cred.username or "admin"
-            password = secret if cred.credential_type == CredentialType.SSH_PASSWORD else None
-            if not password:
-                errors.append(f"{host.name}: remote network check requires ssh_password credential")
-                continue
             try:
-                vendor = NetworkVendor.GENERIC
-                if host_configs:
-                    vendor = host_configs[0].vendor
                 config_text = fetch_running_config(
                     hostname=host.hostname.strip(),
                     port=host.port,
                     username=username,
-                    password=password,
+                    password=secret,
                     vendor=vendor,
                 )
                 publish_job_log(job_run.id, f"Fetched running-config from {host.name} via Netmiko")
+                last_error = None
+                break
             except Exception as exc:
                 reraise_if_transient(exc)
-                errors.append(f"{host.name}: remote fetch failed: {exc}")
-                continue
+                last_error = exc
+                publish_job_log(
+                    job_run.id,
+                    f"[{host.name}] Netmiko auth failed with {cred.name}: {exc}",
+                    level="warning",
+                )
+        if last_error is not None:
+            return 0, [f"{host.name}: remote fetch failed: {last_error}"]
 
-        if not config_text:
-            errors.append(f"{host.name}: no configuration available (upload config or enable remote mode)")
+    if not config_text:
+        return 0, [
+            f"{host.name}: no configuration available (upload config or enable remote mode)"
+        ]
+
+    parsed = parse_network_config(config_text, vendor)
+    for check in parsed.checks:
+        if allowed is not None and check.rule_tech_name not in allowed:
             continue
-
-        parsed = parse_network_config(config_text, vendor)
-        for check in parsed.checks:
-            if allowed is not None and check.rule_tech_name not in allowed:
-                continue
-            upsert_check_result(
-                db,
-                job_run_id=job_run.id,
-                host_id=host.id,
-                rule_tech_name=check.rule_tech_name,
-                status=check.status,
-                message=check.message,
-                raw_output=config_text[:2000],
-            )
-            results_count += 1
-
-    db.commit()
+        upsert_check_result(
+            db,
+            job_run_id=job_run.id,
+            host_id=host.id,
+            rule_tech_name=check.rule_tech_name,
+            status=check.status,
+            message=check.message,
+            raw_output=config_text[:2000],
+        )
+        results_count += 1
     return results_count, errors
 
 
@@ -1230,6 +1440,8 @@ def heartbeat() -> str:
 )
 def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_kwargs) -> dict:
     check_mode = bool(_kwargs.get("check_mode", False))
+    already_claimed = bool(_kwargs.get("_already_claimed"))
+    limits_scaled = bool(_kwargs.get("_limits_scaled"))
     set_current_span_attributes(
         {
             "secaudit.job_run_id": job_run_id,
@@ -1262,7 +1474,15 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
         return {"error": "job_run not found"}
 
     with SessionLocal() as db:
-        if not claim_pending_run(db, JobRun, job_run_id):
+        if already_claimed:
+            status = current_run_status(db, JobRun, job_run_id)
+            if status != JobStatus.RUNNING:
+                return {
+                    "job_run_id": job_run_id,
+                    "status": status.value if status else "not_found",
+                    "claimed": False,
+                }
+        elif not claim_pending_run(db, JobRun, job_run_id):
             status = current_run_status(db, JobRun, job_run_id)
             return {
                 "job_run_id": job_run_id,
@@ -1293,9 +1513,16 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
 
         version = _remember_profile_snapshot(db, job, job_run)
         allowed = _allowed_rule_names(version)
-        publish_job_log(job_run_id, f"Job run #{job_run_id} started")
+        if not already_claimed:
+            publish_job_log(job_run_id, f"Job run #{job_run_id} started")
 
-        hosts = _resolve_hosts(db, job)
+        hosts = _resolve_hosts(db, job, job_run)
+        if job_run.is_partial:
+            publish_job_log(
+                job_run_id,
+                f"Partial run ({job_run.subset_kind or 'selected'}): "
+                f"{len(hosts)} host(s) from source run #{job_run.source_run_id}",
+            )
         if not hosts:
             publish_job_log(job_run_id, "No hosts available", level="error")
             transition_running_run(
@@ -1318,6 +1545,54 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
             )
             return {"error": "no hosts"}
 
+        concurrency = settings.job_host_concurrency_for(len(hosts))
+        needed_soft = settings.job_soft_time_limit_for_hosts(len(hosts))
+        current_soft = None
+        if self.request.timelimit:
+            current_soft = self.request.timelimit[0] or self.request.timelimit[1]
+        if current_soft is None:
+            current_soft = settings.celery_task_soft_time_limit
+        if not limits_scaled and needed_soft > int(current_soft):
+            publish_job_log(
+                job_run_id,
+                f"Rescaling soft time limit for {len(hosts)} host(s): "
+                f"{int(current_soft)}s → {needed_soft}s (concurrency={concurrency})",
+            )
+            child_kwargs = {
+                key: value
+                for key, value in _kwargs.items()
+                if not str(key).startswith("_")
+            }
+            child_kwargs["connection_mode"] = connection_mode
+            child_kwargs["_already_claimed"] = True
+            child_kwargs["_limits_scaled"] = True
+            async_result = self.apply_async(
+                args=[job_run_id],
+                kwargs=child_kwargs,
+                soft_time_limit=needed_soft,
+                time_limit=needed_soft + 300,
+            )
+            if getattr(job_run, "celery_task_id", None) is not None:
+                job_run.celery_task_id = async_result.id
+                db.commit()
+            return {
+                "job_run_id": job_run_id,
+                "status": "rescaled",
+                "soft_time_limit": needed_soft,
+                "celery_task_id": async_result.id,
+            }
+
+        publish_job_log(
+            job_run_id,
+            f"Host pool: {len(hosts)} host(s), concurrency={concurrency}, "
+            f"soft_time_limit={needed_soft}s",
+        )
+
+        from app.cancel_context import active_run_scope
+        from secaudit_core.run_cancel import clear_run_cancel_state
+
+        active_run_cm = active_run_scope("job", job_run_id)
+        active_run_cm.__enter__()
         try:
             if job.scope == JobScope.NETWORK:
                 if job.profile_id:
@@ -1363,8 +1638,8 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
                 raise ValueError("Job has no profile_id or playbook_id")
 
             if _is_run_cancelled(db, job_run_id):
+                transition_running_run(db, JobRun, job_run_id, JobStatus.CANCELLED)
                 publish_job_log(job_run_id, "Job run cancelled")
-                db.commit()
                 return {"job_run_id": job_run_id, "status": JobStatus.CANCELLED.value}
 
             error_results = db.execute(
@@ -1408,6 +1683,8 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
                 error_message=job_run.error_message,
                 owner_sub=job.owner_sub,
             )
+            if final_status == JobStatus.COMPLETED:
+                _emit_compliance_regression_if_needed(db, job=job, job_run_id=job_run_id)
             return {"job_run_id": job_run_id, "status": job_run.status.value}
 
         except InterruptedError:
@@ -1435,6 +1712,9 @@ def run_compliance_job(self, job_run_id: int, connection_mode: str = "auto", **_
                 owner_sub=job.owner_sub,
             )
             return {"job_run_id": job_run_id, "status": "failed", "error": str(exc)}
+        finally:
+            active_run_cm.__exit__(None, None, None)
+            clear_run_cancel_state(settings.redis_url, "job", job_run_id)
 
 
 @celery_app.task(name="app.tasks.compliance.run_scheduled_jobs")

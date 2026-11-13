@@ -105,7 +105,7 @@ class SearchResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     app_name: str
-    version: str = "0.1.0"
+    version: str = "1.9.0"
 
 
 class ComponentHealth(BaseModel):
@@ -116,8 +116,23 @@ class ComponentHealth(BaseModel):
 class ReadinessResponse(BaseModel):
     status: Literal["ok", "error"]
     app_name: str
-    version: str = "0.1.0"
+    version: str = "1.9.0"
     components: dict[str, ComponentHealth]
+
+
+class SystemHealthResponse(BaseModel):
+    status: Literal["ok", "error"]
+    components: dict[str, ComponentHealth]
+    queues: dict[str, int]
+    retention_days: int
+
+
+class SystemHealthSettingsUpdate(BaseModel):
+    retention_days: int = Field(ge=0, le=3650)
+
+
+class SystemHealthSettingsRead(BaseModel):
+    retention_days: int
 
 
 # --- Categories ---
@@ -174,6 +189,9 @@ class ProfileRead(ProfileBase):
     category_name: str | None = None
     package_version: str | None = None
     needs_update: bool = False
+    rules_count: int = 0
+    audit_scripts_count: int = 0
+    remediation_scripts_count: int = 0
 
 
 class InterpreterRuleRead(BaseModel):
@@ -350,6 +368,7 @@ class ProfileDependencies(BaseModel):
     jobs: int = 0
     remediation_jobs: int = 0
     waivers: int = 0
+    playbooks: int = 0
     job_runs: int = 0
     check_results: int = 0
     remediation_runs: int = 0
@@ -357,12 +376,33 @@ class ProfileDependencies(BaseModel):
 
     @property
     def has_blocking(self) -> bool:
-        return self.jobs > 0 or self.remediation_jobs > 0 or self.waivers > 0
+        return (
+            self.jobs > 0
+            or self.remediation_jobs > 0
+            or self.waivers > 0
+            or self.playbooks > 0
+        )
+
+    @property
+    def reports(self) -> int:
+        """Runs that appear under Reports for this profile's jobs."""
+        return self.job_runs + self.remediation_runs
+
+
+class ProfileDeleteOptions(BaseModel):
+    """What else to remove with the profile. Unchecked items are detached/kept."""
+
+    delete_playbooks: bool = False
+    delete_jobs: bool = False
+    delete_reports: bool = False
 
 
 class ProfilesBulkActionRequest(BaseModel):
     profile_ids: list[int]
     cascade: bool = False
+    delete_playbooks: bool | None = None
+    delete_jobs: bool | None = None
+    delete_reports: bool | None = None
 
 
 class ProfilesBulkActionError(BaseModel):
@@ -405,14 +445,16 @@ def _normalize_host_label(value: str | None, *, max_len: int) -> str | None:
 
 
 def _validate_host_address(value: str) -> str:
-    """Reject dotted-numeric typos like 1921.68.1.223 before they reach ssh-keyscan."""
-    cleaned = value.strip()
-    if "." in cleaned and all(ch.isdigit() or ch == "." for ch in cleaned):
-        try:
-            ipaddress.ip_address(cleaned)
-        except ValueError as exc:
+    """Accept IPv4/IPv6 or a DNS hostname; reject typos and shell metacharacters."""
+    from secaudit_core.ssh_fingerprint import validate_ssh_scan_host
+
+    try:
+        return validate_ssh_scan_host(value)
+    except ValueError as exc:
+        cleaned = (value or "").strip()
+        if "." in cleaned and all(ch.isdigit() or ch == "." for ch in cleaned):
             raise ValueError("Hostname looks like an IP address but is not valid") from exc
-    return cleaned
+        raise ValueError("Hostname must be a valid IP address or DNS name") from exc
 
 
 class HostBase(BaseModel):
@@ -517,6 +559,56 @@ class HostRead(HostBase):
     ssh_host_key_fingerprint: str | None = None
     credential_ids: list[int] = Field(default_factory=list)
     linked_credentials: list[HostLinkedCredentialRead] = Field(default_factory=list)
+
+
+class HostsSummary(BaseModel):
+    total: int
+    active: int
+    inactive: int
+
+
+class PreflightCheckResult(BaseModel):
+    name: str
+    status: Literal["ok", "fail", "skip"]
+    detail: str | None = None
+
+
+class PreflightProbeResponse(BaseModel):
+    ok: bool
+    target: str
+    credential_id: int | None = None
+    platform: str | None = None
+    checks: list[PreflightCheckResult] = Field(default_factory=list)
+    duration_ms: int = 0
+    error: str | None = None
+
+
+class CredentialProbeRequest(BaseModel):
+    host_id: int
+
+
+class ProfileApplicabilityRequest(BaseModel):
+    host_ids: list[int] = Field(default_factory=list)
+    profile_version_id: int | None = None
+
+
+class ProfileApplicabilityHost(BaseModel):
+    host_id: int
+    host_name: str
+    os_type: str | None = None
+    applicable: bool
+    reason: str | None = None
+
+
+class ProfileApplicabilityResponse(BaseModel):
+    profile_id: int
+    profile_name: str
+    profile_platform: str
+    rules_count: int
+    hosts_total: int
+    hosts_applicable: int
+    hosts_inapplicable: int
+    hosts: list[ProfileApplicabilityHost] = Field(default_factory=list)
 
 
 class HostSshFingerprintScanResponse(BaseModel):
@@ -1033,7 +1125,7 @@ class JobUpdate(BaseModel):
     is_active: bool | None = None
     scope: JobScope | None = None
     network_check_mode: NetworkCheckMode | None = None
-    host_ids: list[int] | None = Field(default=None, min_length=1)
+    host_ids: list[int] | None = None
     webhook_enabled: bool | None = None
     webhook_events: list[NotificationEventType] | None = None
     webhook_url: str | None = None
@@ -1043,6 +1135,12 @@ class JobUpdate(BaseModel):
     @classmethod
     def validate_cron(cls, value: str | None) -> str | None:
         return validate_cron_expression(value)
+
+    @model_validator(mode="after")
+    def require_hosts_or_dynamic_filter(self) -> "JobUpdate":
+        if self.host_ids == [] and self.dynamic_filter is None:
+            raise ValueError("host_ids or dynamic_filter is required")
+        return self
 
 
 class JobRead(JobBase):
@@ -1237,6 +1335,25 @@ class JobRunRead(BaseModel):
     error_message: str | None
     created_at: datetime
     check_mode: bool = False
+    host_ids: list[int] | None = None
+    is_partial: bool = False
+    subset_kind: Literal["failed", "skipped", "selected"] | None = None
+    source_run_id: int | None = None
+
+
+class JobRunRerunRequest(BaseModel):
+    """Restart a finished run for all hosts, failures, skips, or a manual subset."""
+
+    subset: Literal["failed", "skipped", "selected", "all"] = "failed"
+    host_ids: list[int] | None = None
+
+
+class JobRunRerunTargets(BaseModel):
+    source_run_id: int
+    is_partial: bool = False
+    host_ids: list[int] = Field(default_factory=list)
+    failed_host_ids: list[int] = Field(default_factory=list)
+    skipped_host_ids: list[int] = Field(default_factory=list)
 
 
 class CveRefRead(BaseModel):
@@ -1312,7 +1429,7 @@ class RemediationJobUpdate(BaseModel):
     cron_expression: str | None = None
     is_scheduled: bool | None = None
     is_active: bool | None = None
-    host_ids: list[int] | None = Field(default=None, min_length=1)
+    host_ids: list[int] | None = None
     webhook_enabled: bool | None = None
     webhook_events: list[NotificationEventType] | None = None
     webhook_url: str | None = None
@@ -1323,6 +1440,12 @@ class RemediationJobUpdate(BaseModel):
     def validate_cron(cls, value: str | None) -> str | None:
         return validate_cron_expression(value)
 
+    @model_validator(mode="after")
+    def require_hosts_or_dynamic_filter(self) -> "RemediationJobUpdate":
+        if self.host_ids == [] and self.dynamic_filter is None:
+            raise ValueError("host_ids or dynamic_filter is required")
+        return self
+
 
 class RemediationJobRead(RemediationJobBase):
     model_config = ConfigDict(from_attributes=True)
@@ -1332,6 +1455,10 @@ class RemediationJobRead(RemediationJobBase):
     host_ids: list[int] = Field(default_factory=list)
     owner_sub: str | None = None
     has_webhook_url: bool = False
+    source_run_id: int | None = None
+    rule_tech_names: list[str] | None = None
+    check_mode: bool = False
+    auto_recheck_failed: bool = False
 
 
 class RemediationRunRead(BaseModel):
@@ -1372,6 +1499,7 @@ class RemediationRunLogEntry(BaseModel):
 
 class FailedCheckSummary(BaseModel):
     host_id: int
+    host_name: str | None = None
     rule_tech_name: str
     status: CheckStatus
     message: str | None = None
@@ -1404,6 +1532,9 @@ class RemediationFromRunRequest(BaseModel):
     remediation_script_id: int | None = None
     run_remediation: bool = True
     set_baseline: bool = True
+    rule_tech_names: list[str] | None = None
+    check_mode: bool = False
+    auto_recheck_failed: bool = True
 
 
 class RemediationFromRunResponse(BaseModel):
@@ -1412,6 +1543,21 @@ class RemediationFromRunResponse(BaseModel):
     baseline_run_id: int | None = None
     source_run_id: int
     source_job_id: int
+
+
+class RemediationWorkflowRead(BaseModel):
+    source_run_id: int
+    source_job_id: int | None = None
+    remediation_job_id: int
+    remediation_run_id: int | None = None
+    reaudit_run_id: int | None = None
+    reaudit_completed: bool = False
+    check_mode: bool = False
+    auto_recheck_failed: bool = False
+
+
+class RemediationWorkflowReauditUpdate(BaseModel):
+    reaudit_run_id: int
 
 
 # --- Users ---
@@ -1857,6 +2003,16 @@ class AuditFlowCredentialAdd(AuditFlowCredentialIn):
     host_id: int | None = None
 
 
+class AuditFlowCatalogCredentialAdd(BaseModel):
+    credential_id: int
+    host_id: int | None = None
+
+
+class AuditFlowReprobe(BaseModel):
+    host_ids: list[int] | None = None
+    credential_id: int | None = None
+
+
 class AuditFlowCreate(BaseModel):
     targets: list[StrippedStr] = Field(..., min_length=1, max_length=16)
     credentials: list[AuditFlowCredentialIn] = Field(default_factory=list, max_length=20)
@@ -1906,6 +2062,7 @@ class AuditFlowTemplateCreate(BaseModel):
     save_to_inventory: bool = False
     cron_expression: str | None = None
     is_scheduled: bool = False
+    auto_execute: bool = False
     is_active: bool = True
 
     @field_validator("cron_expression")
@@ -1939,6 +2096,7 @@ class AuditFlowTemplateUpdate(BaseModel):
     save_to_inventory: bool | None = None
     cron_expression: str | None = None
     is_scheduled: bool | None = None
+    auto_execute: bool | None = None
     is_active: bool | None = None
 
     @field_validator("cron_expression")
@@ -1968,6 +2126,7 @@ class AuditFlowTemplateRead(BaseModel):
     save_to_inventory: bool = False
     cron_expression: str | None = None
     is_scheduled: bool = False
+    auto_execute: bool = False
     last_scheduled_at: datetime | None = None
     is_active: bool = True
     owner_sub: str | None = None

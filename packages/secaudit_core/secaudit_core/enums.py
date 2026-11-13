@@ -122,6 +122,8 @@ class NotificationEventType(str, enum.Enum):
     DISPATCH_FAILED = "dispatch_failed"
     WORKER_HEARTBEAT_STALE = "worker_heartbeat_stale"
     WORKER_HEARTBEAT_RECOVERED = "worker_heartbeat_recovered"
+    COMPLIANCE_REGRESSED = "compliance_regressed"
+    WAIVER_EXPIRING = "waiver_expiring"
     AUDIT_EVENT = "audit_event"
     AUDIT_FAILED = "audit_failed"
 

@@ -3,7 +3,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import load_only, selectinload
 
 from app.models import CheckResult, CheckStatus, ComplianceWaiver, Host, Job, JobRun, JobStatus, Profile, WaiverStatus
 from app.schemas import (
@@ -21,7 +21,7 @@ from app.schemas import (
     WeekdayHeatCell,
 )
 from app.services.object_rbac import apply_owner_scope
-from app.services.reports import build_report_summary
+from app.services.reports import build_report_summary, waived_check_ids_for_runs
 
 
 def resolve_period(
@@ -47,11 +47,19 @@ def resolve_period(
     return start, end, span_days
 
 
-def build_timeline_points(runs: list, checks_by_run: dict[int, list]) -> list[ComplianceTimelinePoint]:
+def build_timeline_points(
+    runs: list,
+    checks_by_run: dict[int, list],
+    *,
+    waived_by_run: dict[int, set[int]] | None = None,
+) -> list[ComplianceTimelinePoint]:
+    waived_lookup = waived_by_run or {}
     points: list[ComplianceTimelinePoint] = []
     for run in runs:
         checks = checks_by_run.get(run.id, [])
-        summary = build_report_summary(run.id, checks)
+        summary = build_report_summary(
+            run.id, checks, waived_check_ids=waived_lookup.get(run.id)
+        )
         job_name = run.job.name if run.job else f"Job #{run.job_id}"
         points.append(
             ComplianceTimelinePoint(
@@ -68,7 +76,12 @@ def build_timeline_points(runs: list, checks_by_run: dict[int, list]) -> list[Co
     return points
 
 
-def aggregate_checks_by_host(checks: list, host_names: dict[int, str]) -> list[HostCompliancePoint]:
+def aggregate_checks_by_host(
+    checks: list,
+    host_names: dict[int, str],
+    *,
+    waived_check_ids: set[int] | None = None,
+) -> list[HostCompliancePoint]:
     by_host: dict[int, list] = defaultdict(list)
     for check in checks:
         by_host[check.host_id].append(check)
@@ -76,7 +89,7 @@ def aggregate_checks_by_host(checks: list, host_names: dict[int, str]) -> list[H
     points: list[HostCompliancePoint] = []
     for host_id in sorted(by_host.keys()):
         host_checks = by_host[host_id]
-        summary = build_report_summary(0, host_checks)
+        summary = build_report_summary(0, host_checks, waived_check_ids=waived_check_ids)
         points.append(
             HostCompliancePoint(
                 host_id=host_id,
@@ -94,14 +107,21 @@ def aggregate_profile_compliance(
     runs: list,
     checks_by_run: dict[int, list],
     profiles: dict[int, Profile],
+    *,
+    waived_by_run: dict[int, set[int]] | None = None,
 ) -> list[ProfileCompliancePoint]:
+    waived_lookup = waived_by_run or {}
     by_profile: dict[int, list[tuple[JobRun, float]]] = defaultdict(list)
 
     for run in runs:
         job = run.job
         if job is None or job.profile_id is None:
             continue
-        summary = build_report_summary(run.id, checks_by_run.get(run.id, []))
+        summary = build_report_summary(
+            run.id,
+            checks_by_run.get(run.id, []),
+            waived_check_ids=waived_lookup.get(run.id),
+        )
         by_profile[job.profile_id].append((run, summary.compliance_percent))
 
     points: list[ProfileCompliancePoint] = []
@@ -126,7 +146,20 @@ def aggregate_profile_compliance(
 async def _fetch_checks_by_run(db: AsyncSession, run_ids: list[int]) -> dict[int, list]:
     if not run_ids:
         return {}
-    result = await db.execute(select(CheckResult).where(CheckResult.job_run_id.in_(run_ids)))
+    # Skip raw_output/message blobs — timeline/overview only need status fields.
+    result = await db.execute(
+        select(CheckResult)
+        .options(
+            load_only(
+                CheckResult.id,
+                CheckResult.job_run_id,
+                CheckResult.host_id,
+                CheckResult.rule_tech_name,
+                CheckResult.status,
+            )
+        )
+        .where(CheckResult.job_run_id.in_(run_ids))
+    )
     checks_by_run: dict[int, list] = defaultdict(list)
     for check in result.scalars().all():
         checks_by_run[check.job_run_id].append(check)
@@ -170,11 +203,24 @@ async def fetch_compliance_timeline(
         return []
 
     checks_by_run = await _fetch_checks_by_run(db, [run.id for run in runs])
-    return build_timeline_points(runs, checks_by_run)
+    waived_by_run = await waived_check_ids_for_runs(db, runs, checks_by_run)
+    return build_timeline_points(runs, checks_by_run, waived_by_run=waived_by_run)
 
 
 async def fetch_compliance_by_host(db: AsyncSession, run_id: int) -> list[HostCompliancePoint]:
-    result = await db.execute(select(CheckResult).where(CheckResult.job_run_id == run_id))
+    result = await db.execute(
+        select(CheckResult)
+        .options(
+            load_only(
+                CheckResult.id,
+                CheckResult.job_run_id,
+                CheckResult.host_id,
+                CheckResult.rule_tech_name,
+                CheckResult.status,
+            )
+        )
+        .where(CheckResult.job_run_id == run_id)
+    )
     checks = list(result.scalars().all())
     if not checks:
         return []
@@ -182,7 +228,14 @@ async def fetch_compliance_by_host(db: AsyncSession, run_id: int) -> list[HostCo
     host_ids = {check.host_id for check in checks}
     hosts_result = await db.execute(select(Host).where(Host.id.in_(host_ids)))
     host_names = {host.id: host.name for host in hosts_result.scalars().all()}
-    return aggregate_checks_by_host(checks, host_names)
+    run_result = await db.execute(
+        select(JobRun).options(selectinload(JobRun.job)).where(JobRun.id == run_id)
+    )
+    run = run_result.scalar_one_or_none()
+    waived_by_run = await waived_check_ids_for_runs(db, [run] if run else [], {run_id: checks})
+    return aggregate_checks_by_host(
+        checks, host_names, waived_check_ids=waived_by_run.get(run_id)
+    )
 
 
 async def fetch_compliance_by_profile(
@@ -233,7 +286,10 @@ async def fetch_compliance_by_profile(
     profiles = {profile.id: profile for profile in profiles_result.scalars().all()}
 
     checks_by_run = await _fetch_checks_by_run(db, [run.id for run in runs])
-    return aggregate_profile_compliance(runs, checks_by_run, profiles)
+    waived_by_run = await waived_check_ids_for_runs(db, runs, checks_by_run)
+    return aggregate_profile_compliance(
+        runs, checks_by_run, profiles, waived_by_run=waived_by_run
+    )
 
 
 def _status_value(status) -> str:
@@ -283,12 +339,14 @@ def build_ops_overview(
     waiver_approved: int,
     waiver_pending: int,
     prev_avg: float | None,
+    waived_by_run: dict[int, set[int]] | None = None,
 ) -> ComplianceOpsOverview:
     checks_by_run: dict[int, list] = defaultdict(list)
     outcome: dict[str, int] = defaultdict(int)
     fail_rules: dict[str, int] = defaultdict(int)
     host_ids: set[int] = set()
     profile_ids: set[int] = set()
+    waived_lookup = waived_by_run or {}
 
     for check in checks:
         checks_by_run[check.job_run_id].append(check)
@@ -307,7 +365,11 @@ def build_ops_overview(
     dated_runs: list[tuple[object, object, object]] = []
 
     for run in completed_runs:
-        summary = build_report_summary(run.id, checks_by_run.get(run.id, []))
+        summary = build_report_summary(
+            run.id,
+            checks_by_run.get(run.id, []),
+            waived_check_ids=waived_lookup.get(run.id),
+        )
         run_percents.append(summary.compliance_percent)
         if summary.compliance_percent >= 80:
             bands["high"] += 1
@@ -521,9 +583,14 @@ async def fetch_compliance_ops_overview(
     prev_avg = None
     if prev_runs:
         prev_checks = await _fetch_checks_by_run(db, [run.id for run in prev_runs])
+        prev_waived = await waived_check_ids_for_runs(db, prev_runs, prev_checks)
         prev_avg = _avg(
             [
-                build_report_summary(run.id, prev_checks.get(run.id, [])).compliance_percent
+                build_report_summary(
+                    run.id,
+                    prev_checks.get(run.id, []),
+                    waived_check_ids=prev_waived.get(run.id),
+                ).compliance_percent
                 for run in prev_runs
             ]
         )
@@ -540,6 +607,7 @@ async def fetch_compliance_ops_overview(
     waiver_stmt = waiver_stmt.group_by(ComplianceWaiver.status)
     waiver_rows = (await db.execute(waiver_stmt)).all()
     waiver_counts = {_status_value(status): count for status, count in waiver_rows}
+    waived_by_run = await waived_check_ids_for_runs(db, completed_runs, checks_by_run)
 
     return build_ops_overview(
         days=span_days,
@@ -550,4 +618,5 @@ async def fetch_compliance_ops_overview(
         waiver_approved=waiver_counts.get(WaiverStatus.APPROVED.value, 0),
         waiver_pending=waiver_counts.get(WaiverStatus.PENDING.value, 0),
         prev_avg=prev_avg,
+        waived_by_run=waived_by_run,
     )

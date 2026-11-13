@@ -7,6 +7,7 @@ from app.core.roles import require_operate, require_reports
 from app.schemas.audit_map import (
     AuditMapEdgeRead,
     AuditMapEdgeWrite,
+    AuditMapLayoutWrite,
     AuditMapRead,
     AuditMapServiceRead,
     AuditMapServiceWrite,
@@ -17,6 +18,7 @@ from app.services.audit_map import (
     create_edge,
     delete_edge,
     delete_service,
+    save_layout,
     site_query,
 )
 from secaudit_core.audit_map import protocol_for_port
@@ -42,6 +44,20 @@ async def get_audit_map(
         criticality=criticality,
         tag=tag,
         profile=profile,
+    )
+
+
+@router.put("/layout")
+async def put_audit_map_layout(
+    body: AuditMapLayoutWrite,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_operate),
+) -> dict[str, list[dict]]:
+    return await save_layout(
+        db,
+        user,
+        view=body.view,
+        positions=[item.model_dump() for item in body.positions],
     )
 
 

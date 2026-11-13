@@ -13,7 +13,10 @@ from app.schemas import (
     CheckScriptContentUpdate,
     CheckScriptRead,
     ScapProfilePreview,
+    ProfileApplicabilityRequest,
+    ProfileApplicabilityResponse,
     ProfileCreate,
+    ProfileDeleteOptions,
     ProfileDetail,
     ProfileDependencies,
     ProfileRead,
@@ -58,8 +61,13 @@ def _profile_delete_conflict_detail(exc: ProfileDependencyError | ProfileActiveR
     }
 
 
-def _profile_read(profile, *, latest_versions: dict[str, str] | None = None) -> ProfileRead:
-    payload = profile_service.enrich_profile_read(profile, latest_versions)
+def _profile_read(
+    profile,
+    *,
+    latest_versions: dict[str, str] | None = None,
+    counts: dict[str, int] | None = None,
+) -> ProfileRead:
+    payload = profile_service.enrich_profile_read(profile, latest_versions, counts=counts)
     return ProfileRead.model_validate(payload)
 
 
@@ -98,7 +106,11 @@ async def list_profiles(
         os=os,
     )
     latest_versions = await profile_service.catalog_latest_versions(db)
-    return [_profile_read(s, latest_versions=latest_versions) for s in profiles]
+    counts_by_id = await profile_service.list_profile_counts(db, profiles)
+    return [
+        _profile_read(s, latest_versions=latest_versions, counts=counts_by_id.get(s.id))
+        for s in profiles
+    ]
 
 
 @router.get("/discover", response_model=list[str])
@@ -264,7 +276,20 @@ async def bulk_delete_profiles(
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
 ) -> ProfilesBulkActionResult:
-    result = await profile_service.bulk_delete(db, data.profile_ids, cascade=data.cascade)
+    options = None
+    if (
+        data.delete_playbooks is not None
+        or data.delete_jobs is not None
+        or data.delete_reports is not None
+    ):
+        options = ProfileDeleteOptions(
+            delete_playbooks=bool(data.delete_playbooks),
+            delete_jobs=bool(data.delete_jobs),
+            delete_reports=bool(data.delete_reports),
+        )
+    result = await profile_service.bulk_delete(
+        db, data.profile_ids, cascade=data.cascade, options=options
+    )
     if result["succeeded"]:
         await log_audit_event(
             db,
@@ -272,7 +297,13 @@ async def bulk_delete_profiles(
             user,
             action="profile.bulk_delete",
             resource_type="profile",
-            metadata={"profile_ids": result["succeeded"], "cascade": data.cascade},
+            metadata={
+                "profile_ids": result["succeeded"],
+                "cascade": data.cascade,
+                "delete_playbooks": options.delete_playbooks if options else None,
+                "delete_jobs": options.delete_jobs if options else None,
+                "delete_reports": options.delete_reports if options else None,
+            },
         )
     return ProfilesBulkActionResult(
         succeeded=result["succeeded"],
@@ -340,6 +371,25 @@ async def get_profile(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
     return _profile_detail(profile)
+
+
+@router.post("/{profile_id}/applicability", response_model=ProfileApplicabilityResponse)
+async def profile_applicability_preview(
+    profile_id: int,
+    data: ProfileApplicabilityRequest,
+    db: AsyncSession = Depends(get_db),
+    _: AuthUser = Depends(require_reports),
+) -> ProfileApplicabilityResponse:
+    """Preview which selected hosts match the profile platform (OS / executor)."""
+    from app.services.preflight import profile_applicability
+
+    payload = await profile_applicability(
+        db,
+        profile_id=profile_id,
+        host_ids=data.host_ids,
+        profile_version_id=data.profile_version_id,
+    )
+    return ProfileApplicabilityResponse.model_validate(payload)
 
 
 @router.get("/{profile_id}/rules", response_model=list[ProfileRuleRead])
@@ -865,12 +915,24 @@ async def delete_profile(
     profile_id: int,
     request: Request,
     cascade: bool = Query(False),
+    delete_playbooks: bool | None = Query(default=None),
+    delete_jobs: bool | None = Query(default=None),
+    delete_reports: bool | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
 ) -> None:
     profile = await profile_service.get_profile(db, profile_id)
+    options = None
+    if delete_playbooks is not None or delete_jobs is not None or delete_reports is not None:
+        options = ProfileDeleteOptions(
+            delete_playbooks=bool(delete_playbooks),
+            delete_jobs=bool(delete_jobs),
+            delete_reports=bool(delete_reports),
+        )
     try:
-        await profile_service.delete_profile(db, profile_id, cascade=cascade)
+        await profile_service.delete_profile(
+            db, profile_id, cascade=cascade, options=options
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except (ProfileDependencyError, ProfileActiveRunsError) as exc:
@@ -883,5 +945,10 @@ async def delete_profile(
         resource_type="profile",
         resource_id=profile_id,
         resource_name=profile.profile_name if profile else None,
-        metadata={"cascade": cascade},
+        metadata={
+            "cascade": cascade,
+            "delete_playbooks": options.delete_playbooks if options else None,
+            "delete_jobs": options.delete_jobs if options else None,
+            "delete_reports": options.delete_reports if options else None,
+        },
     )

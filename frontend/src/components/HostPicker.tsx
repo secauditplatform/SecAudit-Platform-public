@@ -205,35 +205,34 @@ export function HostPicker({
                   onChange={() => onToggle(host.id)}
                 />
                 <span className="pf-host-picker__card-body">
-                  <span className="pf-host-picker__name">{host.name}</span>
-                  <span className="pf-host-picker__meta">
+                  <span className="pf-host-picker__name" title={host.name}>
+                    {host.name}
+                  </span>
+                  <span
+                    className="pf-host-picker__meta"
+                    title={`${host.hostname}:${host.port}`}
+                  >
                     {host.hostname}:{host.port}
                   </span>
                   <span className="pf-host-picker__tags">
-                    <span className="pf-host-picker__tags-row">
-                      {host.os_type ? <Badge variant="info">{host.os_type}</Badge> : null}
-                      <Badge variant={host.is_active ? "success" : "neutral"}>
-                        {host.is_active ? t("common.active") : t("common.inactive")}
+                    {host.os_type ? <Badge variant="info">{host.os_type}</Badge> : null}
+                    <Badge variant={host.is_active ? "success" : "neutral"}>
+                      {host.is_active ? t("common.active") : t("common.inactive")}
+                    </Badge>
+                    {host.site ? (
+                      <Badge variant="info" literal>
+                        {host.site}
                       </Badge>
-                    </span>
-                    {host.site || host.environment || host.criticality ? (
-                      <span className="pf-host-picker__tags-row">
-                        {host.site ? (
-                          <Badge variant="info" literal>
-                            {host.site}
-                          </Badge>
-                        ) : null}
-                        {host.environment ? (
-                          <Badge variant="info" literal>
-                            {host.environment}
-                          </Badge>
-                        ) : null}
-                        {host.criticality ? (
-                          <Badge variant={hostCriticalityVariant(host.criticality)} literal>
-                            {t(`hosts.criticalityLabel.${host.criticality}`)}
-                          </Badge>
-                        ) : null}
-                      </span>
+                    ) : null}
+                    {host.environment ? (
+                      <Badge variant="info" literal>
+                        {host.environment}
+                      </Badge>
+                    ) : null}
+                    {host.criticality ? (
+                      <Badge variant={hostCriticalityVariant(host.criticality)} literal>
+                        {t(`hosts.criticalityLabel.${host.criticality}`)}
+                      </Badge>
                     ) : null}
                   </span>
                 </span>

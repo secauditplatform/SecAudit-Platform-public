@@ -22,6 +22,7 @@ from secaudit_core.reports import (
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.settings import SecAuditSettings
 from secaudit_core.storage import upload_report_object
+from secaudit_core.waivers import resolve_waived_fail_map_sync
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +46,41 @@ def build_report_attachments(
     report_format: ScheduledReportFormat | str,
     *,
     locale: str | None = None,
+    db: Session | None = None,
+    waived_check_ids: set[int] | None = None,
 ) -> list[ReportAttachment]:
     fmt = report_format.value if hasattr(report_format, "value") else str(report_format)
     base_name = f"secaudit-report-run-{job_run.id}"
     attachments: list[ReportAttachment] = []
+    waived_ids = waived_check_ids
+    if waived_ids is None and db is not None:
+        job = getattr(job_run, "job", None)
+        profile_id = job.profile_id if job is not None else getattr(profile, "id", None)
+        waived_ids = set(
+            resolve_waived_fail_map_sync(
+                db,
+                list(job_run.check_results or []),
+                profile_id=profile_id,
+                job_id=job_run.job_id,
+            ).keys()
+        )
+    waived_ids = waived_ids or set()
 
     if fmt in {ScheduledReportFormat.HTML.value, ScheduledReportFormat.BOTH.value}:
-        html = render_run_report_html(job_run, profile, hosts, for_pdf=False, locale=locale)
+        html = render_run_report_html(
+            job_run,
+            profile,
+            hosts,
+            for_pdf=False,
+            locale=locale,
+            waived_check_ids=waived_ids,
+        )
         attachments.append((f"{base_name}.html", html.encode("utf-8"), "text/html; charset=utf-8"))
 
     if fmt in {ScheduledReportFormat.PDF.value, ScheduledReportFormat.BOTH.value}:
-        pdf = render_run_report_pdf(job_run, profile, hosts, locale=locale)
+        pdf = render_run_report_pdf(
+            job_run, profile, hosts, locale=locale, waived_check_ids=waived_ids
+        )
         attachments.append((f"{base_name}.pdf", pdf, "application/pdf"))
 
     return attachments
@@ -337,6 +362,7 @@ def deliver_scheduled_report(
         hosts,
         schedule.report_format,
         locale=locale_code or None,
+        db=db,
     )
     if not attachments:
         attempt.status = "failed"

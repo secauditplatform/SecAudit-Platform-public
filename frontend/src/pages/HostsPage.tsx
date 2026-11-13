@@ -14,6 +14,7 @@ import { EmptyState } from "../components/ui/EmptyState";
 import { QueryErrorState } from "../components/ui/QueryErrorState";
 import { PageHeader } from "../components/ui/PageHeader";
 import { Panel } from "../components/ui/Panel";
+import { Pagination } from "../components/ui/Pagination";
 import { SortableTh } from "../components/ui/SortableTh";
 import { Spinner } from "../components/ui/Spinner";
 import { useConfirm } from "../components/ui/ConfirmDialog";
@@ -25,6 +26,15 @@ import { ObjectOwnerCell } from "../components/ObjectOwnerCell";
 import { useTableSort } from "../hooks/useTableSort";
 import { sliceOpsList } from "../utils/opsListLimit";
 import { hostCriticalityVariant } from "../utils/statusVariant";
+
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebounced(value), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [value, delayMs]);
+  return debounced;
+}
 
 function supportsSshFingerprint(osType: string | undefined): boolean {
   return (osType ?? "linux").toLowerCase() === "linux" || isUnixOsType(osType);
@@ -302,11 +312,15 @@ function ScanTaskRow({
   );
 }
 
+function parseTagInput(value: string): string[] {
+  return [...new Set(value.split(",").map((tag) => tag.trim()).filter(Boolean))];
+}
+
 function hostHasCredential(host: Host): boolean {
   return (host.linked_credentials?.length ?? 0) > 0 || host.credential_id != null;
 }
 
-const HOSTS_FETCH_LIMIT = 200;
+const HOSTS_PAGE_SIZE = 50;
 const SCAN_STATUS_OPTIONS = ["all", "pending", "running", "completed", "failed", "cancelled"] as const;
 type ScanStatusFilter = (typeof SCAN_STATUS_OPTIONS)[number];
 type HostStatusFilter = "all" | "active" | "inactive";
@@ -314,7 +328,7 @@ type HostCredentialFilter = "all" | "with" | "without";
 
 export function HostsPage() {
   const { t } = useTranslation();
-  const { canSeeObjectOwners, canOperate, canExecute } = useAuth();
+  const { canSeeObjectOwners, canOperate, canDiscover } = useAuth();
   const { confirm } = useConfirm();
   const toast = useToast();
   const queryClient = useQueryClient();
@@ -329,6 +343,7 @@ export function HostsPage() {
     criticality: "" as HostCriticality | "",
     credential_id: "" as number | "",
     is_active: true,
+    tags: "",
   });
   const [form, setForm] = useState(emptyHostForm);
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -349,19 +364,60 @@ export function HostsPage() {
   const [hostSiteFilter, setHostSiteFilter] = useState("all");
   const [hostEnvironmentFilter, setHostEnvironmentFilter] = useState("all");
   const [hostCriticalityFilter, setHostCriticalityFilter] = useState<HostCriticality | "all">("all");
-  const [hostListExpanded, setHostListExpanded] = useState(false);
   const [selectedHostIds, setSelectedHostIds] = useState<number[]>([]);
   const [bulkSite, setBulkSite] = useState("");
   const [bulkEnvironment, setBulkEnvironment] = useState("");
   const [bulkCriticality, setBulkCriticality] = useState<HostCriticality | "">("");
+  const [bulkCredentialId, setBulkCredentialId] = useState<number | "">("");
   const hostFormPanelRef = useRef<HTMLDivElement | null>(null);
   const urlEditHostId = parseHostEditId(searchParams.get("edit"));
+  const debouncedHostSearch = useDebouncedValue(hostSearch, 300);
+  const [hostsPage, setHostsPage] = useState(1);
 
+  const serverOsType =
+    hostOsFilter !== "all" && hostOsFilter !== "unix" ? hostOsFilter : undefined;
+  const serverIsActive =
+    hostStatusFilter === "active" ? true : hostStatusFilter === "inactive" ? false : undefined;
+
+  useEffect(() => {
+    setHostsPage(1);
+  }, [
+    debouncedHostSearch,
+    serverOsType,
+    serverIsActive,
+    hostSiteFilter,
+    hostEnvironmentFilter,
+    hostCriticalityFilter,
+  ]);
+
+  const hostsOffset = (hostsPage - 1) * HOSTS_PAGE_SIZE;
   const hosts = useQuery({
-    queryKey: ["hosts", HOSTS_FETCH_LIMIT],
-    queryFn: () => api.hosts({ offset: 0, limit: HOSTS_FETCH_LIMIT }),
+    queryKey: [
+      "hosts",
+      hostsOffset,
+      HOSTS_PAGE_SIZE,
+      debouncedHostSearch,
+      serverOsType,
+      serverIsActive,
+      hostSiteFilter,
+      hostEnvironmentFilter,
+      hostCriticalityFilter,
+    ],
+    queryFn: () =>
+      api.hosts({
+        offset: hostsOffset,
+        limit: HOSTS_PAGE_SIZE,
+        search: debouncedHostSearch.trim() || undefined,
+        os_type: serverOsType,
+        is_active: serverIsActive,
+        site: hostSiteFilter !== "all" ? hostSiteFilter : undefined,
+        environment: hostEnvironmentFilter !== "all" ? hostEnvironmentFilter : undefined,
+        criticality: hostCriticalityFilter !== "all" ? hostCriticalityFilter : undefined,
+      }),
   });
+  const hostsTotal = hosts.data?.total ?? 0;
   const credentials = useQuery({ queryKey: ["credentials"], queryFn: api.credentials });
+  const hostTagSuggestions = useQuery({ queryKey: ["host-tags"], queryFn: api.hostTags });
   const scans = useQuery({
     queryKey: ["inventory-scans"],
     queryFn: api.inventoryScans,
@@ -403,6 +459,7 @@ export function HostsPage() {
         criticality: host.criticality ?? "",
         credential_id: host.credential_id ?? "",
         is_active: host.is_active,
+        tags: (host.tags ?? []).join(", "),
       });
       if (options?.updateUrl !== false) {
         setSearchParams({ edit: String(host.id) }, { replace: true });
@@ -435,20 +492,38 @@ export function HostsPage() {
   }, [urlEditHostId, editingId, startEditById]);
 
   const createMutation = useMutation({
-    mutationFn: api.createHost,
-    onSuccess: () => {
+    mutationFn: async ({ data, tags }: { data: Omit<Host, "id">; tags: string[] }) => {
+      const host = await api.createHost(data);
+      if (tags.length > 0) await api.setHostTags(host.id, tags);
+      return host;
+    },
+    onSuccess: (_host, { tags }) => {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      queryClient.invalidateQueries({ queryKey: ["host-tags"] });
       setForm(emptyHostForm());
       toast.success(t("toast.hostCreated"));
+      if (tags.length > 0) toast.success(t("hosts.tagsSaved"));
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: number; data: Partial<Omit<Host, "id">> }) =>
-      api.updateHost(id, data),
+    mutationFn: async ({
+      id,
+      data,
+      tags,
+    }: {
+      id: number;
+      data: Partial<Omit<Host, "id">>;
+      tags: string[];
+    }) => {
+      const host = await api.updateHost(id, data);
+      await api.setHostTags(id, tags);
+      return host;
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      queryClient.invalidateQueries({ queryKey: ["host-tags"] });
       setEditingId(null);
       setForm(emptyHostForm());
       if (searchParams.has("edit")) {
@@ -475,6 +550,50 @@ export function HostsPage() {
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
 
+  const bulkDeleteMutation = useMutation({
+    mutationFn: api.bulkDeleteHosts,
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      setSelectedHostIds([]);
+      if (result.deleted.length > 0) toast.success(t("toast.hostDeleted"));
+      if (result.conflicts.length > 0) {
+        toast.error(
+          `${t("hosts.bulkDeleteConflicts", { count: result.conflicts.length })} ${result.conflicts
+            .map((c) => `#${c.host_id} ${formatHostDeleteError(c.detail, t)}`)
+            .join("; ")}`,
+        );
+      }
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const bulkBindCredentialMutation = useMutation({
+    mutationFn: ({ hostIds, credentialId }: { hostIds: number[]; credentialId: number }) =>
+      Promise.allSettled(hostIds.map((id) => api.linkHostCredential(id, credentialId))),
+    onSuccess: (results) => {
+      queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      const failed = results.filter((r) => r.status === "rejected").length;
+      const params = { count: results.length - failed, failed };
+      if (failed > 0) toast.error(t("hosts.bulkBindDone", params));
+      else toast.success(t("hosts.bulkBindDone", params));
+      setBulkCredentialId("");
+      setSelectedHostIds([]);
+    },
+  });
+
+  const bulkClearSshMutation = useMutation({
+    mutationFn: (hostIds: number[]) =>
+      Promise.allSettled(hostIds.map((id) => api.updateHost(id, { clear_ssh_host_key: true }))),
+    onSuccess: (results) => {
+      queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      const failed = results.filter((r) => r.status === "rejected").length;
+      const params = { count: results.length - failed, failed };
+      if (failed > 0) toast.error(t("hosts.bulkClearDone", params));
+      else toast.success(t("hosts.bulkClearDone", params));
+      setSelectedHostIds([]);
+    },
+  });
+
   const deleteMutation = useMutation({
     mutationFn: api.deleteHost,
     onSuccess: () => {
@@ -492,6 +611,26 @@ export function HostsPage() {
     onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ["hosts"] });
       toast.success(t("hosts.sshFingerprintSaved", { fingerprint: result.fingerprint }));
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const preflightMutation = useMutation({
+    mutationFn: (hostId: number) => api.preflightHost(hostId),
+    onSuccess: (result) => {
+      const failed = result.checks.filter((c) => c.status === "fail").map((c) => c.name);
+      if (result.ok) {
+        toast.success(
+          t("preflight.ok", { target: result.target, ms: result.duration_ms })
+        );
+      } else {
+        toast.error(
+          t("preflight.fail", {
+            target: result.target,
+            checks: failed.join(", ") || result.error || "auth",
+          })
+        );
+      }
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -535,7 +674,6 @@ export function HostsPage() {
   const isEditing = editingId !== null;
 
   const hostRows = hosts.data?.items ?? [];
-  const hostsTotal = hosts.data?.total ?? 0;
 
   const filteredScans = useMemo(() => {
     if (!scans.data) return [];
@@ -559,64 +697,31 @@ export function HostsPage() {
 
   const hasActiveScanFilters = scanSearch.trim() !== "" || scanStatusFilter !== "all";
 
+  // Server already applies search/os/status/site/environment/criticality; only credential + unix stay local.
   const filteredHostRows = useMemo(() => {
-    const query = hostSearch.trim().toLowerCase();
     return hostRows.filter((host) => {
       if (hostOsFilter === "unix" && !isUnixOsType(host.os_type)) return false;
-      if (
-        hostOsFilter !== "all" &&
-        hostOsFilter !== "unix" &&
-        (host.os_type ?? "linux") !== hostOsFilter
-      ) {
-        return false;
-      }
-      if (hostStatusFilter === "active" && !host.is_active) return false;
-      if (hostStatusFilter === "inactive" && host.is_active) return false;
       if (hostCredentialFilter === "with" && !hostHasCredential(host)) return false;
       if (hostCredentialFilter === "without" && hostHasCredential(host)) return false;
-      if (hostSiteFilter !== "all" && (host.site ?? "") !== hostSiteFilter) return false;
-      if (hostEnvironmentFilter !== "all" && (host.environment ?? "") !== hostEnvironmentFilter) {
-        return false;
-      }
-      if (hostCriticalityFilter !== "all" && (host.criticality ?? "") !== hostCriticalityFilter) {
-        return false;
-      }
-      if (!query) return true;
-      return (
-        host.name.toLowerCase().includes(query) ||
-        host.hostname.toLowerCase().includes(query) ||
-        String(host.port).includes(query) ||
-        (host.site ?? "").toLowerCase().includes(query) ||
-        (host.environment ?? "").toLowerCase().includes(query) ||
-        (host.criticality ?? "").toLowerCase().includes(query)
-      );
+      return true;
     });
-  }, [
-    hostRows,
-    hostSearch,
-    hostOsFilter,
-    hostStatusFilter,
-    hostCredentialFilter,
-    hostSiteFilter,
-    hostEnvironmentFilter,
-    hostCriticalityFilter,
-  ]);
+  }, [hostRows, hostOsFilter, hostCredentialFilter]);
 
-  const hostSiteOptions = useMemo(
-    () =>
-      [...new Set(hostRows.map((host) => host.site?.trim()).filter(Boolean) as string[])].sort((a, b) =>
-        a.localeCompare(b)
-      ),
-    [hostRows]
-  );
+  const hostSiteOptions = useMemo(() => {
+    const values = new Set(
+      hostRows.map((host) => host.site?.trim()).filter(Boolean) as string[]
+    );
+    if (hostSiteFilter !== "all") values.add(hostSiteFilter);
+    return [...values].sort((a, b) => a.localeCompare(b));
+  }, [hostRows, hostSiteFilter]);
 
-  const hostEnvironmentOptions = useMemo(
-    () =>
-      [
-        ...new Set(hostRows.map((host) => host.environment?.trim()).filter(Boolean) as string[]),
-      ].sort((a, b) => a.localeCompare(b)),
-    [hostRows]
-  );
+  const hostEnvironmentOptions = useMemo(() => {
+    const values = new Set(
+      hostRows.map((host) => host.environment?.trim()).filter(Boolean) as string[]
+    );
+    if (hostEnvironmentFilter !== "all") values.add(hostEnvironmentFilter);
+    return [...values].sort((a, b) => a.localeCompare(b));
+  }, [hostRows, hostEnvironmentFilter]);
 
   const hasActiveHostFilters =
     hostSearch.trim() !== "" ||
@@ -644,11 +749,6 @@ export function HostsPage() {
     Host,
     HostSortKey
   >(filteredHostRows, { key: "name", direction: "asc" }, hostAccessor);
-
-  const visibleHosts = useMemo(
-    () => sliceOpsList(sortedHosts, hostListExpanded),
-    [sortedHosts, hostListExpanded]
-  );
 
   const filteredHostIdKey = sortedHosts.map((host) => host.id).join(",");
   useEffect(() => {
@@ -701,6 +801,24 @@ export function HostsPage() {
     setSelectedHostIds((prev) =>
       prev.includes(hostId) ? prev.filter((id) => id !== hostId) : [...prev, hostId]
     );
+  };
+
+  const applyBulkDelete = async () => {
+    const ok = await confirm({
+      title: t("hosts.deleteSelected"),
+      message: t("hosts.bulkDeleteConfirm", { count: selectedHostIds.length }),
+      variant: "danger",
+    });
+    if (ok) bulkDeleteMutation.mutate(selectedHostIds);
+  };
+
+  const applyBulkClearSsh = async () => {
+    const ok = await confirm({
+      title: t("hosts.bulkClearSshKey"),
+      message: t("hosts.bulkClearSshConfirm", { count: selectedHostIds.length }),
+      variant: "warning",
+    });
+    if (ok) bulkClearSshMutation.mutate(selectedHostIds);
   };
 
   const applyBulkClassify = () => {
@@ -824,13 +942,13 @@ export function HostsPage() {
                 );
               }}
               disabled={
-                !canExecute ||
+                !canDiscover ||
                 !scanTarget.trim() ||
                 detectTargetType(scanTarget) === "ipv6prefix" ||
                 scanMutation.isPending ||
                 (scanMethod === "snmp" && scanCredentialId === "")
               }
-              title={!canExecute ? t("common.demoActionDisabled") : undefined}
+              title={!canDiscover ? t("common.demoActionDisabled") : undefined}
             >
               {t("hosts.scanStart")}
             </Button>
@@ -934,9 +1052,9 @@ export function HostsPage() {
         )}
       </Panel>
 
-      <DirectoryDiscoveryPanel canExecute={canExecute} />
+      <DirectoryDiscoveryPanel canExecute={canDiscover} />
 
-      {canOperate ? <HostCsvImportPanel canExecute={canExecute} /> : null}
+      {canOperate ? <HostCsvImportPanel canExecute={canDiscover} /> : null}
 
       <div ref={hostFormPanelRef}>
       <Panel title={isEditing ? t("hosts.editTitle", { name: form.name }) : t("hosts.addHost")}>
@@ -959,7 +1077,7 @@ export function HostsPage() {
                 className="pf-input"
                 value={form.hostname}
                 onChange={(e) => setForm({ ...form, hostname: e.target.value })}
-                placeholder="10.0.0.15"
+                placeholder="10.0.0.15 or host.example.com"
               />
             </div>
             <div className="pf-form__group">
@@ -1052,6 +1170,33 @@ export function HostsPage() {
               </select>
               <p className="pf-form__hint">{t("hosts.credentialFormHint")}</p>
             </div>
+            <div className="pf-form__group">
+              <label htmlFor="host-tags">{t("hosts.tags")}</label>
+              <input
+                id="host-tags"
+                className="pf-input"
+                value={form.tags}
+                onChange={(e) => setForm({ ...form, tags: e.target.value })}
+                placeholder={t("hosts.tagsPlaceholder")}
+              />
+              <div className="pf-host-tags">
+                {(hostTagSuggestions.data ?? [])
+                  .filter((tag) => !parseTagInput(form.tags).includes(tag.name))
+                  .slice(0, 12)
+                  .map((tag) => (
+                    <button
+                      key={tag.id}
+                      type="button"
+                      className="pf-btn pf-btn--link pf-btn--sm"
+                      onClick={() =>
+                        setForm({ ...form, tags: [...parseTagInput(form.tags), tag.name].join(", ") })
+                      }
+                    >
+                      {tag.name}
+                    </button>
+                  ))}
+              </div>
+            </div>
           </div>
           <div className="pf-form__actions">
             {isEditing ? (
@@ -1084,6 +1229,7 @@ export function HostsPage() {
                         credential_id: form.credential_id === "" ? null : form.credential_id,
                         is_active: form.is_active,
                       },
+                      tags: parseTagInput(form.tags),
                     })
                   }
                   disabled={!form.name || !form.hostname || !portValid || updateMutation.isPending}
@@ -1098,15 +1244,18 @@ export function HostsPage() {
               <Button
                 onClick={() =>
                   createMutation.mutate({
-                    name: form.name,
-                    hostname: form.hostname,
-                    port: parsedPort,
-                    os_type: form.os_type,
-                    site: form.site.trim() || null,
-                    environment: form.environment.trim() || null,
-                    criticality: form.criticality || null,
-                    credential_id: form.credential_id === "" ? undefined : form.credential_id,
-                    is_active: true,
+                    data: {
+                      name: form.name,
+                      hostname: form.hostname,
+                      port: parsedPort,
+                      os_type: form.os_type,
+                      site: form.site.trim() || null,
+                      environment: form.environment.trim() || null,
+                      criticality: form.criticality || null,
+                      credential_id: form.credential_id === "" ? undefined : form.credential_id,
+                      is_active: true,
+                    },
+                    tags: parseTagInput(form.tags),
                   })
                 }
                 disabled={!form.name || !form.hostname || !portValid || createMutation.isPending}
@@ -1251,15 +1400,12 @@ export function HostsPage() {
                   {hasActiveHostFilters
                     ? t("profiles.filterResultsActive", {
                         count: filteredHostRows.length,
-                        total: hostRows.length,
+                        total: hostsTotal,
                       })
                     : t("profiles.filterShown", {
                         count: filteredHostRows.length,
-                        total: hostRows.length,
+                        total: hostsTotal,
                       })}
-                  {hostsTotal > hostRows.length
-                    ? ` · ${t("hosts.listLoadedCap", { loaded: hostRows.length, total: hostsTotal })}`
-                    : null}
                 </p>
                 {hasActiveHostFilters ? (
                   <Button variant="secondary" className="pf-btn--sm" type="button" onClick={clearHostFilters}>
@@ -1325,6 +1471,61 @@ export function HostsPage() {
                           disabled={bulkClassifyMutation.isPending}
                         >
                           {t("hosts.bulkClassifyApply")}
+                        </Button>
+                      </div>
+                    </div>
+                    <div className="pf-host-bulk__fields">
+                      <div className="pf-form__group">
+                        <label htmlFor="host-bulk-credential">{t("hosts.credential")}</label>
+                        <select
+                          id="host-bulk-credential"
+                          className="pf-select"
+                          value={bulkCredentialId}
+                          onChange={(e) =>
+                            setBulkCredentialId(e.target.value ? Number(e.target.value) : "")
+                          }
+                        >
+                          <option value="">{t("hosts.notSelected")}</option>
+                          {credentials.data
+                            ?.filter(
+                              (c) => c.credential_type !== "snmp_v2c" && c.credential_type !== "snmp_v3",
+                            )
+                            .map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                                {c.username ? ` (${c.username})` : ""} · {c.credential_type}
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+                      <div className="pf-host-bulk__apply pf-host-bulk__apply--wide">
+                        <Button
+                          type="button"
+                          onClick={() =>
+                            bulkBindCredentialMutation.mutate({
+                              hostIds: selectedHostIds,
+                              credentialId: Number(bulkCredentialId),
+                            })
+                          }
+                          disabled={bulkCredentialId === "" || bulkBindCredentialMutation.isPending}
+                        >
+                          {t("hosts.bulkBindCredential")}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          onClick={applyBulkClearSsh}
+                          disabled={bulkClearSshMutation.isPending}
+                        >
+                          {t("hosts.bulkClearSshKey")}
+                        </Button>
+                        <Button
+                          type="button"
+                          variant="danger-secondary"
+                          onClick={applyBulkDelete}
+                          disabled={bulkDeleteMutation.isPending}
+                        >
+                          {t("hosts.deleteSelected")}
                         </Button>
                       </div>
                     </div>
@@ -1424,7 +1625,7 @@ export function HostsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {visibleHosts.map((host) => (
+                  {sortedHosts.map((host) => (
                     <tr
                       key={host.id}
                       className={
@@ -1444,7 +1645,18 @@ export function HostsPage() {
                           />
                         </td>
                       ) : null}
-                      <td>{host.name}</td>
+                      <td>
+                        {host.name}
+                        {host.tags?.length ? (
+                          <div className="pf-host-tags">
+                            {host.tags.map((tag) => (
+                              <Badge key={tag} variant="neutral" literal>
+                                {tag}
+                              </Badge>
+                            ))}
+                          </div>
+                        ) : null}
+                      </td>
                       <td className="pf-table__mono">{host.hostname}</td>
                       <td>{host.port}</td>
                       <td>
@@ -1510,6 +1722,19 @@ export function HostsPage() {
                           <Button
                             variant="secondary"
                             className="pf-btn--sm"
+                            onClick={() => preflightMutation.mutate(host.id)}
+                            disabled={preflightMutation.isPending || !hostHasCredential(host)}
+                            title={
+                              hostHasCredential(host)
+                                ? t("preflight.checkAccess")
+                                : t("preflight.needCredential")
+                            }
+                          >
+                            {t("preflight.checkAccess")}
+                          </Button>
+                          <Button
+                            variant="secondary"
+                            className="pf-btn--sm"
                             onClick={() => scanFingerprintMutation.mutate(host.id)}
                             disabled={
                               scanFingerprintMutation.isPending ||
@@ -1546,11 +1771,11 @@ export function HostsPage() {
                 </tbody>
               </table>
             </div>
-            <OpsListExpandFooter
-              shown={visibleHosts.length}
-              total={filteredHostRows.length}
-              expanded={hostListExpanded}
-              onToggle={() => setHostListExpanded((value) => !value)}
+            <Pagination
+              page={hostsPage}
+              pageSize={HOSTS_PAGE_SIZE}
+              total={hostsTotal}
+              onPageChange={setHostsPage}
             />
               </>
             )}

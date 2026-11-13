@@ -56,11 +56,12 @@ from secaudit_core.audit_flow_state import (
     set_audit_flow_progress,
 )
 from secaudit_core.enums import AuditFlowStatus, CredentialType
-from secaudit_core.models import AuditFlowHost, AuditFlowRun, Category, Profile
+from secaudit_core.models import AuditFlowHost, AuditFlowRun, AuditFlowTemplate, Category, Profile
 from secaudit_core.profiles_catalog import infer_platform as platform_from_slug
 from secaudit_core.secrets import decrypt_secret
 from secaudit_core.credential_auth import decrypt_credential_key_passphrase
 from secaudit_core.settings import SecAuditSettings
+from secaudit_core.task_outbox import enqueue_outbox_row
 
 
 _NMAP_WALL_TIMEOUT = 180
@@ -73,6 +74,28 @@ def _cancelled(redis_url: str, run_id: int) -> None:
 
 def _log(run_id: int, message: str, level: str = "info") -> None:
     publish_audit_flow_log(run_id, message, level=level)
+
+
+def _maybe_enqueue_auto_execute(db: Session, run: AuditFlowRun) -> None:
+    """If the template opted in, start compliance for auto-selected hosts after READY."""
+    if not run.template_id:
+        return
+    template = db.get(AuditFlowTemplate, run.template_id)
+    if template is None or not template.auto_execute:
+        return
+    # No audit_flow_run callback: run is already READY, and outbox would cancel a PENDING-only claim.
+    enqueue_outbox_row(
+        db,
+        task_name="app.tasks.audit_flow.run_audit_flow_execute_task",
+        args=[run.id],
+        queue="inventory",
+        correlation={
+            "source": "auto_execute",
+            "audit_flow_template_id": template.id,
+            "audit_flow_run_id": run.id,
+        },
+    )
+    _log(run.id, "Auto-execute queued (matched high-confidence hosts)")
 
 
 def _host_by_ip(db: Session, run_id: int, ip: str) -> AuditFlowHost | None:
@@ -1015,6 +1038,7 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                         _log(run_id, f"Saved {saved} host(s) to inventory")
                     run.status = AuditFlowStatus.READY
                     run.finished_at = datetime.now(UTC)
+                    _maybe_enqueue_auto_execute(db, run)
                     db.commit()
                     _log(run_id, f"Scan finished: {run.hosts_found} host(s)")
             except ScanCancelledError:
@@ -1126,6 +1150,7 @@ def run_audit_flow_reprobe_sync(
                 if run:
                     run.status = AuditFlowStatus.READY
                     run.finished_at = datetime.now(UTC)
+                    _maybe_enqueue_auto_execute(db, run)
                     db.commit()
                 _log(run_id, f"Re-probe finished ({len(targets)} host(s))")
             except ScanCancelledError:

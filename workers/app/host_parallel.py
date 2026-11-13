@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextvars
+import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import TypeVar
@@ -48,12 +50,30 @@ def run_hosts_parallel(
                 return True
             return False
 
+        def _poll_cancel_while(stop: threading.Event) -> None:
+            # Sequential path blocks inside worker_fn; keep cancel_event fresh.
+            while not stop.is_set() and not cancel_event.is_set():
+                if should_cancel and should_cancel():
+                    cancel_event.set()
+                    return
+                time.sleep(0.25)
+
         if max_workers == 1:
             results: list[R] = []
             for item in items:
                 if _cancelled():
                     raise InterruptedError("Job run cancelled")
-                results.append(worker_fn(item))
+                stop_poll = threading.Event()
+                poller = threading.Thread(
+                    target=_poll_cancel_while, args=(stop_poll,), daemon=True
+                )
+                poller.start()
+                try:
+                    results.append(worker_fn(item))
+                finally:
+                    stop_poll.set()
+                if _cancelled():
+                    raise InterruptedError("Job run cancelled")
             return results
 
         results_map: dict[int, R] = {}

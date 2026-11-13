@@ -381,7 +381,7 @@ export function PlaybooksPage() {
 
   const runDetail = useQuery({
     queryKey: ["playbook-run-detail", selectedRunId],
-    queryFn: () => api.getJobRun(selectedRunId!),
+    queryFn: () => api.getJobRun(selectedRunId!, { include_raw: true }),
     enabled: selectedRunId !== null,
     refetchInterval: (query) => {
       const status = query.state.data?.status;

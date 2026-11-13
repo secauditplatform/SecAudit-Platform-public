@@ -74,7 +74,7 @@ export function JobSchedulePicker({
   };
 
   return (
-    <div className="pf-schedule">
+    <div className={`pf-schedule${enabled ? " pf-schedule--open" : ""}`}>
       <label className="pf-form__checkbox-label pf-schedule__toggle">
         <input
           type="checkbox"
@@ -82,7 +82,7 @@ export function JobSchedulePicker({
           checked={enabled}
           onChange={(event) => onEnabledChange(event.target.checked)}
         />
-        {t("jobs.scheduleEnabled")}
+        <span className="pf-schedule__toggle-text">{t("jobs.scheduleEnabled")}</span>
       </label>
 
       {enabled && (

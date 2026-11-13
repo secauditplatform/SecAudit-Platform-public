@@ -155,9 +155,9 @@ async def stop_inventory_scan(
             status_code=409,
             detail=f"Cannot stop scan in status '{scan.status.value}'",
         )
-    request_scan_cancel(settings.redis_url, scan_id)
-    await db.flush()
+    await db.commit()
     await db.refresh(scan)
+    request_scan_cancel(settings.redis_url, scan_id)
     return InventoryScanRead.model_validate(scan)
 
 

@@ -58,7 +58,7 @@ export function hasProfileRuleMetadata(rule?: ProfileRuleMetadataFields | null):
   );
 }
 
-export type ProfileRuleLookup = Pick<ProfileRule, "tech_name" | "requirement_id"> &
+export type ProfileRuleLookup = Pick<ProfileRule, "tech_name" | "requirement_id" | "num"> &
   ProfileRuleMetadataFields;
 
 export function findProfileRule(

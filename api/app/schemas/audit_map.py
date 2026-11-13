@@ -86,3 +86,8 @@ class AuditMapEdgeWrite(BaseModel):
     source_port: int = Field(..., ge=1, le=65535)
     target_host_id: int
     target_port: int = Field(..., ge=1, le=65535)
+
+
+class AuditMapLayoutWrite(BaseModel):
+    view: str = Field(default="network", max_length=32)
+    positions: list[AuditMapPosition] = Field(default_factory=list, max_length=500)

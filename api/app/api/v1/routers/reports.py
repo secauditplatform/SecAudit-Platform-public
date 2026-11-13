@@ -39,7 +39,13 @@ from app.services.report_ux import (
     load_run_evidence,
     render_multi_compare_csv,
 )
-from app.services.reports import fetch_run_report_context, fetch_run_summary, render_run_report_html, render_run_report_pdf
+from app.services.reports import (
+    fetch_run_report_context,
+    fetch_run_summary,
+    render_run_report_html,
+    render_run_report_pdf,
+    waived_check_ids_for_job_run,
+)
 from secaudit_core.report_i18n import resolve_report_locale
 from app.services.trends import (
     fetch_compliance_by_host,
@@ -140,7 +146,14 @@ async def get_run_report_html(
     if not context:
         raise HTTPException(status_code=404, detail="Job run not found")
     job_run, profile, hosts = context
-    html = render_run_report_html(job_run, profile, hosts, locale=_report_locale(locale, request))
+    waived_ids = await waived_check_ids_for_job_run(db, job_run)
+    html = render_run_report_html(
+        job_run,
+        profile,
+        hosts,
+        locale=_report_locale(locale, request),
+        waived_check_ids=waived_ids,
+    )
     return HTMLResponse(content=html)
 
 
@@ -264,6 +277,7 @@ async def get_run_report_pdf(
         raise HTTPException(status_code=404, detail="Job run not found")
     job_run, profile, hosts = context
     resolved_locale = _report_locale(locale, request)
+    waived_ids = await waived_check_ids_for_job_run(db, job_run)
 
     try:
         pdf_bytes = await run_blocking(
@@ -272,6 +286,7 @@ async def get_run_report_pdf(
             profile,
             hosts,
             locale=resolved_locale,
+            waived_check_ids=waived_ids,
             timeout=settings.blocking_io_timeout_seconds,
         )
     except TimeoutError as exc:
@@ -324,8 +339,15 @@ async def get_run_report_pack(
         raise HTTPException(status_code=404, detail="Job run not found")
     job_run, profile, hosts = context
     resolved_locale = _report_locale(locale, request)
+    waived_ids = await waived_check_ids_for_job_run(db, job_run)
 
-    html = render_run_report_html(job_run, profile, hosts, locale=resolved_locale)
+    html = render_run_report_html(
+        job_run,
+        profile,
+        hosts,
+        locale=resolved_locale,
+        waived_check_ids=waived_ids,
+    )
     try:
         pdf_bytes = await run_blocking(
             render_run_report_pdf,
@@ -333,6 +355,7 @@ async def get_run_report_pack(
             profile,
             hosts,
             locale=resolved_locale,
+            waived_check_ids=waived_ids,
             timeout=settings.blocking_io_timeout_seconds,
         )
     except TimeoutError as exc:

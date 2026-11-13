@@ -31,6 +31,8 @@ import { AuditMapPage } from "./pages/AuditMapPage";
 import { AuditMapDesignsPage } from "./pages/AuditMapDesignsPage";
 import { AagConnectionPage, AagExplainPage, AagGeneratePage } from "./pages/aag/AagPages";
 import { UsersPage } from "./pages/UsersPage";
+import "./fonts";
+import "./monacoSetup";
 import "./index.css";
 
 function TokenSync({ children }: { children: React.ReactNode }) {

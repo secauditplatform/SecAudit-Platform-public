@@ -44,6 +44,8 @@ EVENT_LABELS = {
     NotificationEventType.DISPATCH_FAILED.value: "Dispatch failed",
     NotificationEventType.WORKER_HEARTBEAT_STALE.value: "Worker heartbeat stale",
     NotificationEventType.WORKER_HEARTBEAT_RECOVERED.value: "Worker heartbeat recovered",
+    NotificationEventType.COMPLIANCE_REGRESSED.value: "Compliance regressed",
+    NotificationEventType.WAIVER_EXPIRING.value: "Waiver expiring soon",
 }
 
 

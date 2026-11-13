@@ -29,7 +29,7 @@ function defaultBaselineRunId(
   jobBaselineRunId: number | null | undefined
 ): number | null {
   const completed = jobRuns
-    .filter((run) => run.status === "completed" && run.id !== currentRunId)
+    .filter((run) => run.status === "completed" && !run.is_partial && run.id !== currentRunId)
     .sort((a, b) => (b.finished_at ?? "").localeCompare(a.finished_at ?? ""));
 
   if (jobBaselineRunId != null && jobBaselineRunId !== currentRunId) {
@@ -516,7 +516,7 @@ export function ReportsPage() {
                 <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("pack")} disabled={downloading !== null}>
                   {downloading === "pack" ? t("reports.downloading") : t("reports.downloadPack")}
                 </Button>
-                {canOperate && selectedRun?.status === "completed" && (
+                {canOperate && selectedRun?.status === "completed" && !selectedRun.is_partial && (
                   <Button
                     variant="secondary"
                     className="pf-btn--sm"
@@ -538,6 +538,11 @@ export function ReportsPage() {
                     <Badge variant={checkStatusVariant(selectedRun.status)}>
                       {runStatusLabel(t, selectedRun.status)}
                     </Badge>
+                    {selectedRun.is_partial && (
+                      <span title={t("jobs.partialRunHint", { id: selectedRun.source_run_id ?? "—" })}>
+                        <Badge variant="warning">{t("jobs.partialRunBadge")}</Badge>
+                      </span>
+                    )}
                   </div>
                   <p className="pf-report-run-meta__times">
                     {t("reports.started")}:{" "}
@@ -549,6 +554,9 @@ export function ReportsPage() {
                     {selectedRun.finished_at
                       ? new Date(selectedRun.finished_at).toLocaleString(dateLocale)
                       : t("common.dash")}
+                    {selectedRun.is_partial && selectedRun.host_ids?.length
+                      ? ` · ${t("jobs.hostsCol")}: ${selectedRun.host_ids.length}`
+                      : null}
                   </p>
                 </div>
               </div>
@@ -597,6 +605,7 @@ export function ReportsPage() {
               jobId={selectedRun.job_id}
               runStatus={selectedRun.status}
               canOperate={canAccessRemediation}
+              profileRules={profileRules.data}
               onReauditComplete={(reauditRunId) => {
                 if (activeRunId != null) {
                   setCompareBaselineRunId(activeRunId);

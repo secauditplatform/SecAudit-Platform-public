@@ -34,13 +34,6 @@ spec:
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           volumeMounts:
-            - name: profiles-data
-              mountPath: /data/profiles
+            {{- include "secaudit.profilesVolumeMounts" . | nindent 12 }}
       volumes:
-        - name: profiles-data
-          {{- if or .Values.profiles.persistence.enabled .Values.profiles.existingClaim }}
-          persistentVolumeClaim:
-            claimName: {{ include "secaudit.profilesClaim" . }}
-          {{- else }}
-          emptyDir: {}
-          {{- end }}
+        {{- include "secaudit.profilesVolumes" . | nindent 8 }}

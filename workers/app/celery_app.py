@@ -39,6 +39,7 @@ celery_app = create_celery_app(
         "app.tasks.directory",
         "app.tasks.aag",
         "app.tasks.audit_flow",
+        "app.tasks.preflight",
         "app.tasks.scheduled_reports",
     ],
 )
@@ -63,6 +64,7 @@ celery_app.conf.update(
         "app.tasks.directory.*": {"queue": "inventory"},
         "app.tasks.aag.*": {"queue": "aag"},
         "app.tasks.audit_flow.*": {"queue": "inventory"},
+        "app.tasks.preflight.*": {"queue": "inventory"},
         "app.tasks.maintenance.*": {"queue": "maintenance"},
         "app.tasks.scheduled_reports.*": {"queue": "maintenance"},
     },
@@ -90,6 +92,16 @@ celery_app.conf.update(
         "sweep-stale-runs": {
             "task": "app.tasks.maintenance.sweep_stale_runs",
             "schedule": 300.0,
+            "options": {"queue": "maintenance"},
+        },
+        "cleanup-expired-audit-flow-runs": {
+            "task": "app.tasks.maintenance.cleanup_expired_audit_flow_runs",
+            "schedule": 3600.0,
+            "options": {"queue": "maintenance"},
+        },
+        "purge-old-job-runs": {
+            "task": "app.tasks.maintenance.purge_old_job_runs",
+            "schedule": 3600.0,
             "options": {"queue": "maintenance"},
         },
         "check-worker-heartbeat": {

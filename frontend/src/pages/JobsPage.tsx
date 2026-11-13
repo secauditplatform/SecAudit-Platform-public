@@ -1,7 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { api, type Job, type JobRun, type JobTemplate } from "../api/client";
+import {
+  api,
+  type DynamicHostFilter,
+  type Host,
+  type Job,
+  type JobRun,
+  type JobRunSubset,
+  type JobTemplate,
+} from "../api/client";
+import {
+  DynamicHostFilterFields,
+  EMPTY_DYNAMIC_FILTER,
+  TargetModeToggle,
+  type TargetMode,
+} from "../components/DynamicHostFilterFields";
 import { JobRunLogs } from "../components/JobRunLogs";
 import { JobTemplatesPanel } from "../components/JobTemplatesPanel";
 import {
@@ -64,6 +78,8 @@ function populateFormFromJob(
     setProfileVersionId: (id: number | "") => void;
     setPlaybookId: (id: number | "") => void;
     setHostIds: (ids: number[]) => void;
+    setTargetMode: (mode: TargetMode) => void;
+    setDynamicFilter: (filter: DynamicHostFilter) => void;
     setIsScheduled: (scheduled: boolean) => void;
     setScheduleConfig: (config: ScheduleConfig) => void;
     setNetworkCheckMode?: (mode: "remote" | "config_upload" | "both") => void;
@@ -92,6 +108,8 @@ function populateFormFromJob(
     setters.setPlaybookId("");
   }
   setters.setHostIds(job.host_ids);
+  setters.setTargetMode(job.dynamic_filter ? "dynamic" : "hosts");
+  setters.setDynamicFilter(job.dynamic_filter ?? EMPTY_DYNAMIC_FILTER);
   setters.setIsScheduled(job.is_scheduled);
   setters.setScheduleConfig(parseCronExpression(job.cron_expression));
   if (setters.setNetworkCheckMode && job.network_check_mode) {
@@ -123,6 +141,8 @@ export function JobsPage({
   const [profileVersionId, setProfileVersionId] = useState<number | "">("");
   const [playbookId, setPlaybookId] = useState<number | "">("");
   const [hostIds, setHostIds] = useState<number[]>([]);
+  const [targetMode, setTargetMode] = useState<TargetMode>("hosts");
+  const [dynamicFilter, setDynamicFilter] = useState<DynamicHostFilter>(EMPTY_DYNAMIC_FILTER);
   const [isScheduled, setIsScheduled] = useState(false);
   const [scheduleConfig, setScheduleConfig] = useState<ScheduleConfig>(DEFAULT_SCHEDULE);
   const [lastRunId, setLastRunId] = useState<number | null>(null);
@@ -190,6 +210,15 @@ export function JobsPage({
     queryKey: ["profile-versions", profileId],
     queryFn: () => api.getProfileVersions(profileId as number),
     enabled: profileId !== "",
+  });
+  const applicability = useQuery({
+    queryKey: ["profile-applicability", profileId, profileVersionId, hostIds],
+    queryFn: () =>
+      api.profileApplicability(profileId as number, {
+        host_ids: hostIds,
+        profile_version_id: profileVersionId === "" ? null : profileVersionId,
+      }),
+    enabled: profileId !== "" && hostIds.length > 0 && jobType !== "playbook",
   });
   const playbooks = useQuery({
     queryKey: ["playbooks", operationsScope, operationsPlatform],
@@ -416,16 +445,84 @@ export function JobsPage({
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
 
-  const restartRunMutation = useMutation({
-    mutationFn: (run: JobRun) => {
-      if (!run.job_id || !jobById.get(run.job_id)) {
-        return Promise.reject(new Error(t("jobs.restartMissingJob")));
+  const preflightHostsMutation = useMutation({
+    mutationFn: async (ids: number[]) => {
+      const results = [];
+      for (const id of ids) {
+        results.push(await api.preflightHost(id));
       }
-      return api.runJob(run.job_id);
+      return results;
+    },
+    onSuccess: (results) => {
+      const failed = results.filter((r) => !r.ok);
+      if (failed.length === 0) {
+        toast.success(t("preflight.hostsOk", { count: results.length }));
+      } else {
+        toast.error(
+          t("preflight.hostsFail", {
+            failed: failed.length,
+            total: results.length,
+            targets: failed.map((r) => r.target).join(", "),
+          })
+        );
+      }
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const [restartRun, setRestartRun] = useState<JobRun | null>(null);
+  const [restartSubset, setRestartSubset] = useState<JobRunSubset>("failed");
+  const [restartHostIds, setRestartHostIds] = useState<number[]>([]);
+
+  const restartTargets = useQuery({
+    queryKey: ["job-run-rerun-targets", restartRun?.id],
+    queryFn: () => api.getJobRunRerunTargets(restartRun!.id),
+    enabled: restartRun != null,
+  });
+
+  const restartCandidateHosts = useMemo(() => {
+    const ids = new Set(restartTargets.data?.host_ids ?? []);
+    return (hosts.data?.items ?? []).filter((host: Host) => ids.has(host.id));
+  }, [hosts.data?.items, restartTargets.data?.host_ids]);
+
+  useEffect(() => {
+    if (!restartTargets.data || restartSubset !== "failed") return;
+    if (restartTargets.data.failed_host_ids.length > 0) return;
+    setRestartSubset(restartTargets.data.skipped_host_ids.length > 0 ? "skipped" : "all");
+  }, [restartTargets.data, restartSubset]);
+
+  const openRestartModal = (run: JobRun) => {
+    if (!run.job_id || !jobById.get(run.job_id)) {
+      toast.error(t("jobs.restartMissingJob"));
+      return;
+    }
+    setRestartRun(run);
+    setRestartSubset("failed");
+    setRestartHostIds([]);
+  };
+
+  const closeRestartModal = () => {
+    setRestartRun(null);
+    setRestartHostIds([]);
+  };
+
+  const restartRunMutation = useMutation({
+    mutationFn: async () => {
+      if (!restartRun) {
+        throw new Error(t("jobs.restartMissingJob"));
+      }
+      if (restartSubset === "all") {
+        return api.runJob(restartRun.job_id);
+      }
+      return api.rerunJobRun(restartRun.id, {
+        subset: restartSubset,
+        host_ids: restartSubset === "selected" ? restartHostIds : undefined,
+      });
     },
     onSuccess: (run) => {
       setLastRunId(run.id);
       setSelectedJobId(run.job_id);
+      closeRestartModal();
       queryClient.invalidateQueries({ queryKey: ["job-runs"] });
       toast.success(t("toast.jobRunStarted"));
     },
@@ -480,6 +577,8 @@ export function JobsPage({
     setProfileVersionId("");
     setPlaybookId("");
     setHostIds([]);
+    setTargetMode("hosts");
+    setDynamicFilter(EMPTY_DYNAMIC_FILTER);
     setIsScheduled(false);
     setScheduleConfig(DEFAULT_SCHEDULE);
   };
@@ -493,6 +592,8 @@ export function JobsPage({
     setProfileVersionId,
     setPlaybookId,
     setHostIds,
+    setTargetMode,
+    setDynamicFilter,
     setIsScheduled,
     setScheduleConfig,
     setNetworkCheckMode,
@@ -563,6 +664,11 @@ export function JobsPage({
   const isEditing = editingId !== null;
   const cronExpression = buildCronExpression(scheduleConfig);
 
+  const targetPayload =
+    targetMode === "dynamic"
+      ? { host_ids: [] as number[], dynamic_filter: dynamicFilter }
+      : { host_ids: hostIds, dynamic_filter: null };
+
   const buildCreatePayload = () => {
     const executionType =
       jobType === "ssh"
@@ -574,8 +680,7 @@ export function JobsPage({
             : undefined;
     return {
       name,
-      host_ids: hostIds,
-      dynamic_filter: null,
+      ...targetPayload,
       is_scheduled: isScheduled,
       cron_expression: isScheduled ? cronExpression : undefined,
       profile_id: jobType !== "playbook" && profileId !== "" ? profileId : undefined,
@@ -592,8 +697,7 @@ export function JobsPage({
     if (isNetwork) {
       return {
         name,
-        host_ids: hostIds,
-        dynamic_filter: null,
+        ...targetPayload,
         is_scheduled: isScheduled,
         cron_expression: isScheduled ? cronExpression : null,
         profile_id: profileId !== "" ? profileId : null,
@@ -606,8 +710,7 @@ export function JobsPage({
     if (jobType === "playbook") {
       return {
         name,
-        host_ids: hostIds,
-        dynamic_filter: null,
+        ...targetPayload,
         is_scheduled: isScheduled,
         cron_expression: isScheduled ? cronExpression : null,
         playbook_id: playbookId !== "" ? playbookId : null,
@@ -624,8 +727,7 @@ export function JobsPage({
           : ("python" as const);
     return {
       name,
-      host_ids: hostIds,
-      dynamic_filter: null,
+      ...targetPayload,
       is_scheduled: isScheduled,
       cron_expression: isScheduled ? cronExpression : null,
       profile_id: profileId !== "" ? profileId : null,
@@ -635,7 +737,7 @@ export function JobsPage({
     };
   };
 
-  const hasTarget = hostIds.length > 0;
+  const hasTarget = targetMode === "dynamic" || hostIds.length > 0;
   const isFormValid =
     !!name &&
     (isNetwork ? profileId !== "" : jobType !== "playbook" ? profileId !== "" : playbookId !== "") &&
@@ -660,6 +762,8 @@ export function JobsPage({
       setPlaybookId("");
     }
     setHostIds(template.host_ids);
+    setTargetMode(template.dynamic_filter ? "dynamic" : "hosts");
+    setDynamicFilter(template.dynamic_filter ?? EMPTY_DYNAMIC_FILTER);
     setIsScheduled(template.is_scheduled);
     setScheduleConfig(parseCronExpression(template.cron_expression));
     toast.success(t("jobTemplates.loadedIntoForm"));
@@ -697,8 +801,8 @@ export function JobsPage({
         ref={jobFormPanelRef}
         title={isEditing ? t("jobs.editTitle", { name }) : t("jobs.createJob")}
       >
-        <div className="pf-form pf-form--wide">
-          <div className="pf-form__row">
+        <div className="pf-form pf-form--wide pf-job-composer">
+          <div className="pf-form__row pf-form__row--job-basics">
             <div className="pf-form__group">
               <label htmlFor="job-name">{t("jobs.jobName")}</label>
               <input
@@ -824,7 +928,15 @@ export function JobsPage({
               selected: hostIds.length,
             })}
           >
-            {hosts.isLoading ? (
+            <TargetModeToggle
+              mode={targetMode}
+              onChange={setTargetMode}
+              hostsLabel={t("jobs.targetHosts")}
+              dynamicLabel={t("jobs.targetDynamic")}
+            />
+            {targetMode === "dynamic" ? (
+              <DynamicHostFilterFields value={dynamicFilter} onChange={setDynamicFilter} idPrefix="job-dynamic" />
+            ) : hosts.isLoading ? (
               <Spinner />
             ) : (
               <HostPicker
@@ -837,6 +949,21 @@ export function JobsPage({
             )}
           </CollapsibleFormField>
 
+          {applicability.data && hostIds.length > 0 && profileId !== "" ? (
+            <div
+              className={`pf-alert ${
+                applicability.data.hosts_inapplicable > 0 ? "pf-alert--warning" : "pf-alert--info"
+              }`}
+              role="status"
+            >
+              {t("preflight.applicabilityBanner", {
+                rules: applicability.data.rules_count,
+                applicable: applicability.data.hosts_applicable,
+                inapplicable: applicability.data.hosts_inapplicable,
+              })}
+            </div>
+          ) : null}
+
           <JobSchedulePicker
             enabled={isScheduled}
             onEnabledChange={setIsScheduled}
@@ -845,35 +972,47 @@ export function JobsPage({
           />
 
           <div className="pf-form__actions">
-            {isEditing ? (
-              <>
-                <Button
-                  onClick={() => updateMutation.mutate({ id: editingId, data: buildUpdatePayload() })}
-                  disabled={!isFormValid || updateMutation.isPending}
-                >
-                  {t("jobs.saveChanges")}
-                </Button>
-                <Button variant="secondary" onClick={cancelEdit}>
-                  {t("common.cancel")}
-                </Button>
-              </>
-            ) : (
-              <>
-                <Button
-                  onClick={() => createMutation.mutate(buildCreatePayload())}
-                  disabled={!isFormValid || createMutation.isPending}
-                >
-                  {t("jobs.createButton")}
-                </Button>
-                <Button
-                  variant="secondary"
-                  onClick={saveCurrentAsTemplate}
-                  disabled={!isFormValid || saveTemplateMutation.isPending}
-                >
-                  {t("jobTemplates.saveAsTemplate")}
-                </Button>
-              </>
-            )}
+            {hostIds.length > 0 ? (
+              <Button
+                variant="secondary"
+                onClick={() => preflightHostsMutation.mutate(hostIds.slice(0, 5))}
+                disabled={preflightHostsMutation.isPending}
+                title={t("preflight.checkSelectedHostsHint")}
+              >
+                {t("preflight.checkSelectedHosts")}
+              </Button>
+            ) : null}
+            <div className="pf-form__actions-buttons">
+              {isEditing ? (
+                <>
+                  <Button
+                    onClick={() => updateMutation.mutate({ id: editingId, data: buildUpdatePayload() })}
+                    disabled={!isFormValid || updateMutation.isPending}
+                  >
+                    {t("jobs.saveChanges")}
+                  </Button>
+                  <Button variant="secondary" onClick={cancelEdit}>
+                    {t("common.cancel")}
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    onClick={() => createMutation.mutate(buildCreatePayload())}
+                    disabled={!isFormValid || createMutation.isPending}
+                  >
+                    {t("jobs.createButton")}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={saveCurrentAsTemplate}
+                    disabled={!isFormValid || saveTemplateMutation.isPending}
+                  >
+                    {t("jobTemplates.saveAsTemplate")}
+                  </Button>
+                </>
+              )}
+            </div>
           </div>
         </div>
       </Panel>
@@ -1011,7 +1150,7 @@ export function JobsPage({
           <EmptyState title={t("jobs.noFilterResults")} description={t("jobs.noFilterResultsDesc")} />
         ) : (
           <div className="pf-table-wrap">
-            <table className="pf-table pf-ops-table">
+            <table className="pf-table pf-ops-table pf-jobs-table">
               <thead>
                 <tr>
                   <SortableTh<JobSortKey>
@@ -1035,7 +1174,7 @@ export function JobsPage({
                     direction={jobSort.direction}
                     onSort={toggleJobSort}
                   />
-                  <th>{t("jobs.hostsCol")}</th>
+                  <th className="pf-ops-table__hosts">{t("jobs.hostsCol")}</th>
                   <SortableTh<JobSortKey>
                     label={t("jobs.schedule")}
                     sortKey="is_scheduled"
@@ -1065,10 +1204,14 @@ export function JobsPage({
                         ? t("jobs.playbookRef", { id: job.playbook_id })
                         : t("jobs.profileRef", { id: job.profile_id ?? 0 })}
                     </td>
-                    <td>
-                      {job.host_ids.length === 0
-                        ? t("common.all")
-                        : t("jobTemplates.hostsCount", { count: job.host_ids.length })}
+                    <td className="pf-ops-table__hosts">
+                      {job.dynamic_filter ? (
+                        <Badge variant="neutral">{t("common.all")}</Badge>
+                      ) : (
+                        <Badge variant={job.host_ids.length > 0 ? "info" : "neutral"}>
+                          {t("jobTemplates.hostsCount", { count: job.host_ids.length })}
+                        </Badge>
+                      )}
                     </td>
                     <td>
                       {job.is_scheduled
@@ -1089,6 +1232,25 @@ export function JobsPage({
                           onClick={() => startEdit(job)}
                         >
                           {t("common.edit")}
+                        </Button>
+                        <Button
+                          variant="secondary"
+                          className="pf-btn--sm"
+                          onClick={() => preflightHostsMutation.mutate(job.host_ids.slice(0, 5))}
+                          disabled={
+                            !canExecute ||
+                            preflightHostsMutation.isPending ||
+                            job.host_ids.length === 0
+                          }
+                          title={
+                            job.host_ids.length === 0
+                              ? t("preflight.needExplicitHosts")
+                              : !canExecute
+                                ? t("common.demoActionDisabled")
+                                : t("preflight.checkSelectedHostsHint")
+                          }
+                        >
+                          {t("preflight.checkAccess")}
                         </Button>
                         <Button
                           variant="secondary"
@@ -1139,14 +1301,26 @@ export function JobsPage({
           </p>
           <div className="pf-form__actions">
             {canOperate ? (
-            <Button
-              variant="secondary"
-              onClick={() => runMutation.mutate(selectedJob.id)}
-              disabled={!canExecute || runMutation.isPending}
-              title={!canExecute ? t("common.demoActionDisabled") : undefined}
-            >
-              {t("jobs.runJob")}
-            </Button>
+              <div className="pf-form__actions-buttons">
+                {(selectedJob.host_ids?.length ?? 0) > 0 ? (
+                  <Button
+                    variant="secondary"
+                    onClick={() => preflightHostsMutation.mutate((selectedJob.host_ids ?? []).slice(0, 5))}
+                    disabled={!canExecute || preflightHostsMutation.isPending}
+                    title={t("preflight.checkSelectedHostsHint")}
+                  >
+                    {t("preflight.checkAccess")}
+                  </Button>
+                ) : null}
+                <Button
+                  variant="secondary"
+                  onClick={() => runMutation.mutate(selectedJob.id)}
+                  disabled={!canExecute || runMutation.isPending}
+                  title={!canExecute ? t("common.demoActionDisabled") : undefined}
+                >
+                  {t("jobs.runJob")}
+                </Button>
+              </div>
             ) : null}
           </div>
         </Panel>
@@ -1315,7 +1489,16 @@ export function JobsPage({
                         : t("common.dash")}
                     </td>
                     <td>
-                      <Badge variant={runStatusVariant(run.status)}>{runStatusLabel(t, run.status)}</Badge>
+                      <div className="pf-run-status-cell">
+                        <Badge variant={runStatusVariant(run.status)}>
+                          {runStatusLabel(t, run.status)}
+                        </Badge>
+                        {run.is_partial ? (
+                          <span title={t("jobs.partialRunHint", { id: run.source_run_id ?? "—" })}>
+                            <Badge variant="warning">{t("jobs.partialRunBadge")}</Badge>
+                          </span>
+                        ) : null}
+                      </div>
                     </td>
                     <td>
                       {run.started_at ? new Date(run.started_at).toLocaleString(dateLocale) : t("common.dash")}
@@ -1338,7 +1521,7 @@ export function JobsPage({
                           <Button
                             variant="secondary"
                             className="pf-btn--sm"
-                            onClick={() => restartRunMutation.mutate(run)}
+                            onClick={() => openRestartModal(run)}
                             disabled={
                               restartRunMutation.isPending ||
                               !job ||
@@ -1360,10 +1543,18 @@ export function JobsPage({
                                 title: t("common.stop"),
                                 message: t("jobs.stopConfirm", { id: run.id }),
                                 variant: "warning",
+                                confirmLabel: t("common.stop"),
                               });
                               if (ok) stopRunMutation.mutate(run.id);
                             }}
-                            disabled={stopRunMutation.isPending}
+                            disabled={
+                              stopRunMutation.isPending &&
+                              stopRunMutation.variables === run.id
+                            }
+                            loading={
+                              stopRunMutation.isPending &&
+                              stopRunMutation.variables === run.id
+                            }
                           >
                             {t("common.stop")}
                           </Button>
@@ -1396,6 +1587,181 @@ export function JobsPage({
       </Panel>
 
       <JobRunLogs key={liveRunId ?? "none"} runId={liveRunId} runStatus={liveRunStatus} />
+
+      {restartRun && (
+        <div className="pf-modal pf-modal--auth" role="presentation" onClick={closeRestartModal}>
+          <div
+            className={`pf-modal__panel pf-modal__panel--restart${
+              restartSubset === "selected" ? " pf-modal__panel--restart-wide" : ""
+            }`}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="job-restart-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="pf-modal__header pf-restart-modal__header">
+              <div>
+                <h3 id="job-restart-title" className="pf-modal__title">
+                  {t("jobs.restartModalTitle", { id: restartRun.id })}
+                </h3>
+                <p className="pf-modal__subtitle">{t("jobs.restartModalSubtitle")}</p>
+              </div>
+            </div>
+            <div className="pf-restart-modal__body">
+              <p className="pf-restart-modal__note">{t("jobs.restartSubsetHint")}</p>
+              {restartTargets.isLoading && <Spinner />}
+              {restartTargets.isError && (
+                <div className="pf-alert pf-alert--error">
+                  {restartTargets.error instanceof Error
+                    ? restartTargets.error.message
+                    : t("toast.genericError")}
+                </div>
+              )}
+              {restartTargets.data && (
+                <div
+                  className="pf-restart-options"
+                  role="radiogroup"
+                  aria-labelledby="job-restart-title"
+                >
+                  <label
+                    className={`pf-restart-option${
+                      restartSubset === "all" ? " pf-restart-option--selected" : ""
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="restart-subset"
+                      checked={restartSubset === "all"}
+                      onChange={() => setRestartSubset("all")}
+                    />
+                    <span className="pf-restart-option__copy">
+                      <span className="pf-restart-option__label">
+                        {t("jobs.restartSubsetAll")}
+                      </span>
+                    </span>
+                  </label>
+                  <label
+                    className={`pf-restart-option${
+                      restartSubset === "failed" ? " pf-restart-option--selected" : ""
+                    }${
+                      restartTargets.data.failed_host_ids.length === 0
+                        ? " pf-restart-option--disabled"
+                        : ""
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="restart-subset"
+                      checked={restartSubset === "failed"}
+                      disabled={restartTargets.data.failed_host_ids.length === 0}
+                      onChange={() => setRestartSubset("failed")}
+                    />
+                    <span className="pf-restart-option__copy">
+                      <span className="pf-restart-option__label">
+                        {t("jobs.restartSubsetFailed", {
+                          count: restartTargets.data.failed_host_ids.length,
+                        })}
+                      </span>
+                      {restartTargets.data.failed_host_ids.length === 0 ? (
+                        <span className="pf-restart-option__hint">
+                          {t("jobs.restartNoFailed")}
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                  <label
+                    className={`pf-restart-option${
+                      restartSubset === "skipped" ? " pf-restart-option--selected" : ""
+                    }${
+                      restartTargets.data.skipped_host_ids.length === 0
+                        ? " pf-restart-option--disabled"
+                        : ""
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="restart-subset"
+                      checked={restartSubset === "skipped"}
+                      disabled={restartTargets.data.skipped_host_ids.length === 0}
+                      onChange={() => setRestartSubset("skipped")}
+                    />
+                    <span className="pf-restart-option__copy">
+                      <span className="pf-restart-option__label">
+                        {t("jobs.restartSubsetSkipped", {
+                          count: restartTargets.data.skipped_host_ids.length,
+                        })}
+                      </span>
+                      {restartTargets.data.skipped_host_ids.length === 0 ? (
+                        <span className="pf-restart-option__hint">
+                          {t("jobs.restartNoSkipped")}
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                  <label
+                    className={`pf-restart-option${
+                      restartSubset === "selected" ? " pf-restart-option--selected" : ""
+                    }${
+                      restartCandidateHosts.length === 0 ? " pf-restart-option--disabled" : ""
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="restart-subset"
+                      checked={restartSubset === "selected"}
+                      disabled={restartCandidateHosts.length === 0}
+                      onChange={() => setRestartSubset("selected")}
+                    />
+                    <span className="pf-restart-option__copy">
+                      <span className="pf-restart-option__label">
+                        {t("jobs.restartSubsetSelected")}
+                      </span>
+                    </span>
+                  </label>
+                  {restartSubset === "selected" && (
+                    <div className="pf-restart-picker">
+                      <HostPicker
+                        hosts={restartCandidateHosts}
+                        selectedIds={restartHostIds}
+                        onToggle={(id) =>
+                          setRestartHostIds((prev) =>
+                            prev.includes(id)
+                              ? prev.filter((item) => item !== id)
+                              : [...prev, id]
+                          )
+                        }
+                        onSelectAll={(ids) => setRestartHostIds(ids)}
+                        onClearAll={() => setRestartHostIds([])}
+                        hint={t("jobs.restartSelectHosts")}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+            <div className="pf-restart-modal__actions">
+              <Button variant="secondary" onClick={closeRestartModal}>
+                {t("common.cancel")}
+              </Button>
+              <Button
+                onClick={() => restartRunMutation.mutate()}
+                disabled={
+                  restartRunMutation.isPending ||
+                  restartTargets.isLoading ||
+                  restartTargets.isError ||
+                  (restartSubset === "failed" &&
+                    (restartTargets.data?.failed_host_ids.length ?? 0) === 0) ||
+                  (restartSubset === "skipped" &&
+                    (restartTargets.data?.skipped_host_ids.length ?? 0) === 0) ||
+                  (restartSubset === "selected" && restartHostIds.length === 0)
+                }
+              >
+                {restartRunMutation.isPending ? t("common.loading") : t("jobs.restartConfirm")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

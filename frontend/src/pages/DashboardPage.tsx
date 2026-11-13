@@ -74,7 +74,7 @@ export function DashboardPage() {
   const queryClient = useQueryClient();
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 30000 });
   const profiles = useQuery({ queryKey: ["profiles"], queryFn: () => api.profiles() });
-  const hosts = useQuery({ queryKey: ["hosts"], queryFn: () => api.hosts({ limit: 200 }) });
+  const hostsSummary = useQuery({ queryKey: ["hosts-summary"], queryFn: api.hostsSummary });
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs() });
   const remediations = useQuery({
     queryKey: ["remediations"],
@@ -99,7 +99,7 @@ export function DashboardPage() {
 
   const dataLoadError =
     profiles.isError ||
-    hosts.isError ||
+    hostsSummary.isError ||
     jobs.isError ||
     runs.isError ||
     (canAccessRemediation && remediations.isError) ||
@@ -108,14 +108,13 @@ export function DashboardPage() {
 
   const dataLoading =
     profiles.isLoading ||
-    hosts.isLoading ||
+    hostsSummary.isLoading ||
     jobs.isLoading ||
     runs.isLoading ||
     (canAccessRemediation && remediations.isLoading) ||
     (!isAuditorPortal && playbooks.isLoading) ||
     (canOperate && credentials.isLoading);
 
-  const hostItems = hosts.data?.items ?? [];
   const runItems = runs.data?.items ?? [];
 
   const apiOnline = health.data?.status === "ok";
@@ -123,7 +122,7 @@ export function DashboardPage() {
 
   const retryDashboard = () => {
     void queryClient.invalidateQueries({ queryKey: ["profiles"] });
-    void queryClient.invalidateQueries({ queryKey: ["hosts"] });
+    void queryClient.invalidateQueries({ queryKey: ["hosts-summary"] });
     void queryClient.invalidateQueries({ queryKey: ["jobs"] });
     void queryClient.invalidateQueries({ queryKey: ["job-runs"] });
     void queryClient.invalidateQueries({ queryKey: ["remediations"] });
@@ -144,7 +143,7 @@ export function DashboardPage() {
     if (errored) return "—";
     return value;
   };
-  const activeHosts = hostItems.filter((h) => h.is_active).length;
+  const activeHosts = hostsSummary.data?.active ?? 0;
   const activeJobs = jobs.data?.filter((j) => j.is_active).length ?? 0;
   const scheduledJobs = jobs.data?.filter((j) => j.is_scheduled).length ?? 0;
   const activeRemediations = remediations.data?.filter((j) => j.is_active).length ?? 0;
@@ -254,9 +253,9 @@ export function DashboardPage() {
       <div className="pf-stat-grid pf-dashboard-stats">
         <StatTile
           label={t("dashboard.hosts")}
-          value={statValue(hosts.isLoading, hosts.isError, activeHosts)}
+          value={statValue(hostsSummary.isLoading, hostsSummary.isError, activeHosts)}
           variant="info"
-          sublabel={t("dashboard.hostsTotal", { count: hosts.data?.total ?? hostItems.length })}
+          sublabel={t("dashboard.hostsTotal", { count: hostsSummary.data?.total ?? 0 })}
           to={isAuditorPortal ? undefined : "/hosts"}
         />
         {!isAuditorPortal ? (
@@ -287,7 +286,15 @@ export function DashboardPage() {
           <>
             <StatTile
               label={t("nav.playbooks")}
-              value={statValue(playbooks.isLoading, playbooks.isError, playbooks.data?.length ?? 0)}
+              value={statValue(
+                playbooks.isLoading,
+                playbooks.isError,
+                new Set(
+                  (playbooks.data ?? [])
+                    .filter((pb) => pb.kind === "compliance_template" && pb.profile_id != null)
+                    .map((pb) => pb.profile_id as number)
+                ).size
+              )}
               to="/playbooks"
             />
           </>

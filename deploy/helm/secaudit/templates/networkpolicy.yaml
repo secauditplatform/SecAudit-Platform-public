@@ -120,7 +120,7 @@ spec:
     - ports:
         - protocol: TCP
           port: {{ .Values.externalRedis.port }}
-    # Target hosts, webhooks, package registries, and IdP.
+    # Target hosts, IdP, webhooks, package registries, mail, directory, SNMP.
     - ports:
         - protocol: TCP
           port: 22
@@ -132,6 +132,31 @@ spec:
           port: 5985
         - protocol: TCP
           port: 5986
+        - protocol: UDP
+          port: 161
+        - protocol: TCP
+          port: 389
+        - protocol: TCP
+          port: 636
+        - protocol: TCP
+          port: 25
+        - protocol: TCP
+          port: 465
+        - protocol: TCP
+          port: 587
+    {{- with .Values.networkPolicy.workerExtraEgressPorts }}
+    - ports:
+        {{- range . }}
+        - protocol: {{ .protocol | default "TCP" }}
+          port: {{ .port }}
+        {{- end }}
+    {{- end }}
+    {{- /* ICMP / custom SSH cannot be named in NetworkPolicy; open all protocols to scanned CIDRs. */}}
+    {{- range .Values.networkPolicy.workerTargetCIDRs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+    {{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

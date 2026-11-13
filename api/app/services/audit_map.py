@@ -10,6 +10,7 @@ from sqlalchemy.orm import aliased, selectinload
 from app.core.auth import AuthUser
 from app.models import (
     AuditMapEdge,
+    AuditMapLayout,
     AuditMapService,
     CheckResult,
     CheckScript,
@@ -27,7 +28,13 @@ from app.models import (
     ScriptKind,
 )
 from app.services.object_rbac import apply_owner_scope, assert_can_access
-from secaudit_core.audit_map import UNASSIGNED_SITE, assemble_map, build_edge, parse_open_ports
+from secaudit_core.audit_map import (
+    MAP_VIEWS,
+    UNASSIGNED_SITE,
+    assemble_map,
+    build_edge,
+    parse_open_ports,
+)
 
 
 async def _visible_hosts(
@@ -111,12 +118,23 @@ async def build_audit_map(
         hosts = [host for host in hosts if host.id in allowed]
     host_ids = [host.id for host in hosts]
     positions: dict[int, tuple[float, float]] = {}
+    layouts: dict[str, list[dict]] = {name: [] for name in MAP_VIEWS}
     addresses: dict[int, tuple[str | None, str | None]] = {}
     scan_ports: dict[int, list[int]] = {}
     manual: list[dict] = []
     check_rows: list[dict] = []
     edges: list[dict] = []
     catalog: set[str] = set()
+
+    layout_rows = await db.execute(
+        select(AuditMapLayout).where(AuditMapLayout.owner_sub == user.sub)
+    )
+    for row in layout_rows.scalars():
+        view = row.view if row.view in MAP_VIEWS else "network"
+        entry = {"host_id": row.host_id, "x": row.x, "y": row.y}
+        layouts.setdefault(view, []).append(entry)
+        if view == "network" and (not host_ids or row.host_id in host_ids):
+            positions[row.host_id] = (row.x, row.y)
 
     if host_ids:
         scan_rows = await db.execute(
@@ -242,6 +260,7 @@ async def build_audit_map(
         catalog_executors=catalog,
         edges=edges,
     )
+    payload["layouts"] = layouts
     profile_rows = await db.execute(
         select(Profile.id, Profile.profile_name)
         .where(Profile.is_active.is_(True))
@@ -249,6 +268,59 @@ async def build_audit_map(
     )
     payload["profiles"] = [{"id": row_id, "name": name} for row_id, name in profile_rows.all()]
     return payload
+
+
+async def save_layout(
+    db: AsyncSession,
+    user: AuthUser,
+    *,
+    view: str,
+    positions: list[dict],
+) -> dict[str, list[dict]]:
+    chosen = view if view in MAP_VIEWS else None
+    if chosen is None:
+        raise HTTPException(status_code=400, detail="Unknown audit map view")
+    host_ids = [int(item["host_id"]) for item in positions]
+    for host_id in host_ids:
+        await _require_host(db, user, host_id)
+    if host_ids:
+        existing = await db.execute(
+            select(AuditMapLayout).where(
+                AuditMapLayout.owner_sub == user.sub,
+                AuditMapLayout.view == chosen,
+                AuditMapLayout.host_id.in_(host_ids),
+            )
+        )
+        by_host = {row.host_id: row for row in existing.scalars()}
+        for item in positions:
+            host_id = int(item["host_id"])
+            row = by_host.get(host_id)
+            if row is None:
+                db.add(
+                    AuditMapLayout(
+                        owner_sub=user.sub,
+                        host_id=host_id,
+                        view=chosen,
+                        x=float(item["x"]),
+                        y=float(item["y"]),
+                    )
+                )
+            else:
+                row.x = float(item["x"])
+                row.y = float(item["y"])
+        await db.commit()
+    rows = await db.execute(
+        select(AuditMapLayout).where(
+            AuditMapLayout.owner_sub == user.sub,
+            AuditMapLayout.view == chosen,
+        )
+    )
+    return {
+        chosen: [
+            {"host_id": row.host_id, "x": row.x, "y": row.y}
+            for row in rows.scalars()
+        ]
+    }
 
 
 async def confirm_service(db: AsyncSession, user: AuthUser, host_id: int, port: int) -> AuditMapService:

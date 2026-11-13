@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from app.services.dispatch import (
     cancel_active_run,
@@ -12,6 +13,7 @@ from app.services.dispatch import (
 
 from secaudit_core.celery_dispatch import revoke_task
 from secaudit_core.notifications import enqueue_run_notification, events_for_terminal_status
+from secaudit_core.run_cancel import set_run_cancel_flag
 
 from app.core.auth import AuthUser
 from app.core.roles import require_jobs_run, require_reports
@@ -26,13 +28,17 @@ from app.schemas import (
     JobRead,
     JobRunDetail,
     JobRunRead,
+    JobRunRerunRequest,
+    JobRunRerunTargets,
     JobUpdate,
     PaginatedResponse,
 )
 from app.services.cve_feed import load_feed_entries, references_for_check
 from app.services.audit_log import log_audit_event
+from app.services.job_run_subset import create_subset_run, load_source_run, preview_rerun_targets
 from app.services.job_webhooks import apply_webhook_fields, webhook_read_fields
 from app.services.network_jobs import validate_job_scope
+from app.services.demo_exec_targets import assert_demo_exec_job
 from app.services.object_rbac import (
     apply_owner_scope,
     assert_can_access,
@@ -44,8 +50,8 @@ from app.services.object_rbac import (
 router = APIRouter()
 
 
-def _revoke_celery_task(task_id: str) -> None:
-    revoke_task(task_id, broker_url=settings.celery_broker_url)
+def _revoke_celery_task(task_id: str, *, terminate: bool = False) -> None:
+    revoke_task(task_id, broker_url=settings.celery_broker_url, terminate=terminate)
 
 
 async def _validate_profile_version(
@@ -256,6 +262,7 @@ async def run_job(
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     assert_can_access(user, job.owner_sub, detail="Job not found")
+    await assert_demo_exec_job(db, job)
 
     job_run = JobRun(job_id=job.id, status=JobStatus.PENDING)
     db.add(job_run)
@@ -316,17 +323,128 @@ async def run_job(
     return JobRunRead.model_validate(job_run)
 
 
+@router.get("/runs/{run_id}/rerun-targets", response_model=JobRunRerunTargets)
+async def get_job_run_rerun_targets(
+    run_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_jobs_run),
+) -> JobRunRerunTargets:
+    return JobRunRerunTargets.model_validate(await preview_rerun_targets(db, user, run_id))
+
+
+@router.post("/runs/{run_id}/rerun", response_model=JobRunRead, status_code=201)
+async def rerun_job_run(
+    run_id: int,
+    data: JobRunRerunRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_jobs_run),
+) -> JobRunRead:
+    source, job = await load_source_run(db, user, run_id)
+    job_run = await create_subset_run(
+        db,
+        job=job,
+        source=source,
+        subset=data.subset,
+        host_ids=data.host_ids,
+    )
+    db.add(job_run)
+    await db.flush()
+    if job_run.host_ids:
+        from app.services.demo_exec_targets import assert_demo_exec_host_ids
+
+        await assert_demo_exec_host_ids(db, [int(host_id) for host_id in job_run.host_ids])
+    else:
+        await assert_demo_exec_job(db, job)
+
+    outbox = await enqueue_run_dispatch(
+        db,
+        task_name="app.tasks.run_compliance_job",
+        args=[job_run.id],
+        queue="compliance",
+        callback_kind="job_run",
+        callback_ref_id=job_run.id,
+        correlation=correlation_from_request(request, run_kind="job", run_id=job_run.id),
+    )
+    await commit_and_try_dispatch(db, outbox_id=outbox.id, pending_entity=job_run)
+
+    if job_run.status == JobStatus.FAILED:
+        exc = RuntimeError(job_run.error_message or "Failed to dispatch Celery task")
+        await log_audit_event(
+            db,
+            request,
+            user,
+            action="job.rerun",
+            resource_type="job",
+            resource_id=job.id,
+            resource_name=job.name,
+            outcome="failed",
+            metadata={
+                "run_id": job_run.id,
+                "source_run_id": source.id,
+                "subset": data.subset,
+                "is_partial": job_run.is_partial,
+                "host_ids": job_run.host_ids,
+                "error": str(exc),
+            },
+        )
+        await db.commit()
+        enqueue_run_notification(
+            broker_url=settings.celery_broker_url,
+            settings=settings,
+            trigger_events=events_for_terminal_status(JobStatus.FAILED, source="dispatch"),
+            run_kind="job",
+            run_id=job_run.id,
+            job_id=job.id,
+            job_name=job.name,
+            status=JobStatus.FAILED.value,
+            error_message=str(exc),
+            owner_sub=job.owner_sub,
+        )
+        await db.refresh(job_run)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    await db.flush()
+    await db.refresh(job_run)
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="job.rerun",
+        resource_type="job",
+        resource_id=job.id,
+        resource_name=job.name,
+        metadata={
+            "run_id": job_run.id,
+            "source_run_id": source.id,
+            "subset": data.subset,
+            "is_partial": job_run.is_partial,
+            "host_ids": job_run.host_ids,
+        },
+    )
+    return JobRunRead.model_validate(job_run)
+
+
 @router.get("/runs/{run_id}", response_model=JobRunDetail)
 async def get_job_run(
     run_id: int,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_reports),
+    include_raw: bool = Query(
+        default=False,
+        description="Include check raw_output blobs (large). Default omits them.",
+    ),
 ) -> JobRunDetail:
-    from secaudit_core.waivers import load_active_waivers, waived_fail_ids
+    from app.models import CheckResult
+    from app.services.reports import resolve_run_waived_map
+
+    check_load = selectinload(JobRun.check_results)
+    if not include_raw:
+        check_load = check_load.options(defer(CheckResult.raw_output))
 
     result = await db.execute(
         select(JobRun)
-        .options(selectinload(JobRun.check_results), selectinload(JobRun.job))
+        .options(check_load, selectinload(JobRun.job))
         .where(JobRun.id == run_id)
     )
     job_run = result.scalar_one_or_none()
@@ -334,17 +452,18 @@ async def get_job_run(
         raise HTTPException(status_code=404, detail="Job run not found")
     assert_can_access(user, job_run.job.owner_sub if job_run.job else None, detail="Job run not found")
 
-    waived_map = {}
-    if job_run.job and job_run.job.profile_id is not None:
-        waivers = await load_active_waivers(
-            db, profile_id=job_run.job.profile_id, job_id=job_run.job_id
-        )
-        waived_map = waived_fail_ids(
-            job_run.check_results,
-            waivers,
-            profile_id=job_run.job.profile_id,
-            job_id=job_run.job_id,
-        )
+    if not include_raw:
+        for check in job_run.check_results or []:
+            # Prevent deferred column lazy-load during pydantic validation.
+            set_committed_value(check, "raw_output", None)
+
+    profile_id = job_run.job.profile_id if job_run.job else None
+    waived_map = await resolve_run_waived_map(
+        db,
+        checks=list(job_run.check_results or []),
+        profile_id=profile_id,
+        job_id=job_run.job_id,
+    )
 
     host_ids = {check.host_id for check in job_run.check_results}
     hosts_by_id: dict[int, Host] = {}
@@ -386,17 +505,8 @@ async def get_job_run(
             )
         check_results.append(payload)
 
-    return JobRunDetail(
-        id=job_run.id,
-        job_id=job_run.job_id,
-        status=job_run.status,
-        started_at=job_run.started_at,
-        finished_at=job_run.finished_at,
-        celery_task_id=job_run.celery_task_id,
-        error_message=job_run.error_message,
-        created_at=job_run.created_at,
-        check_results=check_results,
-    )
+    base = JobRunRead.model_validate(job_run)
+    return JobRunDetail(**base.model_dump(), check_results=check_results)
 
 
 @router.post("/runs/{run_id}/stop", response_model=JobRunRead)
@@ -414,19 +524,29 @@ async def stop_job_run(
     job = await db.get(Job, job_run.job_id)
     assert_can_access(user, job.owner_sub if job else None, detail="Job run not found")
 
+    # Flag first: worker ansible watcher polls Redis and killpg in its PID ns.
+    # API-side os.kill is a no-op across Docker PID namespaces.
+    set_run_cancel_flag(settings.redis_url, "job", run_id)
+    await db.refresh(job_run)
+
+    if job_run.status == JobStatus.CANCELLED:
+        return JobRunRead.model_validate(job_run)
+
     if job_run.status not in (JobStatus.PENDING, JobStatus.RUNNING):
         raise HTTPException(status_code=409, detail=f"Cannot stop run in status '{job_run.status.value}'")
 
     if not await cancel_active_run(db, JobRun, run_id):
         await db.refresh(job_run)
+        if job_run.status == JobStatus.CANCELLED:
+            return JobRunRead.model_validate(job_run)
         raise HTTPException(
             status_code=409,
             detail=f"Cannot stop run in status '{job_run.status.value}'",
         )
-    if job_run.celery_task_id:
-        _revoke_celery_task(job_run.celery_task_id)
-    await db.flush()
+    await db.commit()
     await db.refresh(job_run)
+    if job_run.celery_task_id:
+        _revoke_celery_task(job_run.celery_task_id, terminate=False)
     await log_audit_event(
         db,
         request,

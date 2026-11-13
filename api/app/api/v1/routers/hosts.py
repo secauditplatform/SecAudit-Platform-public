@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from sqlalchemy import delete, distinct, or_, select
+from sqlalchemy import delete, distinct, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -45,9 +45,11 @@ from app.schemas import (
     HostTagRead,
     HostRead,
     HostLinkedCredentialRead,
+    HostsSummary,
     HostSshFingerprintScanResponse,
     HostUpdate,
     PaginatedResponse,
+    PreflightProbeResponse,
 )
 from app.services.audit_log import log_audit_event
 from app.services.host_credentials import (
@@ -222,24 +224,24 @@ async def _load_host(db: AsyncSession, host_id: int) -> Host | None:
     return result.scalar_one_or_none()
 
 
-@router.get("", response_model=PaginatedResponse[HostRead])
-async def list_hosts(
-    db: AsyncSession = Depends(get_db),
-    user: AuthUser = Depends(require_reports),
-    page: tuple[int, int] = Depends(pagination_params),
-    tag: list[str] = Query(default=[]),
-    active_only: bool = Query(default=False),
-    search: str | None = Query(default=None),
-    os_type: str | None = Query(default=None),
-    site: str | None = Query(default=None),
-    environment: str | None = Query(default=None),
-    criticality: str | None = Query(default=None),
-) -> PaginatedResponse[HostRead]:
-    offset, limit = page
-    stmt = select(Host).options(*_HOST_LOAD_OPTIONS)
+def _hosts_base_stmt(
+    user: AuthUser,
+    *,
+    tag: list[str] | None = None,
+    active_only: bool = False,
+    is_active: bool | None = None,
+    search: str | None = None,
+    os_type: str | None = None,
+    site: str | None = None,
+    environment: str | None = None,
+    criticality: str | None = None,
+):
+    stmt = select(Host)
     stmt = apply_owner_scope(stmt, Host.owner_sub, user)
     stmt = stmt.where(Host.is_ephemeral.is_(False))
-    if active_only:
+    if is_active is not None:
+        stmt = stmt.where(Host.is_active.is_(is_active))
+    elif active_only:
         stmt = stmt.where(Host.is_active.is_(True))
     if search:
         q = f"%{search.strip()}%"
@@ -264,6 +266,68 @@ async def list_hosts(
             .where(HostTag.name.in_(tag))
         )
         stmt = stmt.where(Host.id.in_(tag_stmt))
+    return stmt
+
+
+@router.get("/summary", response_model=HostsSummary)
+async def hosts_summary(
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+) -> HostsSummary:
+    """Lightweight inventory counters for dashboards (no host rows)."""
+    total = int(
+        (
+            await db.execute(
+                apply_owner_scope(
+                    select(func.count()).select_from(Host).where(Host.is_ephemeral.is_(False)),
+                    Host.owner_sub,
+                    user,
+                )
+            )
+        ).scalar_one()
+    )
+    active = int(
+        (
+            await db.execute(
+                apply_owner_scope(
+                    select(func.count())
+                    .select_from(Host)
+                    .where(Host.is_ephemeral.is_(False), Host.is_active.is_(True)),
+                    Host.owner_sub,
+                    user,
+                )
+            )
+        ).scalar_one()
+    )
+    return HostsSummary(total=total, active=active, inactive=total - active)
+
+
+@router.get("", response_model=PaginatedResponse[HostRead])
+async def list_hosts(
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+    page: tuple[int, int] = Depends(pagination_params),
+    tag: list[str] = Query(default=[]),
+    active_only: bool = Query(default=False),
+    is_active: bool | None = Query(default=None),
+    search: str | None = Query(default=None),
+    os_type: str | None = Query(default=None),
+    site: str | None = Query(default=None),
+    environment: str | None = Query(default=None),
+    criticality: str | None = Query(default=None),
+) -> PaginatedResponse[HostRead]:
+    offset, limit = page
+    stmt = _hosts_base_stmt(
+        user,
+        tag=tag,
+        active_only=active_only,
+        is_active=is_active,
+        search=search,
+        os_type=os_type,
+        site=site,
+        environment=environment,
+        criticality=criticality,
+    ).options(*_HOST_LOAD_OPTIONS)
     stmt = stmt.order_by(Host.name)
     hosts, total = await paginate_scalars(db, stmt, offset=offset, limit=limit)
     return PaginatedResponse(
@@ -616,6 +680,20 @@ async def update_host(
         else:
             await replace_host_credentials(db, host, user, [credential_id])
 
+    new_hostname = updates.get("hostname")
+    if (
+        isinstance(new_hostname, str)
+        and new_hostname.strip()
+        and new_hostname.strip() != (host.hostname or "").strip()
+        and host.ssh_known_hosts_entry
+        and not clear_ssh
+    ):
+        from secaudit_core.ssh_fingerprint import retarget_known_hosts_entry
+
+        host.ssh_known_hosts_entry = retarget_known_hosts_entry(
+            host.ssh_known_hosts_entry, new_hostname.strip()
+        )
+
     for field, value in updates.items():
         setattr(host, field, value)
 
@@ -688,6 +766,43 @@ async def unlink_credential_from_host(
         resource_name=host.name,
     )
     return _host_to_read(host)
+
+
+@router.post("/{host_id}/preflight", response_model=PreflightProbeResponse)
+async def preflight_host(
+    host_id: int,
+    request: Request,
+    credential_id: int | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR, UserRole.ADMIN)),
+) -> PreflightProbeResponse:
+    """TCP + auth (+ sudo/python3/oscap on UNIX) probe for a host."""
+    from app.services.preflight import dispatch_host_probe
+
+    host = await db.get(Host, host_id)
+    if not host:
+        raise HTTPException(status_code=404, detail="Host not found")
+    assert_can_access(user, host.owner_sub, detail="Host not found")
+    if credential_id is not None:
+        from app.models import Credential
+
+        cred = await db.get(Credential, credential_id)
+        if not cred:
+            raise HTTPException(status_code=404, detail="Credential not found")
+        assert_credential_attachable(user, cred.owner_sub)
+
+    payload = await dispatch_host_probe(host_id, credential_id)
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="host.preflight",
+        resource_type="host",
+        resource_id=host.id,
+        resource_name=host.name,
+        metadata={"ok": payload.get("ok"), "credential_id": payload.get("credential_id")},
+    )
+    return PreflightProbeResponse.model_validate(payload)
 
 
 @router.post("/{host_id}/scan-ssh-fingerprint", response_model=HostSshFingerprintScanResponse)
@@ -793,8 +908,6 @@ async def set_host_tags(
 
     await db.flush()
     result = await db.execute(
-        select(Host)
-        .options(selectinload(Host.tags).selectinload(HostTagLink.tag))
-        .where(Host.id == host_id)
+        select(Host).options(*_HOST_LOAD_OPTIONS).where(Host.id == host_id)
     )
     return _host_to_read(result.scalar_one())

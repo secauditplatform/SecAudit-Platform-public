@@ -85,6 +85,31 @@ def validate_ssh_scan_host(hostname: str) -> str:
     return host
 
 
+def retarget_known_hosts_entry(entry: str | None, hostname: str) -> str | None:
+    """Rewrite known_hosts host markers to the current connection name.
+
+    Fingerprints are often scanned against an IP, then the inventory hostname is
+    switched to a DNS name (or the reverse). OpenSSH/AsyncSSH match on the
+    marker, so keep the key material and point it at the active hostname.
+    Hashed markers (|1|…) cannot be rewritten and are left unchanged.
+    """
+    host = (hostname or "").strip()
+    text = (entry or "").strip()
+    if not text or not host:
+        return text or None
+    lines: list[str] = []
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = raw.split()
+        if len(parts) < 2 or parts[0].startswith("|"):
+            lines.append(raw)
+            continue
+        lines.append(" ".join([host, *parts[1:]]))
+    return "\n".join(lines) if lines else None
+
+
 def scan_ssh_host_key(hostname: str, port: int = 22, *, timeout: int = 15) -> tuple[str, str]:
     """Fetch host keys via ssh-keyscan. Returns (fingerprint, known_hosts_line)."""
     host = validate_ssh_scan_host(hostname)

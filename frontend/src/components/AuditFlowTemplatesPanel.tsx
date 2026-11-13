@@ -25,6 +25,7 @@ type SaveDraft = {
   site: string;
   isScheduled: boolean;
   scheduleConfig: ScheduleConfig;
+  autoExecute: boolean;
   isActive: boolean;
 };
 
@@ -51,6 +52,7 @@ const emptySave = (): SaveDraft => ({
   site: "",
   isScheduled: false,
   scheduleConfig: { ...DEFAULT_SCHEDULE },
+  autoExecute: false,
   isActive: true,
 });
 
@@ -168,6 +170,7 @@ export function AuditFlowTemplatesPanel({
         description?: string;
         is_scheduled?: boolean;
         cron_expression?: string | null;
+        auto_execute?: boolean;
         is_active?: boolean;
         inventory_scope?: { tags: string[]; site?: string | null } | null;
       };
@@ -242,6 +245,7 @@ export function AuditFlowTemplatesPanel({
       cron_expression: saveForm.isScheduled
         ? buildCronExpression(saveForm.scheduleConfig)
         : undefined,
+      auto_execute: saveForm.autoExecute,
       is_active: saveForm.isActive,
     });
   };
@@ -256,6 +260,7 @@ export function AuditFlowTemplatesPanel({
       ...draftFromScope(template.inventory_scope),
       isScheduled: template.is_scheduled,
       scheduleConfig: parseCronExpression(template.cron_expression),
+      autoExecute: template.auto_execute,
       isActive: template.is_active,
     });
   };
@@ -276,6 +281,7 @@ export function AuditFlowTemplatesPanel({
         cron_expression: editForm.isScheduled
           ? buildCronExpression(editForm.scheduleConfig)
           : null,
+        auto_execute: editForm.autoExecute,
         is_active: editForm.isActive,
         inventory_scope: editScope,
       },
@@ -345,6 +351,17 @@ export function AuditFlowTemplatesPanel({
             {saveForm.isScheduled ? (
               <p className="pf-audit-flow-templates__cron-preview">{cronPreview}</p>
             ) : null}
+
+            <label className="pf-notify-switch">
+              <input
+                type="checkbox"
+                checked={saveForm.autoExecute}
+                onChange={(e) => setSaveForm((prev) => ({ ...prev, autoExecute: e.target.checked }))}
+              />
+              <span className="pf-notify-switch__track" aria-hidden />
+              <span className="pf-notify-switch__label">{t("auditFlow.templateAutoExecute")}</span>
+            </label>
+            <p className="pf-form__hint">{t("auditFlow.templateAutoExecuteHint")}</p>
 
             <label className="pf-notify-switch">
               <input
@@ -448,6 +465,9 @@ export function AuditFlowTemplatesPanel({
                           <Badge variant={template.is_scheduled ? "info" : "neutral"}>
                             {scheduleLabel}
                           </Badge>
+                          {template.auto_execute ? (
+                            <Badge variant="info">{t("auditFlow.templateAutoExecuteBadge")}</Badge>
+                          ) : null}
                           <Badge variant="neutral">
                             {t("auditFlow.templateCreds", {
                               count: template.credentials?.length ?? 0,
@@ -539,6 +559,20 @@ export function AuditFlowTemplatesPanel({
                         {editForm.isScheduled ? (
                           <p className="pf-audit-flow-templates__cron-preview">{editCronPreview}</p>
                         ) : null}
+                        <label className="pf-notify-switch">
+                          <input
+                            type="checkbox"
+                            checked={editForm.autoExecute}
+                            onChange={(e) =>
+                              setEditForm((prev) => ({ ...prev, autoExecute: e.target.checked }))
+                            }
+                          />
+                          <span className="pf-notify-switch__track" aria-hidden />
+                          <span className="pf-notify-switch__label">
+                            {t("auditFlow.templateAutoExecute")}
+                          </span>
+                        </label>
+                        <p className="pf-form__hint">{t("auditFlow.templateAutoExecuteHint")}</p>
                         <label className="pf-notify-switch">
                           <input
                             type="checkbox"

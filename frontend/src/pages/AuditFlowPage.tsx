@@ -205,7 +205,7 @@ const INVENTORY_DRIFT_METRICS: AuditFlowInventoryChange[] = [
 
 export function AuditFlowPage() {
   const { t } = useTranslation();
-  const { canExecute } = useAuth();
+  const { canDiscover } = useAuth();
   const scanLimits = useQuery({
     queryKey: ["scan-limits"],
     queryFn: () => api.scanLimits(),
@@ -446,6 +446,52 @@ export function AuditFlowPage() {
     onError: (err: Error) => toast.error(err.message),
   });
 
+  const catalogQuery = useQuery({
+    queryKey: ["credentials"],
+    queryFn: () => api.credentials(),
+    enabled: run?.status === "ready",
+  });
+  const catalogCreds = (catalogQuery.data ?? []).filter((c) =>
+    ["ssh_password", "ssh_key", "winrm"].includes(c.credential_type)
+  );
+  const [catalogSel, setCatalogSel] = useState<number[]>([]);
+  const [bulkCred, setBulkCred] = useState("");
+  const [bulkProfile, setBulkProfile] = useState("");
+
+  const addCatalogMutation = useMutation({
+    mutationFn: async (ids: number[]) => {
+      let updated: AuditFlowRun | null = null;
+      for (const id of ids) {
+        updated = await api.addAuditFlowCatalogCredential(activeId!, { credential_id: id });
+      }
+      return updated;
+    },
+    onSuccess: (updated) => {
+      if (updated) queryClient.setQueryData(["audit-flow-run", updated.id], updated);
+      queryClient.invalidateQueries({ queryKey: ["audit-flow-runs"] });
+      setCatalogSel([]);
+      toast.success(t("auditFlow.credSaved"));
+    },
+    onError: (err: Error) => {
+      queryClient.invalidateQueries({ queryKey: ["audit-flow-run", activeId] });
+      toast.error(err.message);
+    },
+  });
+
+  const bulkMutation = useMutation({
+    mutationFn: (patch: { credential_id?: number; profile_id?: number }) =>
+      api.patchAuditFlowHosts(
+        activeId!,
+        (run?.hosts ?? []).filter((h) => h.selected && !h.job_run_id).map((h) => ({ id: h.id, ...patch }))
+      ),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(["audit-flow-run", updated.id], updated);
+      queryClient.invalidateQueries({ queryKey: ["audit-flow-runs"] });
+      toast.success(t("auditFlow.bulkApplied"));
+    },
+    onError: (err: Error) => toast.error(err.message),
+  });
+
   const deleteMutation = useMutation({
     mutationFn: (id: number) => api.deleteAuditFlowRun(id),
     onSuccess: (_void, id) => {
@@ -647,13 +693,30 @@ export function AuditFlowPage() {
     );
   };
 
+  const hostHasPendingExtras = (host: AuditFlowHost) => {
+    const launched = new Set(
+      (host.extra_checks ?? [])
+        .map((item) => item.profile_id)
+        .filter((id): id is number => typeof id === "number")
+    );
+    return (host.extra_profiles ?? []).some(
+      (item) =>
+        Boolean(item.selected) &&
+        typeof item.profile_id === "number" &&
+        !launched.has(item.profile_id) &&
+        item.profile_id !== host.profile_id
+    );
+  };
   const canContinue = Boolean(
     run && run.status === "ready" && run.hosts.some((host) => !host.job_run_id)
   );
   const hostEditable = (host: AuditFlowHost) => canContinue && !host.job_run_id;
   const hostsReadyToExecute = Boolean(
     run?.hosts.some(
-      (host) => host.selected && host.credential_id && !host.job_run_id && host.profile_id
+      (host) =>
+        host.selected &&
+        host.credential_id &&
+        ((!host.job_run_id && host.profile_id) || hostHasPendingExtras(host))
     )
   );
   const orderedHosts = useMemo(
@@ -1140,6 +1203,47 @@ export function AuditFlowPage() {
                     ))
                   )}
                 </div>
+                {run?.status === "ready" ? (
+                  <div className="pf-audit-flow-list">
+                    <strong>{t("auditFlow.fromCatalog")}</strong>
+                    {catalogCreds.length === 0 ? (
+                      <p className="pf-form__hint">{t("auditFlow.catalogEmpty")}</p>
+                    ) : (
+                      <>
+                        {catalogCreds.map((c) => (
+                          <label key={c.id} className="pf-audit-flow-option">
+                            <input
+                              type="checkbox"
+                              className="pf-checkbox-control"
+                              checked={catalogSel.includes(c.id)}
+                              onChange={(e) =>
+                                setCatalogSel((prev) =>
+                                  e.target.checked ? [...prev, c.id] : prev.filter((id) => id !== c.id)
+                                )
+                              }
+                            />
+                            <span className="pf-audit-flow-option__copy">
+                              <span className="pf-audit-flow-option__title">{c.name}</span>
+                              <span className="pf-audit-flow-option__hint">
+                                {c.credential_type}
+                                {c.username ? ` · ${c.username}` : ""}
+                              </span>
+                            </span>
+                          </label>
+                        ))}
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          className="pf-btn--sm"
+                          disabled={catalogSel.length === 0 || addCatalogMutation.isPending}
+                          onClick={() => addCatalogMutation.mutate(catalogSel)}
+                        >
+                          {t("auditFlow.addFromCatalog")}
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                ) : null}
               </section>
 
               <label className="pf-audit-flow-option" htmlFor="audit-flow-save-inventory">
@@ -1180,12 +1284,12 @@ export function AuditFlowPage() {
                   startMutation.mutate();
                 }}
                 disabled={
-                  !canExecute ||
+                  !canDiscover ||
                   startMutation.isPending ||
                   findIpv6Prefix(targets) != null ||
                   targets.flatMap((item) => item.split(/[\s,;\r\n]+/)).filter((t) => t.trim()).length === 0
                 }
-                title={!canExecute ? t("common.demoActionDisabled") : undefined}
+                title={!canDiscover ? t("common.demoActionDisabled") : undefined}
               >
                 {t("auditFlow.startScan")}
               </Button>
@@ -1427,6 +1531,44 @@ export function AuditFlowPage() {
                       </p>
                     </div>
                   </header>
+                  {step === "review" && canContinue ? (
+                    <div className="pf-audit-flow-list">
+                      <select
+                        className="pf-select"
+                        aria-label={t("auditFlow.bulkAssignCredential")}
+                        value={bulkCred}
+                        disabled={(run.credentials ?? []).length === 0 || reviewStats.selected === 0}
+                        onChange={(e) => {
+                          setBulkCred("");
+                          if (e.target.value) bulkMutation.mutate({ credential_id: Number(e.target.value) });
+                        }}
+                      >
+                        <option value="">{t("auditFlow.bulkAssignCredential")}</option>
+                        {(run.credentials ?? []).map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        className="pf-select"
+                        aria-label={t("auditFlow.bulkAssignProfile")}
+                        value={bulkProfile}
+                        disabled={reviewStats.selected === 0}
+                        onChange={(e) => {
+                          setBulkProfile("");
+                          if (e.target.value) bulkMutation.mutate({ profile_id: Number(e.target.value) });
+                        }}
+                      >
+                        <option value="">{t("auditFlow.bulkAssignProfile")}</option>
+                        {(profilesQuery.data ?? []).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.profile_name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
                   <div
                     className={`pf-table-wrap pf-audit-flow-review__table${
                       addingCredHostId != null ? " pf-audit-flow-review__table--editing" : ""
@@ -1840,7 +1982,7 @@ export function AuditFlowPage() {
               </>
             )}
           </div>
-          {(step === "review" || step === "checks") && (
+          {(step === "review" || step === "checks" || (step === "results" && hostsReadyToExecute)) && (
             <div className="pf-audit-flow-footer">
               {step === "checks" ? (
                 <span className="pf-audit-flow-footer__note pf-audit-flow-footer__live">
@@ -1853,13 +1995,15 @@ export function AuditFlowPage() {
                     {t("auditFlow.reviewSelected", { count: reviewStats.selected })}
                   </span>
                   <div className="pf-audit-flow-footer__actions">
-                    <Button type="button" variant="secondary" onClick={() => goToStep("setup")}>
-                      {t("auditFlow.changeSettings")}
-                    </Button>
+                    {step === "review" ? (
+                      <Button type="button" variant="secondary" onClick={() => goToStep("setup")}>
+                        {t("auditFlow.changeSettings")}
+                      </Button>
+                    ) : null}
                     <Button
                       onClick={() => executeMutation.mutate()}
-                      disabled={executeMutation.isPending || !canExecute || !hostsReadyToExecute}
-                      title={!canExecute ? t("common.demoActionDisabled") : undefined}
+                      disabled={executeMutation.isPending || !canDiscover || !hostsReadyToExecute}
+                      title={!canDiscover ? t("common.demoActionDisabled") : undefined}
                     >
                       {t("auditFlow.execute")}
                     </Button>
@@ -1879,7 +2023,7 @@ export function AuditFlowPage() {
 
       <Panel title={t("auditFlow.templates")}>
         <AuditFlowTemplatesPanel
-          canManage={canExecute}
+          canManage={canDiscover}
           draftTargets={targets}
           draftCredentials={creds
             .filter((c) => c.username.trim() && c.secret.trim())

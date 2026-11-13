@@ -15,9 +15,11 @@ services:
   api:
     environment:
       DEMO_MODE: "true"
-      DEMO_MAX_SESSIONS: ${DEMO_MAX_SESSIONS:-25}
-      DEMO_SESSION_IDLE_SECONDS: ${DEMO_SESSION_IDLE_SECONDS:-300}
+      DEMO_MAX_SESSIONS: ${DEMO_MAX_SESSIONS:-100}
+      DEMO_SESSION_IDLE_SECONDS: ${DEMO_SESSION_IDLE_SECONDS:-120}
       DEMO_OPERATOR_USERNAMES: ${DEMO_OPERATOR_USERNAMES:-}
+      # Hard allowlist for compliance/remediation/playbook targets (Docker lab network).
+      DEMO_EXEC_ALLOWED_CIDRS: ${DEMO_EXEC_ALLOWED_CIDRS:-172.18.0.0/16}
       LOCAL_AUTH_ENABLED: "true"
       NOTIFICATIONS_ENABLED: "false"
       SCHEDULED_REPORTS_ENABLED: "false"
@@ -39,6 +41,7 @@ services:
   worker:
     environment:
       DEMO_MODE: "true"
+      DEMO_EXEC_ALLOWED_CIDRS: ${DEMO_EXEC_ALLOWED_CIDRS:-172.18.0.0/16}
       LOCAL_AUTH_ENABLED: "true"
       NOTIFICATIONS_ENABLED: "false"
       SCHEDULED_REPORTS_ENABLED: "false"

@@ -42,4 +42,18 @@ async def enforce_rate_limit(
     except HTTPException:
         raise
     except Exception:
-        logger.warning("Rate limit check failed for scope %s; allowing request", scope, exc_info=True)
+        # Auth scopes must fail closed in production when Redis is down.
+        auth_scopes = {"auth_local", "auth_mfa", "auth_demo", "auth_refresh", "login", "mfa"}
+        if settings.app_env == "production" and scope in auth_scopes:
+            logger.error(
+                "Rate limit check failed for auth scope %s; rejecting request (fail-closed)",
+                scope,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Authentication temporarily unavailable. Try again later.",
+            ) from None
+        logger.warning(
+            "Rate limit check failed for scope %s; allowing request", scope, exc_info=True
+        )

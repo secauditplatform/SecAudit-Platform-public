@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 
 from app.celery_app import celery_app, settings
+from app.audit_flow_execute import run_audit_flow_execute_sync
 from app.audit_flow_runner import run_audit_flow_reprobe_sync, run_audit_flow_scan_sync
 from app.logging_pub import publish_audit_flow_log
 from secaudit_core.audit_flow_scope import compose_template_targets, load_inventory_scope_hosts, normalize_inventory_scope
@@ -45,6 +46,20 @@ def run_audit_flow_reprobe_task(
         host_ids=host_ids,
     )
     return {"audit_flow_run_id": run_id, "reprobe": True}
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.audit_flow.run_audit_flow_execute_task",
+    **TASK_RETRY_KWARGS,
+)
+def run_audit_flow_execute_task(self, run_id: int, **_kwargs) -> dict:
+    publish_audit_flow_log(run_id, f"Worker auto-executing compliance for task #{run_id}")
+    return run_audit_flow_execute_sync(
+        run_id,
+        database_url=settings.database_url_sync,
+        redis_url=settings.redis_url,
+    )
 
 
 @celery_app.task(name="app.tasks.audit_flow.run_scheduled_audit_flow_templates")

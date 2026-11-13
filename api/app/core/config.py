@@ -13,8 +13,6 @@ class Settings(SecAuditSettings):
     auth_enabled: bool = True
     # Required when AUTH_ENABLED=false outside production (synthetic admin).
     allow_auth_disabled: bool = False
-    # Public demo stand: block execute/mutate APIs (jobs, remediation, scans, …).
-    demo_mode: bool = False
     # Max concurrent one-click demo sessions (Redis-backed).
     demo_max_sessions: int = 5
     # Drop a demo session after this many seconds without API activity.

@@ -7,7 +7,7 @@ class SecAuditSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
-    app_version: str = "1.8.0"
+    app_version: str = "1.9.0"
     secret_key: str = "dev-secret-key"
 
     # Data-at-rest encryption backend: fernet (dev), vault (Transit), aws_kms (BYO-KMS).
@@ -60,8 +60,21 @@ class SecAuditSettings(BaseSettings):
     stale_run_timeout_seconds: int | None = None
     pending_orphan_timeout_seconds: int | None = None
     beat_lock_ttl_seconds: int = 55
+    # Cross-JobRun host mutex (SSH/WinRM); TTL covers package/SCAP script defaults.
+    host_lock_ttl_seconds: int = 1800
+    # How long a run queues for a busy host. None = wait up to host_lock_ttl_seconds.
+    host_lock_wait_seconds: float | None = None
     job_host_concurrency: int = 4
+    job_host_concurrency_max: int = 16
+    # Wall-clock budget per host when sizing soft time limit for a JobRun.
+    job_host_time_budget_seconds: int = 180
+    # Hard wall-clock for one ansible-playbook child (kills hung SSH/process tree).
+    ansible_playbook_timeout_seconds: int = 1800
+    # Notify when an approved waiver expires within this many days.
+    waiver_expiring_days: int = 7
     job_log_ttl_seconds: int = 86400
+    # Purge terminal JobRuns older than N days (0 = disabled). Protects baselines / waiver jobs.
+    job_run_retention_days: int = 0
     raw_output_max_chars: int = 16000
 
     profiles_path: str = "/profiles"
@@ -75,6 +88,12 @@ class SecAuditSettings(BaseSettings):
     # Default /20 for operators; admins may use a wider limit (smaller number), e.g. /16.
     inventory_max_cidr_prefix_len: int = 20
     inventory_max_cidr_prefix_len_admin: int = 16
+
+    # Public demo stand: guest execute/mutate locks + hard local-network allowlist for runs.
+    demo_mode: bool = False
+    # Comma-separated CIDRs that compliance/remediation/playbook targets may resolve to.
+    # Empty while DEMO_MODE=true rejects every remote execution target.
+    demo_exec_allowed_cidrs: str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 
     notifications_enabled: bool = True
     # When true, webhook/SIEM URLs may target RFC1918 hosts (still blocks metadata/loopback).
@@ -110,13 +129,39 @@ class SecAuditSettings(BaseSettings):
     def stale_run_timeout_effective(self) -> int:
         if self.stale_run_timeout_seconds is not None:
             return self.stale_run_timeout_seconds
-        return self.celery_task_time_limit * 2
+        # Stay ahead of job_soft_time_limit_for_hosts cap (12h) + hard buffer.
+        return max(self.celery_task_time_limit * 2, 12 * 3600 + 900)
 
     @property
     def pending_orphan_timeout_effective(self) -> int:
         if self.pending_orphan_timeout_seconds is not None:
             return self.pending_orphan_timeout_seconds
         return min(600, max(120, self.celery_task_soft_time_limit // 4))
+
+    @property
+    def host_lock_wait_effective(self) -> float:
+        """Seconds to queue for ``host_lock`` before giving up (SKIP HOST_BUSY)."""
+        if self.host_lock_wait_seconds is not None:
+            return max(0.0, float(self.host_lock_wait_seconds))
+        return float(max(1, int(self.host_lock_ttl_seconds)))
+
+    def job_host_concurrency_for(self, host_count: int) -> int:
+        """Scale in-task host pool with fleet size, capped by job_host_concurrency_max."""
+        base = max(1, int(self.job_host_concurrency))
+        if host_count <= 0:
+            return base
+        # Roughly one extra worker slot per 25 hosts above the base pool.
+        scaled = base + max(0, host_count - base) // 25
+        return min(max(base, scaled), max(base, int(self.job_host_concurrency_max)))
+
+    def job_soft_time_limit_for_hosts(self, host_count: int) -> int:
+        """Soft time limit so large fleets are not killed by the default 1h ceiling."""
+        concurrency = self.job_host_concurrency_for(host_count)
+        budget = max(30, int(self.job_host_time_budget_seconds))
+        waves = max(1, (max(0, host_count) + concurrency - 1) // concurrency)
+        needed = waves * budget + 600
+        # Cap at 12h so a stuck run still eventually soft-fails.
+        return min(max(int(self.celery_task_soft_time_limit), needed), 12 * 3600)
 
     worker_heartbeat_max_age_seconds: int = 120
     outbox_poll_batch_size: int = 50

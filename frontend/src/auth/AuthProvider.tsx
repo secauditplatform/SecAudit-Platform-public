@@ -44,8 +44,10 @@ type AuthContextValue = {
   isAdmin: boolean;
   /** Browse/operate UI (nav + forms). True for admin/operator even on the demo stand. */
   canOperate: boolean;
-  /** Start compliance jobs, nmap/AuditFlow scans, remediation, playbook runs. False in demo. */
+  /** Start compliance/remediation/playbook runs (demo guests included; targets are CIDR-limited). */
   canExecute: boolean;
+  /** Inventory/AuditFlow discovery and host import. False for demo guests. */
+  canDiscover: boolean;
   canAccessRemediation: boolean;
   canViewScripts: boolean;
   canManageUsers: boolean;
@@ -72,6 +74,7 @@ const AuthContext = createContext<AuthContextValue>({
   isAdmin: false,
   canOperate: false,
   canExecute: false,
+  canDiscover: false,
   canAccessRemediation: false,
   canViewScripts: false,
   canManageUsers: false,
@@ -445,10 +448,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const isDemoOperator =
     demoMode && demoOperatorUsernames.includes((username || "").trim().toLowerCase());
   const guestDemoMode = demoMode && !isDemoOperator;
-  const canExecute = (!demoMode || isDemoOperator) && canOperate;
+  const canExecute = canOperate;
+  const canDiscover = (!demoMode || isDemoOperator) && canOperate;
   const canAccessRemediation = !authEnabled || roles.includes(ADMIN_ROLE);
   const canViewScripts = !authEnabled || roles.includes(ADMIN_ROLE);
-  const canManageUsers = !authEnabled || roles.includes(ADMIN_ROLE);
+  const canManageUsers =
+    (!demoMode || isDemoOperator) && (!authEnabled || roles.includes(ADMIN_ROLE));
   const canViewReports =
     !authEnabled ||
     roles.includes(ADMIN_ROLE) ||
@@ -468,6 +473,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     isAdmin,
     canOperate,
     canExecute,
+    canDiscover,
     canAccessRemediation,
     canViewScripts,
     canManageUsers,

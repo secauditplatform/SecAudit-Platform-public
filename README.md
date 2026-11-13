@@ -26,6 +26,18 @@ It is built for security and infrastructure teams that need a controlled, audita
 - **Security built in** — Keycloak OIDC or local users, object-level RBAC, encrypted credentials, audit trail, and SIEM export.
 - **Production-ready packaging** — develop on lab Compose; deploy with hardened Compose or Helm on your infrastructure.
 
+## What's new in v1.9.0
+
+- **Remediation from failed rules** — pick which failed rules to remediate from a finished run, dry-run with Ansible `--check --diff`, and optionally re-audit when remediation finishes.
+- **Host-subset reruns and preflight** — re-run a job on selected hosts only; probe SSH/WinRM access and profile applicability before a full run.
+- **Large fleets stay responsive** — paginated hosts, leaner check payloads, and Celery limits that scale with host count.
+
+## What's new in v1.8.0
+
+- **Profile versions and script variants** — named check sets with one active version, optional job pinning, and a version snapshot in every run; add or remove audit and remediation scripts without re-importing, and see which jobs, runs, and results a version deletion removes.
+- **UNIX hosts** — FreeBSD, OpenBSD, NetBSD, Solaris/illumos, AIX, HP-UX, and macOS get a platform tab, host filter, SSH fingerprint, playbook scope, and inventory playbook.
+- **Service credentials only where needed** — a profile asks for a service login only when its audit script reads one; remote commands get EOF on stdin, so a waiting tool cannot hold a run until timeout.
+
 ## What's new in v1.7.0
 
 v1.7.0 adds AAG, an assistant that sits beside the audit. It can explain a finished check or draft a custom profile. It does not write results, start a job, or start remediation.

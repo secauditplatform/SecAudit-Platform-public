@@ -667,6 +667,18 @@ def _load_rules_records(rules_path: Path) -> list[dict]:
     return _load_rules_records_from_json(rules_path)
 
 
+def count_profile_rules_metadata(package_dir: Path) -> int:
+    """Count rules in profile_rules.json without building full metadata dicts."""
+    profile_file = _find_profile_file(package_dir)
+    if not profile_file:
+        return 0
+    profile_meta = _read_json(profile_file)
+    rules_path = resolve_rules_path(package_dir, profile_meta)
+    if not rules_path or rules_path.suffix.lower() != ".json":
+        return 0
+    return len(_load_rules_records(rules_path))
+
+
 def load_profile_rules_metadata(package_dir: Path, *, limit: int | None = None) -> list[dict]:
     """Load check-item metadata from profile_rules.json."""
     profile_file = _find_profile_file(package_dir)

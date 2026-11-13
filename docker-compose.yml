@@ -354,7 +354,9 @@ services:
       WATCHPACK_POLLING: "true"
     depends_on:
       - api
-    command: npm run dev
+    # Named volume hides image node_modules; reinstall from lockfile so new deps
+    # (e.g. @fontsource/*) exist after package.json sync without -v recreate.
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
 
   tempo:
     profiles: ["observability"]

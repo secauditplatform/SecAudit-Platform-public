@@ -15,6 +15,8 @@ _FORBIDDEN_VARS = re.compile(
     re.IGNORECASE,
 )
 _FORBIDDEN_CONNECTION_VAR = re.compile(r"\bansible_connection\b", re.IGNORECASE)
+_JINJA_TEMPLATE = re.compile(r"(\{\{|\{%)")
+_TASK_LIST_KEYS = ("tasks", "pre_tasks", "post_tasks", "handlers")
 _CONTROLLER_FILE_MODULES = frozenset(
     {"copy", "template", "assemble", "unarchive", "script"}
 )
@@ -158,11 +160,26 @@ def _play_uses_local_connection(play: dict[str, Any]) -> bool:
 
 
 def _task_uses_local_connection(task: dict[str, Any]) -> bool:
+    connection = task.get("connection")
+    if connection is not None and _normalize_module(str(connection)) == "local":
+        return True
     vars_block = task.get("vars")
     if not isinstance(vars_block, dict):
         return False
     ansible_connection = vars_block.get("ansible_connection")
     return ansible_connection is not None and _normalize_module(str(ansible_connection)) == "local"
+
+
+def _assert_no_jinja_in_connection_fields(task: dict[str, Any], context: str) -> None:
+    for key in ("connection", "delegate_to"):
+        value = task.get(key)
+        if value is None:
+            continue
+        text = str(value)
+        if _JINJA_TEMPLATE.search(text):
+            raise PlaybookSecurityError(
+                f"{context}: Jinja templates are forbidden in '{key}'"
+            )
 
 
 def _task_module_name(task: dict[str, Any]) -> str | None:
@@ -342,40 +359,60 @@ def assert_playbook_local_execution_policy(content: str) -> None:
                 f"{context}: ansible_connection in vars is forbidden; use the play-level connection keyword"
             )
 
-        local_connection = _play_uses_local_connection(play) or _hosts_are_localhost_only(
-            play.get("hosts")
-        )
-        if _play_uses_local_connection(play) and not _hosts_are_localhost_only(play.get("hosts")):
+        if play.get("roles"):
+            raise PlaybookSecurityError(
+                f"{context}: roles: is forbidden (role tasks bypass the local-execution scanner)"
+            )
+
+        play_local_connection = _play_uses_local_connection(play)
+        hosts_localhost = _hosts_are_localhost_only(play.get("hosts"))
+        if play_local_connection and not hosts_localhost:
             raise PlaybookSecurityError(
                 f"{context}: connection: local is only allowed with hosts: localhost "
                 "(refusing hosts that would execute on the worker for inventory targets)"
             )
+        play_connection = play.get("connection")
+        if play_connection is not None and _JINJA_TEMPLATE.search(str(play_connection)):
+            raise PlaybookSecurityError(
+                f"{context}: Jinja templates are forbidden in play-level 'connection'"
+            )
 
-        for task in _iter_task_dicts(play.get("tasks")):
-            task_name = str(task.get("name") or "unnamed task")
-            task_context = f"{context} / task '{task_name}'"
-            if isinstance(task.get("vars"), dict) and "ansible_connection" in task["vars"]:
-                raise PlaybookSecurityError(
-                    f"{task_context}: ansible_connection in task vars is forbidden"
-                )
-            if "local_action" in task:
-                raise PlaybookSecurityError(
-                    f"{task_context}: local_action is forbidden (unsandboxed worker execution)"
-                )
-            delegated_local = _delegate_is_local(task.get("delegate_to"))
+        for list_key in _TASK_LIST_KEYS:
+            for task in _iter_task_dicts(play.get(list_key)):
+                task_name = str(task.get("name") or "unnamed task")
+                task_context = f"{context} / {list_key} '{task_name}'"
+                if isinstance(task.get("vars"), dict) and "ansible_connection" in task["vars"]:
+                    raise PlaybookSecurityError(
+                        f"{task_context}: ansible_connection in task vars is forbidden"
+                    )
+                if "local_action" in task:
+                    raise PlaybookSecurityError(
+                        f"{task_context}: local_action is forbidden (unsandboxed worker execution)"
+                    )
+                _assert_no_jinja_in_connection_fields(task, task_context)
 
-            if not local_connection and not delegated_local:
-                _assert_no_controller_file_read(task, task_context)
+                task_local = _task_uses_local_connection(task)
+                if task_local and not hosts_localhost and not play_local_connection:
+                    # Task-level connection: local on remote inventory is worker RCE.
+                    raise PlaybookSecurityError(
+                        f"{task_context}: connection: local is only allowed with hosts: localhost"
+                    )
 
-            if local_connection:
-                _assert_local_task_allowed(
-                    task,
-                    allowed_modules=_LOCAL_CONNECTION_MODULES,
-                    context=task_context,
-                )
-            elif delegated_local:
-                _assert_local_task_allowed(
-                    task,
-                    allowed_modules=_LOCAL_DELEGATE_MODULES,
-                    context=task_context,
-                )
+                local_connection = play_local_connection or hosts_localhost or task_local
+                delegated_local = _delegate_is_local(task.get("delegate_to"))
+
+                if not local_connection and not delegated_local:
+                    _assert_no_controller_file_read(task, task_context)
+
+                if local_connection:
+                    _assert_local_task_allowed(
+                        task,
+                        allowed_modules=_LOCAL_CONNECTION_MODULES,
+                        context=task_context,
+                    )
+                elif delegated_local:
+                    _assert_local_task_allowed(
+                        task,
+                        allowed_modules=_LOCAL_DELEGATE_MODULES,
+                        context=task_context,
+                    )

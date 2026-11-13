@@ -548,8 +548,11 @@ export function TimelineChart({
 
             {xLabelIndices.map((index) => {
               const { x, point } = coords[index];
+              // Edge labels would be cut in half by the clipped SVG viewport.
+              const screenX = ((x - plotView.x) / plotView.w) * plotWidth;
+              const anchor = screenX <= 24 ? "start" : screenX >= plotWidth - 24 ? "end" : "middle";
               return (
-                <text key={point.run_id} x={x} y={height - 10} textAnchor="middle" className="pf-trends-timeline__x-label">
+                <text key={point.run_id} x={x} y={height - 10} textAnchor={anchor} className="pf-trends-timeline__x-label">
                   {new Date(point.finished_at).toLocaleDateString(dateLocale, {
                     day: "2-digit",
                     month: "short",

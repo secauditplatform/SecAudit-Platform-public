@@ -230,6 +230,7 @@ async def _run_package_script_async(
     known_hosts_entry: str | None = None,
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     raise_if_cancelled()
     resolved_script = resolve_script_under_package(package_dir, script_file)
@@ -241,6 +242,8 @@ async def _run_package_script_async(
     q_remote_archive = shlex.quote(remote_archive)
     q_script_path = shlex.quote(script_path)
     q_bash_script = shlex.quote(f"./{script_path}")
+    env_prefix = shell_export_prefix(extra_env)
+    cli_suffix = service_script_cli_suffix(extra_env)
 
     try:
         connect_kwargs = _ssh_connect_kwargs(
@@ -265,7 +268,7 @@ async def _run_package_script_async(
                     f"mkdir -p {q_remote_dir} && "
                     f"tar -xzf {q_remote_archive} -C {q_remote_dir} && "
                     f"chmod +x {q_remote_dir}/{q_script_path} && "
-                    f"cd {q_remote_dir} && bash {q_bash_script}; "
+                    f"cd {q_remote_dir} && {env_prefix}bash {q_bash_script}{cli_suffix}; "
                     f"EXIT_CODE=$?; exit $EXIT_CODE",
                     timeout=timeout,
                     stdin=asyncssh.DEVNULL,
@@ -298,6 +301,7 @@ def run_package_script_over_ssh(
     known_hosts_entry: str | None = None,
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     if not package_dir.is_dir():
         raise FileNotFoundError(f"Package directory not found: {package_dir}")
@@ -329,5 +333,6 @@ def run_package_script_over_ssh(
                 known_hosts_entry=known_hosts_entry,
                 cancel_event=cancel_event,
                 key_passphrase=key_passphrase,
+                extra_env=extra_env,
             )
         )

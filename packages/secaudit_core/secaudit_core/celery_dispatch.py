@@ -72,11 +72,23 @@ def send_task(
     return result.id
 
 
-def revoke_task(task_id: str, *, broker_url: str) -> None:
-    """Revoke a Celery task (best-effort)."""
+def revoke_task(
+    task_id: str,
+    *,
+    broker_url: str,
+    terminate: bool = False,
+) -> None:
+    """Revoke a Celery task (best-effort).
+
+    Default ``terminate=False`` so Stop can commit CANCELLED first and let
+    workers cooperatively kill ansible/SSH children. ``terminate=True`` SIGTERM
+    orphans ``start_new_session`` grandchildren and races the DB cancel flag.
+    """
     _ = broker_url
     try:
         settings = SecAuditSettings()
-        _celery_client(_settings_key(settings)).control.revoke(task_id, terminate=True, signal="SIGTERM")
+        _celery_client(_settings_key(settings)).control.revoke(
+            task_id, terminate=terminate, signal="SIGTERM"
+        )
     except Exception:
         pass

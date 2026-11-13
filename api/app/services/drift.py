@@ -3,10 +3,11 @@ from typing import Literal
 from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.models import CheckResult, CheckStatus, Job, JobRun, JobStatus
 from app.schemas import DiffReport, DiffRow, DiffSummary, DriftItem, DriftReport, DriftSummary
-from app.services.reports import build_report_summary
+from app.services.reports import build_report_summary, waived_check_ids_for_runs
 
 DriftChange = Literal["improved", "regressed", "unchanged", "new", "removed"]
 
@@ -51,6 +52,9 @@ def compare_check_results(
     baseline_run_id: int,
     baseline_checks: list,
     current_checks: list,
+    *,
+    baseline_waived_ids: set[int] | None = None,
+    current_waived_ids: set[int] | None = None,
 ) -> DriftReport:
     baseline_map = {(c.host_id, c.rule_tech_name): c for c in baseline_checks}
     current_map = {(c.host_id, c.rule_tech_name): c for c in current_checks}
@@ -78,8 +82,12 @@ def compare_check_results(
             )
         )
 
-    baseline_summary = build_report_summary(baseline_run_id, baseline_checks)
-    current_summary = build_report_summary(current_run_id, current_checks)
+    baseline_summary = build_report_summary(
+        baseline_run_id, baseline_checks, waived_check_ids=baseline_waived_ids
+    )
+    current_summary = build_report_summary(
+        current_run_id, current_checks, waived_check_ids=current_waived_ids
+    )
     compliance_delta = round(
         current_summary.compliance_percent - baseline_summary.compliance_percent, 2
     )
@@ -155,7 +163,10 @@ async def _fetch_run_checks(db: AsyncSession, run_id: int) -> list[CheckResult]:
 
 
 async def _get_job_run(db: AsyncSession, run_id: int) -> JobRun | None:
-    return await db.get(JobRun, run_id)
+    result = await db.execute(
+        select(JobRun).options(selectinload(JobRun.job)).where(JobRun.id == run_id)
+    )
+    return result.scalar_one_or_none()
 
 
 async def fetch_drift_report(
@@ -177,8 +188,18 @@ async def fetch_drift_report(
 
     baseline_checks = await _fetch_run_checks(db, baseline_run_id)
     current_checks = await _fetch_run_checks(db, current_run_id)
+    waived_by_run = await waived_check_ids_for_runs(
+        db,
+        [baseline_run, current_run],
+        {baseline_run_id: baseline_checks, current_run_id: current_checks},
+    )
     return compare_check_results(
-        current_run_id, baseline_run_id, baseline_checks, current_checks
+        current_run_id,
+        baseline_run_id,
+        baseline_checks,
+        current_checks,
+        baseline_waived_ids=waived_by_run.get(baseline_run_id),
+        current_waived_ids=waived_by_run.get(current_run_id),
     )
 
 
@@ -199,6 +220,11 @@ async def set_job_baseline(db: AsyncSession, job_id: int, run_id: int) -> int:
         raise HTTPException(status_code=404, detail="Run not found for this job")
     if run.status != JobStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Only completed runs can be set as baseline")
+    if run.is_partial:
+        raise HTTPException(
+            status_code=400,
+            detail="Partial host-subset runs cannot be set as baseline; use a full run",
+        )
 
     job.baseline_run_id = run_id
     await db.commit()

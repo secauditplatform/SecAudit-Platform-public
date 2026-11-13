@@ -8,15 +8,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.auth import AuthUser
-from app.models import CheckResult, CheckScript, CheckStatus, ExecutionType, Job, JobRun, JobStatus, ScriptKind, Profile
+from app.models import (
+    CheckResult,
+    CheckScript,
+    CheckStatus,
+    ExecutionType,
+    Host,
+    Job,
+    JobRun,
+    JobStatus,
+    Profile,
+    ScriptKind,
+)
 from app.services.object_rbac import assert_job_run_access
 
 
 class FailedCheckSummary:
-    __slots__ = ("host_id", "rule_tech_name", "status", "message")
+    __slots__ = ("host_id", "host_name", "rule_tech_name", "status", "message")
 
-    def __init__(self, host_id: int, rule_tech_name: str, status: CheckStatus, message: str | None):
+    def __init__(
+        self,
+        host_id: int,
+        rule_tech_name: str,
+        status: CheckStatus,
+        message: str | None,
+        host_name: str | None = None,
+    ):
         self.host_id = host_id
+        self.host_name = host_name
         self.rule_tech_name = rule_tech_name
         self.status = status
         self.message = message
@@ -59,10 +78,25 @@ async def _failed_checks(db: AsyncSession, run_id: int) -> list[FailedCheckSumma
                 job_id=run.job_id,
             ).keys()
         )
-    return [
-        FailedCheckSummary(c.host_id, c.rule_tech_name, c.status, c.message)
+    failed = [
+        c
         for c in checks
         if c.status in (CheckStatus.FAIL, CheckStatus.ERROR) and c.id not in waived_ids
+    ]
+    host_ids = sorted({c.host_id for c in failed})
+    host_names: dict[int, str] = {}
+    if host_ids:
+        host_rows = await db.execute(select(Host.id, Host.name).where(Host.id.in_(host_ids)))
+        host_names = {int(row.id): str(row.name) for row in host_rows.all()}
+    return [
+        FailedCheckSummary(
+            c.host_id,
+            c.rule_tech_name,
+            c.status,
+            c.message,
+            host_name=host_names.get(c.host_id),
+        )
+        for c in failed
     ]
 
 
@@ -110,6 +144,7 @@ async def build_remediation_suggestion(db: AsyncSession, user: AuthUser, run_id:
         "failed_checks": [
             {
                 "host_id": c.host_id,
+                "host_name": c.host_name,
                 "rule_tech_name": c.rule_tech_name,
                 "status": c.status,
                 "message": c.message,

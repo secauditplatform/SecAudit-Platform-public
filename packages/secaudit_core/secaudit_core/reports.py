@@ -37,6 +37,7 @@ _STATUS_ACCENT = {
     "fail": "#c62828",
     "skip": "#c9a227",
     "error": "#5a6572",
+    "waived": "#5b6b9a",
 }
 
 
@@ -747,7 +748,7 @@ REPORT_TEMPLATE = _REPORT_ENV.from_string("""{% macro pdf_spacer(height_pt=8) %}
           <td class="k" width="14%">{{ t.status }}</td>
           <td class="v" width="36%">{{ run_status_label }}</td>
           <td class="k" width="14%">{{ t.hosts }}</td>
-          <td class="v" width="36%">{{ host_count }}</td>
+          <td class="v" width="36%">{{ host_count }}{% if is_partial %} · {{ t.partial_run }}{% endif %}</td>
         </tr>
         <tr>
           <td class="k" width="14%">{{ t.created }}</td>
@@ -756,6 +757,22 @@ REPORT_TEMPLATE = _REPORT_ENV.from_string("""{% macro pdf_spacer(height_pt=8) %}
           <td class="v" width="36%">{{ finished_at }}</td>
         </tr>
       </table>
+
+      {% if excluded_by_version %}
+      <div class="h2">{{ t.section_excluded_by_version }} · {{ excluded_by_version|length }}</div>
+      <table class="meta" width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+          <td class="k" width="14%">{{ t.excluded_version }}</td>
+          <td class="v" width="86%">{{ excluded_version_label or "—" }}</td>
+        </tr>
+        {% for item in excluded_by_version %}
+        <tr>
+          <td class="k" width="14%">{% if loop.first %}{{ t.rule }}{% endif %}</td>
+          <td class="v" width="86%">{{ item.rule_tech_name }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% endif %}
 
       <div class="h2">{{ t.section_summary }}</div>
       <table width="100%" cellpadding="0" cellspacing="0">
@@ -855,9 +872,11 @@ def build_report_summary_dict(
         if c.status == CheckStatus.FAIL and getattr(c, "id", None) in waived_ids
     )
     total = len(checks)
-    compliance_raw = round((passed / total) * 100, 2) if total else 0.0
+    # SKIP / notselected stay out of the denominator; they remain a separate metric.
+    applicable = passed + failed + errors
+    compliance_raw = round((passed / applicable) * 100, 2) if applicable else 0.0
     # Waived FAILs count toward compliant checks without rewriting stored status.
-    compliance = round(((passed + waived) / total) * 100, 2) if total else 0.0
+    compliance = round(((passed + waived) / applicable) * 100, 2) if applicable else 0.0
 
     return {
         "job_run_id": run_id,
@@ -1027,9 +1046,10 @@ def _build_check_row(
     status_labels: dict[str, str],
     *,
     for_pdf: bool,
+    is_waived: bool = False,
 ) -> dict:
     meta = _find_rule_meta(rules_lookup, check.rule_tech_name)
-    status = check.status.value
+    status = "waived" if is_waived else check.status.value
     rule_name = _profile_rule_display_name(meta, check.rule_tech_name)
     description = (
         (meta.get("explanation") or meta.get("description") or "").strip() if meta else ""
@@ -1066,19 +1086,31 @@ def _build_check_row(
     }
 
 
-def render_run_report_html(job_run, profile, hosts: dict, *, for_pdf: bool = False, locale: str | None = None) -> str:
+def render_run_report_html(
+    job_run,
+    profile,
+    hosts: dict,
+    *,
+    for_pdf: bool = False,
+    locale: str | None = None,
+    waived_check_ids: set[int] | None = None,
+) -> str:
     checks = job_run.check_results or []
-    passed = sum(1 for c in checks if c.status.value == "pass")
-    failed = sum(1 for c in checks if c.status.value == "fail")
-    skipped = sum(1 for c in checks if c.status.value == "skip")
-    errors = sum(1 for c in checks if c.status.value == "error")
-    total = len(checks)
-    compliance = round((passed / total) * 100, 2) if total else 0.0
+    waived_ids = waived_check_ids or set()
+    summary = build_report_summary_dict(job_run.id, checks, waived_check_ids=waived_ids)
+    passed = summary["passed"]
+    failed = summary["failed"]
+    skipped = summary["skipped"]
+    errors = summary["errors"]
+    total = summary["total_checks"]
+    compliance = summary["compliance_percent"]
     compliance_bar = max(0, min(100, int(round(compliance))))
     compliance_rest = max(0, 100 - compliance_bar)
     if compliance_bar == 0 and compliance_rest == 0:
         compliance_rest = 100
-    host_count = len({c.host_id for c in checks})
+    planned_host_ids = getattr(job_run, "host_ids", None) or []
+    host_count = len({int(h) for h in planned_host_ids}) if planned_host_ids else len({c.host_id for c in checks})
+    is_partial = bool(getattr(job_run, "is_partial", False))
     run_status = getattr(job_run.status, "value", str(job_run.status)).lower()
     lang = normalize_report_locale(locale)
     t = get_report_strings(lang)
@@ -1096,10 +1128,28 @@ def render_run_report_html(job_run, profile, hosts: dict, *, for_pdf: bool = Fal
                 rules_lookup,
                 status_labels,
                 for_pdf=for_pdf,
+                is_waived=getattr(c, "id", None) in waived_ids,
             )
         )
 
     host_groups = _group_rows_by_host(rows) if rows else []
+    snapshot = getattr(job_run, "profile_snapshot", None)
+    excluded_raw = snapshot.get("excluded_by_version") if isinstance(snapshot, dict) else None
+    excluded_by_version: list[dict[str, str]] = []
+    if isinstance(excluded_raw, list):
+        for item in excluded_raw:
+            if not isinstance(item, dict):
+                continue
+            rule_name = str(item.get("rule_tech_name") or "").strip()
+            if not rule_name:
+                continue
+            display = _soft_break(rule_name, chunk=28) if for_pdf else rule_name
+            excluded_by_version.append({"rule_tech_name": display})
+    excluded_version_label = ""
+    if isinstance(snapshot, dict):
+        excluded_version_label = str(snapshot.get("version_label") or "").strip()
+    if for_pdf and excluded_version_label:
+        excluded_version_label = _soft_break(excluded_version_label, chunk=24)
 
     if for_pdf:
         _ensure_pdf_fonts()
@@ -1130,6 +1180,9 @@ def render_run_report_html(job_run, profile, hosts: dict, *, for_pdf: bool = Fal
         errors=errors,
         total_checks=total,
         host_count=host_count,
+        is_partial=is_partial,
+        excluded_by_version=excluded_by_version,
+        excluded_version_label=excluded_version_label,
         run_status_label=run_status_label(run_status, lang),
         created_at=_format_dt(job_run.created_at, lang),
         finished_at=_format_dt(job_run.finished_at, lang),
@@ -1139,14 +1192,28 @@ def render_run_report_html(job_run, profile, hosts: dict, *, for_pdf: bool = Fal
     )
 
 
-def render_run_report_pdf(job_run, profile, hosts: dict, *, locale: str | None = None) -> bytes:
+def render_run_report_pdf(
+    job_run,
+    profile,
+    hosts: dict,
+    *,
+    locale: str | None = None,
+    waived_check_ids: set[int] | None = None,
+) -> bytes:
     chromium = (
         shutil.which("chromium")
         or shutil.which("chromium-browser")
         or shutil.which("google-chrome")
     )
     if chromium:
-        html = render_run_report_html(job_run, profile, hosts, for_pdf=False, locale=locale)
+        html = render_run_report_html(
+            job_run,
+            profile,
+            hosts,
+            for_pdf=False,
+            locale=locale,
+            waived_check_ids=waived_check_ids,
+        )
         with tempfile.TemporaryDirectory(prefix="secaudit-report-") as tmp:
             workdir = Path(tmp)
             html_path = workdir / "report.html"
@@ -1187,7 +1254,14 @@ def render_run_report_pdf(job_run, profile, hosts: dict, *, locale: str | None =
 
     if pisa is None:
         raise RuntimeError("No PDF renderer is installed")
-    html = render_run_report_html(job_run, profile, hosts, for_pdf=True, locale=locale)
+    html = render_run_report_html(
+        job_run,
+        profile,
+        hosts,
+        for_pdf=True,
+        locale=locale,
+        waived_check_ids=waived_check_ids,
+    )
     buffer = BytesIO()
     result = pisa.CreatePDF(
         html,

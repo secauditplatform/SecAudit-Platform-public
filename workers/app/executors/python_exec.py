@@ -13,7 +13,7 @@ from secaudit_core.ssh_connect import build_ssh_connect_kwargs
 from secaudit_core.tracing import start_span
 
 from app.cancel_context import get_cancel_event, raise_if_cancelled
-from app.executors.ssh import unique_remote_script_path
+from app.executors.ssh import _run_async, unique_remote_script_path
 
 _settings = SecAuditSettings()
 
@@ -309,7 +309,8 @@ def run_script_over_ssh(
         "enduser.id": username,
     }
     with start_span(f"executor.python {script_path.name}", attributes=span_attrs, kind="client"):
-        return asyncio.run(
+        # Reuse the thread-local loop from ssh.py — asyncio.run() would close it.
+        return _run_async(
             _run_python_async(
                 hostname=hostname,
                 port=port,

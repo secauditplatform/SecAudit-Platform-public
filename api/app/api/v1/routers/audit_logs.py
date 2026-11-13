@@ -1,6 +1,11 @@
+import csv
+import io
+import json
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +23,8 @@ from app.schemas import (
 from secaudit_core.sensitive_data import redact_sensitive
 
 router = APIRouter()
+
+_EXPORT_LIMIT = 10_000
 
 
 @router.get("", response_model=PaginatedResponse[AuditLogRead])
@@ -58,6 +65,101 @@ async def list_audit_logs(
         total=total,
         offset=offset,
         limit=limit,
+    )
+
+
+@router.get("/export")
+async def export_audit_logs(
+    db: AsyncSession = Depends(get_db),
+    _: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+    format: Literal["csv", "json"] = Query(default="csv"),
+    action: str | None = Query(default=None),
+    resource_type: str | None = Query(default=None),
+    actor_username: str | None = Query(default=None),
+    outcome: str | None = Query(default=None),
+    from_datetime: datetime | None = Query(default=None, alias="from"),
+    to_datetime: datetime | None = Query(default=None, alias="to"),
+) -> Response:
+    stmt = select(AuditLog)
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    if resource_type:
+        stmt = stmt.where(AuditLog.resource_type == resource_type)
+    if actor_username:
+        stmt = stmt.where(AuditLog.actor_username == actor_username)
+    if outcome:
+        stmt = stmt.where(AuditLog.outcome == outcome)
+    if from_datetime:
+        stmt = stmt.where(AuditLog.created_at >= from_datetime)
+    if to_datetime:
+        stmt = stmt.where(AuditLog.created_at <= to_datetime)
+    stmt = stmt.order_by(AuditLog.created_at.desc()).limit(_EXPORT_LIMIT)
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    if format == "json":
+        payload = [
+            {
+                "id": row.id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "actor_username": row.actor_username,
+                "actor_roles": row.actor_roles,
+                "action": row.action,
+                "resource_type": row.resource_type,
+                "resource_id": row.resource_id,
+                "resource_name": row.resource_name,
+                "outcome": row.outcome,
+                "ip_address": row.ip_address,
+                "user_agent": row.user_agent,
+                "metadata_json": redact_sensitive(row.metadata_json),
+            }
+            for row in rows
+        ]
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        return Response(
+            content=body,
+            media_type="application/json; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="audit-logs.json"'},
+        )
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            "id",
+            "created_at",
+            "actor_username",
+            "actor_roles",
+            "action",
+            "resource_type",
+            "resource_id",
+            "resource_name",
+            "outcome",
+            "ip_address",
+            "user_agent",
+            "metadata_json",
+        ]
+    )
+    for row in rows:
+        writer.writerow(
+            [
+                row.id,
+                row.created_at.isoformat() if row.created_at else "",
+                row.actor_username,
+                json.dumps(row.actor_roles or [], ensure_ascii=False),
+                row.action,
+                row.resource_type,
+                row.resource_id or "",
+                row.resource_name or "",
+                row.outcome,
+                row.ip_address or "",
+                row.user_agent or "",
+                json.dumps(redact_sensitive(row.metadata_json) or {}, ensure_ascii=False),
+            ]
+        )
+    return StreamingResponse(
+        iter([buffer.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="audit-logs.csv"'},
     )
 
 

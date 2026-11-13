@@ -44,6 +44,8 @@ const RUN_EVENTS: NotificationEventType[] = [
   "dispatch_failed",
   "worker_heartbeat_stale",
   "worker_heartbeat_recovered",
+  "compliance_regressed",
+  "waiver_expiring",
 ];
 
 const emptyForm = (): ChannelForm => ({

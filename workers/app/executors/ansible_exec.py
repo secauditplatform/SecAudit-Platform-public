@@ -1,7 +1,9 @@
 import json
+import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,7 +15,10 @@ from typing import Literal
 
 from secaudit_core.playbook_security import assert_playbook_local_execution_policy
 from secaudit_core.settings import SecAuditSettings
+from secaudit_core.ssh_fingerprint import retarget_known_hosts_entry
 from secaudit_core.tracing import start_span
+
+logger = logging.getLogger(__name__)
 
 ConnectionMode = Literal["auto", "ssh", "paramiko", "winrm"]
 
@@ -88,11 +93,14 @@ def resolve_connection_mode(
     ansible_vars = inventory_host.get("ansible_vars") or {}
     if ansible_vars.get("ansible_connection") == "winrm" or credentials and credentials.get("winrm"):
         return "winrm"
+    # Key auth: use paramiko (library SSH, same family as Operations asyncssh).
+    # OpenSSH + ControlMaster=no opens many TCP sessions; flaky hosts then return
+    # "Connection refused" while a single asyncssh Operations run still succeeds.
     if credentials and credentials.get("private_key"):
-        return "ssh"
+        return "paramiko"
     if credentials and credentials.get("password"):
         return "paramiko" if not sshpass_available() else "ssh"
-    return "ssh"
+    return "paramiko"
 
 
 def _apply_connection_settings(
@@ -132,8 +140,6 @@ def _apply_connection_settings(
             host_vars["ansible_password"] = credentials["password"]
         if key_file is not None:
             host_vars["ansible_ssh_private_key_file"] = str(key_file)
-            if credentials and credentials.get("key_passphrase"):
-                host_vars["ansible_ssh_private_key_passphrase"] = credentials["key_passphrase"]
         return
 
     host_vars["ansible_connection"] = "ssh"
@@ -141,8 +147,6 @@ def _apply_connection_settings(
         host_vars["ansible_password"] = credentials["password"]
     if key_file is not None:
         host_vars["ansible_ssh_private_key_file"] = str(key_file)
-        if credentials and credentials.get("key_passphrase"):
-            host_vars["ansible_ssh_private_key_passphrase"] = credentials["key_passphrase"]
 
 
 def _extract_event_message(event: dict) -> tuple[str, str, str]:
@@ -284,12 +288,41 @@ def _ansible_child_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key in _ANSIBLE_CHILD_ENV_ALLOWLIST}
 
 
+def _terminate_ansible_process(process: subprocess.Popen) -> None:
+    """Kill ansible-child process group (playbook + stuck ssh)."""
+    if process.poll() is not None:
+        return
+    try:
+        if process.pid:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def _run_ansible_child(
     run_kwargs: dict,
     cancel_event,
     work_dir: Path,
+    *,
+    timeout_seconds: int | None = None,
 ):
     """Execute ansible-runner in a subprocess that has no platform secrets."""
+    settings = SecAuditSettings()
+    timeout = max(
+        30,
+        int(
+            timeout_seconds
+            if timeout_seconds is not None
+            else settings.ansible_playbook_timeout_seconds
+        ),
+    )
     result_path = work_dir / "runner-result.json"
     cancel_path = work_dir / "runner-cancel"
     payload = {
@@ -297,6 +330,10 @@ def _run_ansible_child(
         "result_path": str(result_path),
         "cancel_path": str(cancel_path),
     }
+    from app.cancel_context import get_active_run
+    from secaudit_core.run_cancel import register_run_child_pid, unregister_run_child_pid
+
+    # New session so hung ssh grandchildren die with killpg on timeout/cancel.
     process = subprocess.Popen(
         [sys.executable, "-m", "app.executors.ansible_child"],
         stdin=subprocess.PIPE,
@@ -305,39 +342,103 @@ def _run_ansible_child(
         text=True,
         env=_ansible_child_env(),
         cwd=str(Path(__file__).resolve().parents[2]),
+        start_new_session=True,
     )
+    active_run = get_active_run()
+    if active_run is not None and process.pid:
+        try:
+            register_run_child_pid(
+                settings.redis_url, active_run[0], active_run[1], process.pid
+            )
+        except Exception:
+            logger.warning("Failed to register ansible child pid for cancel", exc_info=True)
+
+    def _cancel_requested() -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        if active_run is None:
+            return False
+        try:
+            from secaudit_core.run_cancel import is_run_cancel_requested
+
+            return is_run_cancel_requested(
+                settings.redis_url, active_run[0], active_run[1]
+            )
+        except Exception:
+            return False
 
     def _watch_cancel() -> None:
+        from secaudit_core.run_cancel import kill_run_child_pids
+
         while process.poll() is None:
-            if cancel_event is not None and cancel_event.is_set():
+            if not _cancel_requested():
+                time.sleep(0.25)
+                continue
+            if cancel_event is not None:
+                cancel_event.set()
+            try:
+                cancel_path.touch()
+            except OSError:
+                pass
+            # Stuck OpenSSH ignores ansible-runner cancel_callback — kill now.
+            _terminate_ansible_process(process)
+            if active_run is not None:
                 try:
-                    cancel_path.touch()
-                except OSError:
+                    kill_run_child_pids(
+                        settings.redis_url, active_run[0], active_run[1]
+                    )
+                except Exception:
                     pass
-                return
-            time.sleep(0.25)
+            return
 
-    if cancel_event is not None:
-        threading.Thread(target=_watch_cancel, daemon=True).start()
+    # Always watch: Redis cancel flag is set by API in a different PID namespace.
+    threading.Thread(target=_watch_cancel, daemon=True).start()
 
-    stdout, stderr = process.communicate(json.dumps(payload, default=str))
-    if cancel_event is not None and cancel_event.is_set():
-        raise InterruptedError("Job run cancelled")
-    if process.returncode != 0:
-        detail = (stderr or stdout or "ansible-runner child failed").strip()
-        raise AnsiblePlaybookError(f"Ansible runner failed: {detail[-1000:]}")
-    if not result_path.is_file():
-        raise AnsiblePlaybookError("Ansible runner produced no result")
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    if result.get("error"):
-        raise AnsiblePlaybookError(str(result["error"]))
-    return SimpleNamespace(
-        status=result.get("status"),
-        rc=result.get("rc"),
-        stats=result.get("stats") or {},
-        events=result.get("events") or [],
-        stdout=result.get("stdout") or "",
-    )
+    try:
+        try:
+            stdout, stderr = process.communicate(
+                json.dumps(payload, default=str),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _terminate_ansible_process(process)
+            try:
+                process.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            if _cancel_requested():
+                raise InterruptedError("Job run cancelled") from exc
+            raise AnsiblePlaybookError(
+                f"Ansible playbook timed out after {timeout}s (hung SSH/session killed)"
+            ) from exc
+
+        # Redis/API cancel kills the child first; do not surface that as playbook ERROR.
+        if _cancel_requested():
+            _terminate_ansible_process(process)
+            raise InterruptedError("Job run cancelled")
+        if process.returncode != 0:
+            detail = (stderr or stdout or "ansible-runner child failed").strip()
+            raise AnsiblePlaybookError(f"Ansible runner failed: {detail[-1000:]}")
+        if not result_path.is_file():
+            raise AnsiblePlaybookError("Ansible runner produced no result")
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        if result.get("error"):
+            raise AnsiblePlaybookError(str(result["error"]))
+        return SimpleNamespace(
+            status=result.get("status"),
+            rc=result.get("rc"),
+            stats=result.get("stats") or {},
+            events=result.get("events") or [],
+            stdout=result.get("stdout") or "",
+        )
+    finally:
+        if active_run is not None and process.pid:
+            try:
+                unregister_run_child_pid(
+                    settings.redis_url, active_run[0], active_run[1], process.pid
+                )
+            except Exception:
+                pass
 
 
 def normalize_private_key(raw: str) -> str:
@@ -348,15 +449,57 @@ def normalize_private_key(raw: str) -> str:
     return text
 
 
+def write_private_key_file(path: Path, raw: str, passphrase: str | None = None) -> None:
+    """Write a temp private key. Encrypted keys are unlocked so OpenSSH never prompts/hangs."""
+    text = normalize_private_key(raw)
+    if not passphrase:
+        path.write_text(text, encoding="utf-8")
+        path.chmod(0o600)
+        return
+
+    # OpenSSH ignores ansible_ssh_private_key_passphrase and blocks on /dev/tty.
+    # Unlock once with paramiko (same stack netmiko uses) and hand ssh an open key.
+    from io import StringIO
+
+    import paramiko
+
+    key = None
+    last_error: Exception | None = None
+    for loader in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
+        try:
+            key = loader.from_private_key(StringIO(text), password=passphrase)
+            break
+        except Exception as exc:  # noqa: BLE001 - try next key type
+            last_error = exc
+    if key is None:
+        raise ValueError(
+            "Unable to decrypt SSH private key with the provided passphrase"
+        ) from last_error
+    key.write_private_key_file(str(path))
+    path.chmod(0o600)
+
+
 def ssh_client_args(*, known_hosts_file: Path, strict: bool) -> str:
-    """Force OpenSSH off /etc/passwd HOME=/nonexistent (worker image)."""
+    """Force OpenSSH off /etc/passwd HOME=/nonexistent (worker image).
+
+    Do not set ConnectTimeout here: ansible_ssh_common_args are appended after
+    ANSIBLE_TIMEOUT's ConnectTimeout and would override it (was 10s vs 120s),
+    so playbook runs failed while Operations asyncssh still reached the host.
+    """
     checking = "yes" if strict else "no"
+    # Multiplex under the per-run HOME/.ssh (created by _ansible_local_envvars).
+    control_path = known_hosts_file.parent / ".ssh" / "cm-%r@%h:%p"
     return (
         f"-o StrictHostKeyChecking={checking} "
         "-o GlobalKnownHostsFile=/dev/null "
-        "-o ControlMaster=no "
-        "-o ControlPath=none "
+        "-o ControlMaster=auto "
+        "-o ControlPersist=120 "
+        f"-o ControlPath={control_path} "
         "-o IdentitiesOnly=yes "
+        "-o GSSAPIAuthentication=no "
+        "-o GSSAPIKeyExchange=no "
+        "-o ServerAliveInterval=15 "
+        "-o ServerAliveCountMax=4 "
         f"-o UserKnownHostsFile={known_hosts_file}"
     )
 
@@ -375,11 +518,13 @@ def run_playbook(
     cancel_event=None,
     sidecar_files: dict[str, str | bytes] | None = None,
     check_mode: bool = False,
+    tags: list[str] | None = None,
 ) -> str:
     """Run Ansible playbook via ansible-runner. Returns combined stdout events.
 
     sidecar_files: optional files written next to playbook.yml (e.g. script module sources).
     check_mode: pass ansible-playbook --check --diff (report changes, do not apply).
+    tags: optional ansible-playbook --tags list (rule_tech_name for scoped remediation).
     """
     span_attrs = {
         "secaudit.executor": "ansible",
@@ -387,6 +532,7 @@ def run_playbook(
         "secaudit.connection_mode": connection_mode,
         "secaudit.sidecar_files": len(sidecar_files or {}),
         "secaudit.check_mode": check_mode,
+        "secaudit.tags": len(tags or []),
     }
     with start_span("executor.ansible", attributes=span_attrs, kind="client"):
         return _run_playbook(
@@ -398,6 +544,7 @@ def run_playbook(
             cancel_event=cancel_event,
             sidecar_files=sidecar_files,
             check_mode=check_mode,
+            tags=tags,
         )
 
 
@@ -411,6 +558,7 @@ def _run_playbook(
     sidecar_files: dict[str, str | bytes] | None = None,
     *,
     check_mode: bool = False,
+    tags: list[str] | None = None,
 ) -> str:
     from app.cancel_context import get_cancel_event, raise_if_cancelled
 
@@ -444,8 +592,11 @@ def _run_playbook(
         key_file: Path | None = None
         if credentials and credentials.get("private_key"):
             key_file = tmp_path / "id_rsa"
-            key_file.write_text(normalize_private_key(str(credentials["private_key"])), encoding="utf-8")
-            key_file.chmod(0o600)
+            write_private_key_file(
+                key_file,
+                str(credentials["private_key"]),
+                credentials.get("key_passphrase"),
+            )
 
         inventory = {"all": {"hosts": {}}}
         resolved_modes: list[str] = []
@@ -492,7 +643,10 @@ def _run_playbook(
 
             mode = resolve_connection_mode(host, credentials, connection_mode)
             resolved_modes.append(f"{name}={mode}")
-            entry = str(host.get("ssh_known_hosts_entry") or "").strip()
+            entry = retarget_known_hosts_entry(
+                str(host.get("ssh_known_hosts_entry") or "").strip() or None,
+                host_vars["ansible_host"],
+            )
             if entry:
                 known_host_entries.append(entry)
             elif (
@@ -519,11 +673,18 @@ def _run_playbook(
         except OSError:
             pass
 
+        playbook_timeout = max(30, int(settings.ansible_playbook_timeout_seconds))
         envvars: dict[str, str] = {
             **_ansible_local_envvars(tmp_path),
             "ANSIBLE_RETRY_FILES_ENABLED": "False",
             "ANSIBLE_REMOTE_TMP": "/tmp/.ansible/tmp",
+            # Connection/plugin default; wall-clock kill in _run_ansible_child is authoritative.
+            "ANSIBLE_TIMEOUT": str(min(120, playbook_timeout)),
+            # Fewer TCP handshakes per task (closer to one Operations asyncssh session).
+            "ANSIBLE_SSH_PIPELINING": "True",
         }
+        if not settings.ssh_strict_host_key_checking_effective:
+            envvars["ANSIBLE_PARAMIKO_HOST_KEY_AUTO_ADD"] = "True"
         # Prefer sshpass env so inventory JSON is not the only secret carrier.
         if credentials and credentials.get("password") and sshpass_available():
             envvars["SSHPASS"] = str(credentials["password"])
@@ -551,9 +712,20 @@ def _run_playbook(
                 "quiet": False,
                 "ignore_logging": True,
             }
+            cmdline_parts: list[str] = []
             if check_mode:
-                run_kwargs["cmdline"] = "--check --diff"
-            runner = _run_ansible_child(run_kwargs, cancel_event, tmp_path)
+                cmdline_parts.append("--check --diff")
+            clean_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+            if clean_tags:
+                cmdline_parts.append("--tags " + ",".join(clean_tags))
+            if cmdline_parts:
+                run_kwargs["cmdline"] = " ".join(cmdline_parts)
+            runner = _run_ansible_child(
+                run_kwargs,
+                cancel_event,
+                tmp_path,
+                timeout_seconds=playbook_timeout,
+            )
         finally:
             # Best-effort shred of secrets written for the run.
             try:

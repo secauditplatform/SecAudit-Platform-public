@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
 from sqlalchemy import Select, or_, select
@@ -127,6 +127,18 @@ def load_active_waivers_sync(
     return list(result.scalars().all())
 
 
+async def load_active_waivers_for_profiles(
+    db: AsyncSession,
+    profile_ids: Iterable[int],
+) -> list[ComplianceWaiver]:
+    ids = {int(profile_id) for profile_id in profile_ids if profile_id is not None}
+    if not ids:
+        return []
+    stmt = active_waivers_select().where(ComplianceWaiver.profile_id.in_(ids))
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
 def waived_fail_ids(
     checks: Iterable,
     waivers: Iterable[ComplianceWaiver],
@@ -155,6 +167,77 @@ def waived_fail_ids(
     return mapped
 
 
+def resolve_waived_fail_map(
+    checks: Iterable,
+    waivers: Iterable[ComplianceWaiver],
+    *,
+    profile_id: int | None,
+    job_id: int | None,
+    now: datetime | None = None,
+) -> dict[int, ComplianceWaiver]:
+    """Map FAIL check ids covered by an active waiver for one run context."""
+    return waived_fail_ids(
+        checks,
+        waivers,
+        profile_id=profile_id,
+        job_id=job_id,
+        now=now,
+    )
+
+
+async def resolve_waived_fail_map_async(
+    db: AsyncSession,
+    checks: Iterable,
+    *,
+    profile_id: int | None,
+    job_id: int | None,
+) -> dict[int, ComplianceWaiver]:
+    if profile_id is None:
+        return {}
+    waivers = await load_active_waivers(db, profile_id=profile_id, job_id=job_id)
+    return resolve_waived_fail_map(checks, waivers, profile_id=profile_id, job_id=job_id)
+
+
+def resolve_waived_fail_map_sync(
+    db: Session,
+    checks: Iterable,
+    *,
+    profile_id: int | None,
+    job_id: int | None,
+) -> dict[int, ComplianceWaiver]:
+    if profile_id is None:
+        return {}
+    waivers = load_active_waivers_sync(db, profile_id=profile_id, job_id=job_id)
+    return resolve_waived_fail_map(checks, waivers, profile_id=profile_id, job_id=job_id)
+
+
+def waived_ids_by_run(
+    runs: Iterable,
+    checks_by_run: dict[int, list],
+    waivers: Iterable[ComplianceWaiver],
+) -> dict[int, set[int]]:
+    """Batch-resolve waived FAIL check ids for runs that already have ``job`` loaded."""
+    by_profile: dict[int, list[ComplianceWaiver]] = {}
+    for waiver in waivers:
+        by_profile.setdefault(waiver.profile_id, []).append(waiver)
+
+    out: dict[int, set[int]] = {}
+    for run in runs:
+        job = getattr(run, "job", None)
+        profile_id = job.profile_id if job is not None else None
+        if profile_id is None:
+            out[run.id] = set()
+            continue
+        mapped = resolve_waived_fail_map(
+            checks_by_run.get(run.id, []),
+            by_profile.get(profile_id, []),
+            profile_id=profile_id,
+            job_id=run.job_id,
+        )
+        out[run.id] = set(mapped.keys())
+    return out
+
+
 def expire_due_waivers(db: Session, *, now: datetime | None = None) -> list[int]:
     current = now or datetime.now(UTC)
     rows = list(
@@ -173,3 +256,27 @@ def expire_due_waivers(db: Session, *, now: datetime | None = None) -> list[int]
         waiver.is_active = False
         expired_ids.append(waiver.id)
     return expired_ids
+
+
+def find_expiring_waivers(
+    db: Session,
+    *,
+    within_days: int = 7,
+    now: datetime | None = None,
+) -> list[ComplianceWaiver]:
+    """Approved active waivers whose expires_at falls within the next ``within_days``."""
+    current = now or datetime.now(UTC)
+    horizon = current + timedelta(days=max(1, int(within_days)))
+    return list(
+        db.execute(
+            select(ComplianceWaiver).where(
+                ComplianceWaiver.is_active.is_(True),
+                ComplianceWaiver.status == WaiverStatus.APPROVED,
+                ComplianceWaiver.expires_at.is_not(None),
+                ComplianceWaiver.expires_at > current,
+                ComplianceWaiver.expires_at <= horizon,
+            )
+        )
+        .scalars()
+        .all()
+    )

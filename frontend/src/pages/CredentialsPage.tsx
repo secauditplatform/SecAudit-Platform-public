@@ -71,12 +71,37 @@ export function CredentialsPage() {
   ];
 
   const credentials = useQuery({ queryKey: ["credentials"], queryFn: api.credentials });
+  const hosts = useQuery({
+    queryKey: ["hosts", "credentials-preflight"],
+    queryFn: () => api.hosts({ limit: 200, active_only: true }),
+  });
+  const [probeHostByCred, setProbeHostByCred] = useState<Record<number, number | "">>({});
+
   const createMutation = useMutation({
     mutationFn: api.createCredential,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
       setForm(emptyForm());
       toast.success(t("toast.credentialCreated"));
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const preflightMutation = useMutation({
+    mutationFn: ({ credentialId, hostId }: { credentialId: number; hostId: number }) =>
+      api.preflightCredential(credentialId, hostId),
+    onSuccess: (result) => {
+      const failed = result.checks.filter((c) => c.status === "fail").map((c) => c.name);
+      if (result.ok) {
+        toast.success(t("preflight.ok", { target: result.target, ms: result.duration_ms }));
+      } else {
+        toast.error(
+          t("preflight.fail", {
+            target: result.target,
+            checks: failed.join(", ") || result.error || "auth",
+          })
+        );
+      }
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -508,6 +533,40 @@ export function CredentialsPage() {
                           <td>{new Date(cred.created_at).toLocaleString(dateLocale)}</td>
                           <td className="pf-table__col-actions">
                             <div className="pf-table__actions">
+                              <select
+                                className="pf-select pf-select--sm"
+                                aria-label={t("preflight.probeHost")}
+                                value={probeHostByCred[cred.id] ?? ""}
+                                onChange={(e) =>
+                                  setProbeHostByCred((prev) => ({
+                                    ...prev,
+                                    [cred.id]: e.target.value ? Number(e.target.value) : "",
+                                  }))
+                                }
+                              >
+                                <option value="">{t("preflight.pickHost")}</option>
+                                {(hosts.data?.items ?? []).map((host) => (
+                                  <option key={host.id} value={host.id}>
+                                    {host.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <Button
+                                variant="secondary"
+                                className="pf-btn--sm"
+                                onClick={() => {
+                                  const hostId = probeHostByCred[cred.id];
+                                  if (!hostId) {
+                                    toast.error(t("preflight.pickHost"));
+                                    return;
+                                  }
+                                  preflightMutation.mutate({ credentialId: cred.id, hostId });
+                                }}
+                                disabled={preflightMutation.isPending || !probeHostByCred[cred.id]}
+                                title={t("preflight.checkAccess")}
+                              >
+                                {t("preflight.checkAccess")}
+                              </Button>
                               <Button variant="secondary" className="pf-btn--sm" onClick={() => startEdit(cred)}>
                                 {t("common.edit")}
                               </Button>

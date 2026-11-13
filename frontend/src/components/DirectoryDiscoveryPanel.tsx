@@ -219,62 +219,69 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
             {sources.error instanceof Error ? sources.error.message : t("toast.genericError")}
           </div>
         ) : null}
-        <div className="pf-form pf-form--wide">
-          <div className="pf-form__row pf-directory__endpoint">
-            <div className="pf-form__group">
+        <div className="pf-form pf-form--wide pf-directory__form">
+          <div className="pf-directory__grid">
+            <div className="pf-form__group pf-directory__col-4">
               <label htmlFor="directory-name">{t("hosts.directoryName")}</label>
               <input
                 id="directory-name"
                 className="pf-input"
                 value={form.name}
+                autoComplete="off"
                 onChange={(event) => setForm({ ...form, name: event.target.value })}
               />
             </div>
-            <div className="pf-form__group">
+            <div className="pf-form__group pf-directory__col-6">
               <label htmlFor="directory-server">{t("hosts.directoryServer")}</label>
               <input
                 id="directory-server"
                 className="pf-input"
                 value={form.server}
                 placeholder="dc.corp.local"
+                autoComplete="off"
+                spellCheck={false}
                 onChange={(event) => setForm({ ...form, server: event.target.value })}
               />
             </div>
-            <div className="pf-form__group">
+            <div className="pf-form__group pf-directory__col-2">
               <label htmlFor="directory-port">{t("hosts.directoryPort")}</label>
               <input
                 id="directory-port"
-                className="pf-input"
+                className="pf-input pf-directory__port-input"
                 type="number"
                 min={1}
                 max={65535}
+                inputMode="numeric"
                 value={form.port}
                 onChange={(event) => setForm({ ...form, port: Number(event.target.value) || 389 })}
               />
             </div>
-          </div>
-          <div className="pf-form__row pf-directory__identity">
-            <div className="pf-form__group">
+
+            <div className="pf-form__group pf-directory__col-4">
               <label htmlFor="directory-base-dn">{t("hosts.directoryBaseDn")}</label>
               <input
                 id="directory-base-dn"
-                className="pf-input"
+                className="pf-input pf-directory__mono"
                 value={form.base_dn}
                 placeholder="DC=corp,DC=local"
+                autoComplete="off"
+                spellCheck={false}
                 onChange={(event) => setForm({ ...form, base_dn: event.target.value })}
               />
             </div>
-            <div className="pf-form__group">
+            <div className="pf-form__group pf-directory__col-4">
               <label htmlFor="directory-bind-dn">{t("hosts.directoryBindDn")}</label>
               <input
                 id="directory-bind-dn"
-                className="pf-input"
+                className="pf-input pf-directory__mono"
                 value={form.bind_dn}
                 placeholder="CN=secaudit,OU=Service,DC=corp,DC=local"
+                autoComplete="off"
+                spellCheck={false}
                 onChange={(event) => setForm({ ...form, bind_dn: event.target.value })}
               />
             </div>
-            <div className="pf-form__group">
+            <div className="pf-form__group pf-directory__col-4">
               <label htmlFor="directory-password">{t("hosts.directoryPassword")}</label>
               <PasswordInput
                 id="directory-password"
@@ -285,75 +292,85 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
               {editingId != null ? <p className="pf-form__hint">{t("hosts.directoryPasswordKeep")}</p> : null}
             </div>
           </div>
+
           <div className="pf-directory__options">
-            <div className="pf-directory__option-group">
-              <p className="pf-directory__option-label">{t("hosts.directoryConnection")}</p>
-              <label className="pf-directory__option" htmlFor="directory-ssl">
-                <input
-                  id="directory-ssl"
-                  type="checkbox"
-                  className="pf-checkbox-control"
-                  checked={form.use_ssl}
-                  onChange={(event) => setSsl(event.target.checked)}
-                />
-                <span className="pf-directory__option-text">{t("hosts.directoryUseSsl")}</span>
-              </label>
-              <label className="pf-directory__option" htmlFor="directory-starttls">
-                <input
-                  id="directory-starttls"
-                  type="checkbox"
-                  className="pf-checkbox-control"
-                  checked={form.start_tls && !form.use_ssl}
-                  disabled={form.use_ssl}
-                  onChange={(event) => setForm({ ...form, start_tls: event.target.checked })}
-                />
-                <span className="pf-directory__option-text">{t("hosts.directoryStartTls")}</span>
-              </label>
-              <label className="pf-directory__option" htmlFor="directory-verify">
-                <input
-                  id="directory-verify"
-                  type="checkbox"
-                  className="pf-checkbox-control"
-                  checked={form.verify_tls}
-                  onChange={(event) => setForm({ ...form, verify_tls: event.target.checked })}
-                />
-                <span className="pf-directory__option-text">{t("hosts.directoryVerifyTls")}</span>
-              </label>
+            <div className="pf-directory__option-card" role="group" aria-labelledby="directory-group-conn">
+              <div id="directory-group-conn" className="pf-directory__option-title">
+                {t("hosts.directoryConnection")}
+              </div>
+              <div className="pf-directory__option-items">
+                <label className="pf-directory__toggle" htmlFor="directory-ssl">
+                  <input
+                    id="directory-ssl"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.use_ssl}
+                    onChange={(event) => setSsl(event.target.checked)}
+                  />
+                  <span>{t("hosts.directoryUseSsl")}</span>
+                </label>
+                <label className="pf-directory__toggle" htmlFor="directory-starttls">
+                  <input
+                    id="directory-starttls"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.start_tls && !form.use_ssl}
+                    disabled={form.use_ssl}
+                    onChange={(event) => setForm({ ...form, start_tls: event.target.checked })}
+                  />
+                  <span>{t("hosts.directoryStartTls")}</span>
+                </label>
+                <label className="pf-directory__toggle" htmlFor="directory-verify">
+                  <input
+                    id="directory-verify"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.verify_tls}
+                    onChange={(event) => setForm({ ...form, verify_tls: event.target.checked })}
+                  />
+                  <span>{t("hosts.directoryVerifyTls")}</span>
+                </label>
+              </div>
             </div>
-            <div className="pf-directory__option-group">
-              <p className="pf-directory__option-label">{t("hosts.directoryImportOptions")}</p>
-              <label className="pf-directory__option" htmlFor="directory-enabled">
-                <input
-                  id="directory-enabled"
-                  type="checkbox"
-                  className="pf-checkbox-control"
-                  checked={form.enabled_only}
-                  onChange={(event) => setForm({ ...form, enabled_only: event.target.checked })}
-                />
-                <span className="pf-directory__option-text">{t("hosts.directoryEnabledOnly")}</span>
-              </label>
-              <label className="pf-directory__option" htmlFor="directory-ou">
-                <input
-                  id="directory-ou"
-                  type="checkbox"
-                  className="pf-checkbox-control"
-                  checked={form.map_ou_to_site}
-                  onChange={(event) => setForm({ ...form, map_ou_to_site: event.target.checked })}
-                />
-                <span className="pf-directory__option-text">{t("hosts.directoryMapOu")}</span>
-              </label>
-              <label className="pf-directory__option" htmlFor="directory-active">
-                <input
-                  id="directory-active"
-                  type="checkbox"
-                  className="pf-checkbox-control"
-                  checked={form.is_active}
-                  onChange={(event) => setForm({ ...form, is_active: event.target.checked })}
-                />
-                <span className="pf-directory__option-text">{t("hosts.directoryActive")}</span>
-              </label>
+            <div className="pf-directory__option-card" role="group" aria-labelledby="directory-group-import">
+              <div id="directory-group-import" className="pf-directory__option-title">
+                {t("hosts.directoryImportOptions")}
+              </div>
+              <div className="pf-directory__option-items">
+                <label className="pf-directory__toggle" htmlFor="directory-enabled">
+                  <input
+                    id="directory-enabled"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.enabled_only}
+                    onChange={(event) => setForm({ ...form, enabled_only: event.target.checked })}
+                  />
+                  <span>{t("hosts.directoryEnabledOnly")}</span>
+                </label>
+                <label className="pf-directory__toggle" htmlFor="directory-ou">
+                  <input
+                    id="directory-ou"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.map_ou_to_site}
+                    onChange={(event) => setForm({ ...form, map_ou_to_site: event.target.checked })}
+                  />
+                  <span>{t("hosts.directoryMapOu")}</span>
+                </label>
+                <label className="pf-directory__toggle" htmlFor="directory-active">
+                  <input
+                    id="directory-active"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.is_active}
+                    onChange={(event) => setForm({ ...form, is_active: event.target.checked })}
+                  />
+                  <span>{t("hosts.directoryActive")}</span>
+                </label>
+              </div>
             </div>
           </div>
+
           <div className="pf-directory__actions">
             {editingId != null ? (
               <Button

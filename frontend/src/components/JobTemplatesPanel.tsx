@@ -1,6 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { api, type Job, type JobTemplate } from "../api/client";
+import { api, type DynamicHostFilter, type Job, type JobTemplate } from "../api/client";
+import {
+  DynamicHostFilterFields,
+  EMPTY_DYNAMIC_FILTER,
+  TargetModeToggle,
+  type TargetMode,
+} from "./DynamicHostFilterFields";
 import { HostPicker } from "./HostPicker";
 import { JobSchedulePicker, useScheduleLabels } from "./JobSchedulePicker";
 import { Badge } from "./ui/Badge";
@@ -26,6 +32,8 @@ type TemplateForm = {
   profileId: number | "";
   playbookId: number | "";
   hostIds: number[];
+  targetMode: TargetMode;
+  dynamicFilter: DynamicHostFilter;
   isScheduled: boolean;
   scheduleConfig: ScheduleConfig;
   isActive: boolean;
@@ -38,6 +46,8 @@ const emptyForm = (): TemplateForm => ({
   profileId: "",
   playbookId: "",
   hostIds: [],
+  targetMode: "hosts",
+  dynamicFilter: EMPTY_DYNAMIC_FILTER,
   isScheduled: false,
   scheduleConfig: { ...DEFAULT_SCHEDULE },
   isActive: true,
@@ -59,6 +69,8 @@ function formFromTemplate(template: JobTemplate): TemplateForm {
     profileId: template.profile_id ?? "",
     playbookId: template.playbook_id ?? "",
     hostIds: template.host_ids,
+    targetMode: template.dynamic_filter ? "dynamic" : "hosts",
+    dynamicFilter: template.dynamic_filter ?? EMPTY_DYNAMIC_FILTER,
     isScheduled: template.is_scheduled,
     scheduleConfig: parseCronExpression(template.cron_expression),
     isActive: template.is_active,
@@ -81,8 +93,9 @@ function buildPayload(form: TemplateForm) {
     profile_id: form.jobType !== "playbook" && form.profileId !== "" ? form.profileId : undefined,
     playbook_id: form.jobType === "playbook" && form.playbookId !== "" ? form.playbookId : undefined,
     execution_type: executionType,
-    host_ids: form.hostIds,
-    dynamic_filter: null,
+    ...(form.targetMode === "dynamic"
+      ? { host_ids: [] as number[], dynamic_filter: form.dynamicFilter }
+      : { host_ids: form.hostIds, dynamic_filter: null }),
     is_scheduled: form.isScheduled,
     cron_expression: form.isScheduled ? buildCronExpression(form.scheduleConfig) : undefined,
     is_active: form.isActive,
@@ -173,7 +186,7 @@ export function JobTemplatesPanel({ canManage, onUseTemplate, onJobCreated }: Jo
   const isFormValid =
     !!form.name &&
     (form.jobType !== "playbook" ? form.profileId !== "" : form.playbookId !== "") &&
-    form.hostIds.length > 0;
+    (form.targetMode === "dynamic" || form.hostIds.length > 0);
 
   const cancelForm = () => {
     setEditingId(null);
@@ -311,13 +324,27 @@ export function JobTemplatesPanel({ canManage, onUseTemplate, onJobCreated }: Jo
               )}
             </div>
 
-            <HostPicker
-              hosts={availableHosts}
-              selectedIds={form.hostIds}
-              onToggle={toggleHost}
-              onSelectAll={(hostIds) => setForm({ ...form, hostIds })}
-              onClearAll={() => setForm({ ...form, hostIds: [] })}
+            <TargetModeToggle
+              mode={form.targetMode}
+              onChange={(targetMode) => setForm({ ...form, targetMode })}
+              hostsLabel={t("jobTemplates.targetHosts")}
+              dynamicLabel={t("jobTemplates.targetDynamic")}
             />
+            {form.targetMode === "dynamic" ? (
+              <DynamicHostFilterFields
+                value={form.dynamicFilter}
+                onChange={(dynamicFilter) => setForm({ ...form, dynamicFilter })}
+                idPrefix="template-dynamic"
+              />
+            ) : (
+              <HostPicker
+                hosts={availableHosts}
+                selectedIds={form.hostIds}
+                onToggle={toggleHost}
+                onSelectAll={(hostIds) => setForm({ ...form, hostIds })}
+                onClearAll={() => setForm({ ...form, hostIds: [] })}
+              />
+            )}
 
             <JobSchedulePicker
               enabled={form.isScheduled}

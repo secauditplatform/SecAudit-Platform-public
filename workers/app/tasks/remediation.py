@@ -7,18 +7,22 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery_app, settings
-from app.tasks.compliance import SessionLocal, _credential_secret
+from app.tasks.compliance import SessionLocal, _credential_secret, _primary_credential
 from secaudit_core.credential_auth import ssh_auth_from_credential
+from secaudit_core.host_credentials import linked_credentials
 from secaudit_core.beat_lock import acquire_beat_lock, release_beat_lock
 from secaudit_core.celery_reliability import TASK_RETRY_KWARGS
 from secaudit_core.package_paths import resolve_script_under_package
 from secaudit_core.transient import reraise_if_transient
 from secaudit_core.models import (
+    CheckResult,
     CheckScript,
     CheckStatus,
     CredentialType,
     ExecutionType,
     Host,
+    Job,
+    JobRun,
     JobStatus,
     NetworkRemediationConfig,
     RemediationJob,
@@ -27,6 +31,7 @@ from secaudit_core.models import (
     ScriptKind,
     Profile,
 )
+from secaudit_core.job_run_subset import classify_host_outcomes, resolve_subset_host_ids
 from secaudit_core.enums import JobScope, NetworkVendor
 from secaudit_core.network_config import generate_remediation_config
 from secaudit_core.network_scope import host_is_network
@@ -37,6 +42,7 @@ from app.executors.python_exec import (
 )
 from app.executors.ssh import run_package_script_over_ssh, run_script_over_ssh
 from app.executors.winrm_exec import run_script_over_winrm
+from app.host_lock_guard import hold_host_lock, host_tcp_ready, wrap_process_host
 from app.host_parallel import run_hosts_parallel
 from app.logging_pub import publish_remediation_log
 from app.notify import emit_run_notification
@@ -48,6 +54,50 @@ from secaudit_core.task_outbox import enqueue_outbox_row
 from secaudit_core.tracing import set_current_span_attributes
 
 logger = logging.getLogger(__name__)
+
+HOST_BUSY_MESSAGE = "Host locked by another job or remediation run"
+HOST_UNREACHABLE_SCRIPT = "HOST_UNREACHABLE"
+
+
+def _skip_remediation_host_busy(remediation_run_id: int, host: Host) -> tuple[int, list[str]]:
+    with SessionLocal() as host_db:
+        publish_remediation_log(
+            remediation_run_id,
+            f"SKIP [{host.name}]: {HOST_BUSY_MESSAGE}",
+            level="warning",
+        )
+        upsert_remediation_result(
+            host_db,
+            remediation_run_id=remediation_run_id,
+            host_id=host.id,
+            script_name="HOST_BUSY",
+            status=CheckStatus.SKIP,
+            message=HOST_BUSY_MESSAGE,
+        )
+        host_db.commit()
+    return 1, []
+
+
+def _skip_remediation_host_unreachable(
+    remediation_run_id: int, host: Host, detail: str
+) -> tuple[int, list[str]]:
+    message = f"Host unreachable before run: {detail}"
+    with SessionLocal() as host_db:
+        publish_remediation_log(
+            remediation_run_id,
+            f"SKIP [{host.name}]: {message}",
+            level="warning",
+        )
+        upsert_remediation_result(
+            host_db,
+            remediation_run_id=remediation_run_id,
+            host_id=host.id,
+            script_name=HOST_UNREACHABLE_SCRIPT,
+            status=CheckStatus.SKIP,
+            message=message[:500],
+        )
+        host_db.commit()
+    return 1, []
 
 
 def _raw_output_limit() -> int:
@@ -62,13 +112,32 @@ def _resolve_remediation_hosts(db: Session, job: RemediationJob) -> list[Host]:
         owner_sub=job.owner_sub,
         enforce_owner_scope=job.enforce_host_owner_scope,
     )
-    return load_active_hosts(db, host_ids)
+    hosts = load_active_hosts(db, host_ids)
+    if getattr(settings, "demo_mode", False) and hosts:
+        from secaudit_core.demo_exec_guard import assert_hostnames_in_demo_cidrs
+
+        assert_hostnames_in_demo_cidrs(
+            [host.hostname for host in hosts],
+            allowed_cidrs_raw=getattr(settings, "demo_exec_allowed_cidrs", ""),
+        )
+    return hosts
 
 
 def _is_run_cancelled(db: Session, remediation_run_id: int) -> bool:
+    from secaudit_core.run_cancel import is_run_cancel_requested
+
+    if is_run_cancel_requested(settings.redis_url, "remediation", remediation_run_id):
+        return True
     return (
         current_run_status(db, RemediationRun, remediation_run_id) == JobStatus.CANCELLED
     )
+
+
+def _remediate_rules_env(rule_tech_names: list[str] | None) -> dict[str, str] | None:
+    rules = [str(name).strip() for name in (rule_tech_names or []) if str(name).strip()]
+    if not rules:
+        return None
+    return {"SECAUDIT_REMEDIATE_RULES": ",".join(rules)}
 
 
 def _execute_remediation(
@@ -77,30 +146,43 @@ def _execute_remediation(
     script: CheckScript,
     execution_type: ExecutionType,
     remediation_run_id: int,
+    *,
+    rule_tech_names: list[str] | None = None,
+    check_mode: bool = False,
 ) -> str:
-    if not host.credential:
+    cred = _primary_credential(host)
+    if not cred:
         raise ValueError(f"Host '{host.name}' has no credential assigned")
 
-    cred = host.credential
     secret = _credential_secret(cred)
     username = cred.username or "root"
     password, private_key, key_passphrase = ssh_auth_from_credential(cred, secret, settings)
+    extra_env = _remediate_rules_env(rule_tech_names)
+    tags = [str(name).strip() for name in (rule_tech_names or []) if str(name).strip()] or None
 
+    mode_note = " (check mode)" if check_mode else ""
     publish_remediation_log(
         remediation_run_id,
-        f"[{host.name}] Running remediation {execution_type.value}: {script.script_file}",
+        f"[{host.name}] Running remediation {execution_type.value}: {script.script_file}{mode_note}",
     )
     known_hosts_entry = host.ssh_known_hosts_entry
 
     if execution_type == ExecutionType.WINRM:
+        winrm_cred = next(
+            (item for item in linked_credentials(host) if item.credential_type == CredentialType.WINRM),
+            None,
+        )
+        if not winrm_cred:
+            raise ValueError(f"Host '{host.name}' has no winrm credential assigned")
         script_path = resolve_script_under_package(package_dir, script.script_file)
         return run_script_over_winrm(
             hostname=host.hostname,
             port=host.port,
-            username=username,
-            password=secret if cred.credential_type == CredentialType.WINRM else None,
+            username=winrm_cred.username or "root",
+            password=_credential_secret(winrm_cred),
             script_path=script_path,
             server_cert_validation=settings.winrm_server_cert_validation_effective,
+            extra_env=extra_env,
         )
 
     if execution_type == ExecutionType.PYTHON:
@@ -114,6 +196,7 @@ def _execute_remediation(
                 private_key=private_key,
                 script_path=script_path,
                 key_passphrase=key_passphrase,
+                extra_env=extra_env,
             )
         return run_python_over_ssh(
             hostname=host.hostname,
@@ -124,6 +207,7 @@ def _execute_remediation(
             script_path=script_path,
             known_hosts_entry=known_hosts_entry,
             key_passphrase=key_passphrase,
+            extra_env=extra_env,
         )
 
     if execution_type == ExecutionType.ANSIBLE:
@@ -148,7 +232,15 @@ def _execute_remediation(
         elif cred.credential_type == CredentialType.WINRM:
             creds["password"] = secret
             inv[0]["ansible_vars"] = {"ansible_connection": "winrm"}
-        return run_playbook(content, inv, credentials=creds, connection_mode="auto")
+        return run_playbook(
+            content,
+            inv,
+            credentials=creds,
+            connection_mode="auto",
+            check_mode=check_mode,
+            tags=tags,
+            extravars={"secaudit_remediate_rules": tags or []},
+        )
 
     return run_package_script_over_ssh(
         hostname=host.hostname,
@@ -160,7 +252,68 @@ def _execute_remediation(
         script_file=script.script_file,
         known_hosts_entry=known_hosts_entry,
         key_passphrase=key_passphrase,
+        extra_env=extra_env,
     )
+
+
+def _enqueue_failed_host_recheck(db: Session, remediation_job: RemediationJob) -> int | None:
+    """Queue a partial compliance JobRun for hosts that failed on the source audit run."""
+    source_run_id = remediation_job.source_run_id
+    if not source_run_id:
+        return None
+    source = db.get(JobRun, source_run_id)
+    if not source:
+        return None
+    audit_job = db.get(Job, source.job_id)
+    if not audit_job:
+        return None
+
+    checks = list(
+        db.execute(select(CheckResult).where(CheckResult.job_run_id == source.id)).scalars().all()
+    )
+    classified = classify_host_outcomes(checks)
+    allowed = set(classified["all"])
+    if source.host_ids:
+        allowed |= {int(host_id) for host_id in source.host_ids if host_id is not None}
+    try:
+        host_ids = resolve_subset_host_ids(
+            subset="failed",
+            classified=classified,
+            selected_host_ids=None,
+            allowed_host_ids=allowed,
+        )
+    except ValueError:
+        return None
+    if not host_ids:
+        return None
+
+    job_run = JobRun(
+        job_id=audit_job.id,
+        status=JobStatus.PENDING,
+        host_ids=host_ids,
+        is_partial=True,
+        subset_kind="failed",
+        source_run_id=source.id,
+    )
+    db.add(job_run)
+    db.flush()
+    enqueue_outbox_row(
+        db,
+        task_name="app.tasks.run_compliance_job",
+        args=[job_run.id],
+        queue="compliance",
+        callback_kind="job_run",
+        callback_ref_id=job_run.id,
+        correlation={
+            "source": "remediation_auto_recheck",
+            "run_kind": "job",
+            "run_id": job_run.id,
+            "remediation_job_id": remediation_job.id,
+        },
+    )
+    remediation_job.workflow_reaudit_run_id = job_run.id
+    db.flush()
+    return job_run.id
 
 
 def _run_remediation_job(
@@ -188,6 +341,10 @@ def _run_remediation_job(
     remediation_run_id = remediation_run.id
     execution_type = job.execution_type
     raw_limit = _raw_output_limit()
+    rule_tech_names = [
+        str(name).strip() for name in (job.rule_tech_names or []) if str(name).strip()
+    ] or None
+    check_mode = bool(getattr(job, "check_mode", False))
 
     def process_host(host: Host) -> tuple[int, list[str]]:
         with SessionLocal() as host_db:
@@ -201,7 +358,13 @@ def _run_remediation_job(
                     raise InterruptedError("Remediation run cancelled")
                 try:
                     output = _execute_remediation(
-                        host, package_dir, script, execution_type, remediation_run_id
+                        host,
+                        package_dir,
+                        script,
+                        execution_type,
+                        remediation_run_id,
+                        rule_tech_names=rule_tech_names,
+                        check_mode=check_mode,
                     )
                     summary = output.split("\n", 1)[0][:500]
                     upsert_remediation_result(
@@ -244,8 +407,16 @@ def _run_remediation_job(
 
     host_results = run_hosts_parallel(
         hosts,
-        settings.job_host_concurrency,
-        process_host,
+        settings.job_host_concurrency_for(len(hosts)),
+        wrap_process_host(
+            settings,
+            process_host,
+            label=f"remediation_run:{remediation_run_id}",
+            on_busy=lambda host: _skip_remediation_host_busy(remediation_run_id, host),
+            on_unreachable=lambda host, detail: _skip_remediation_host_unreachable(
+                remediation_run_id, host, detail
+            ),
+        ),
         should_cancel=lambda: _is_run_cancelled(db, remediation_run_id),
     )
     results_count = sum(count for count, _ in host_results)
@@ -312,42 +483,58 @@ def _run_network_remediation_job(
     for host in hosts:
         if _is_run_cancelled(db, remediation_run_id):
             break
-        commands: list[str] = []
-        for script in scripts:
-            try:
-                commands.extend(_commands_from_remediation_script(package_dir, script))
-            except Exception as exc:
-                reraise_if_transient(exc)
-                errors.append(f"{host.name}: failed to read remediation script {script.name}: {exc}")
-        if not commands:
-            commands = list(default_commands)
+        ok, detail = host_tcp_ready(host)
+        if not ok:
+            skipped, _ = _skip_remediation_host_unreachable(
+                remediation_run_id, host, detail
+            )
+            results_count += skipped
+            continue
+        with hold_host_lock(
+            settings, host.id, label=f"remediation_run:{remediation_run_id}"
+        ) as acquired:
+            if not acquired:
+                skipped, _ = _skip_remediation_host_busy(remediation_run_id, host)
+                results_count += skipped
+                continue
+            commands: list[str] = []
+            for script in scripts:
+                try:
+                    commands.extend(_commands_from_remediation_script(package_dir, script))
+                except Exception as exc:
+                    reraise_if_transient(exc)
+                    errors.append(
+                        f"{host.name}: failed to read remediation script {script.name}: {exc}"
+                    )
+            if not commands:
+                commands = list(default_commands)
 
-        vendor = _infer_host_vendor(host)
-        content = generate_remediation_config(vendor, hostname=host.name, commands=commands)
-        filename = f"remediation-{remediation_run_id}-{host.name}-{vendor.value}.cfg"
-        db.add(
-            NetworkRemediationConfig(
+            vendor = _infer_host_vendor(host)
+            content = generate_remediation_config(vendor, hostname=host.name, commands=commands)
+            filename = f"remediation-{remediation_run_id}-{host.name}-{vendor.value}.cfg"
+            db.add(
+                NetworkRemediationConfig(
+                    remediation_run_id=remediation_run_id,
+                    host_id=host.id,
+                    vendor=vendor,
+                    filename=filename,
+                    content=content,
+                )
+            )
+            upsert_remediation_result(
+                db,
                 remediation_run_id=remediation_run_id,
                 host_id=host.id,
-                vendor=vendor,
-                filename=filename,
-                content=content,
+                script_name="network_remediation_config",
+                status=CheckStatus.PASS,
+                message="Remediation config generated; download and apply on device",
+                raw_output=content[: _raw_output_limit()],
             )
-        )
-        upsert_remediation_result(
-            db,
-            remediation_run_id=remediation_run_id,
-            host_id=host.id,
-            script_name="network_remediation_config",
-            status=CheckStatus.PASS,
-            message="Remediation config generated; download and apply on device",
-            raw_output=content[: _raw_output_limit()],
-        )
-        publish_remediation_log(
-            remediation_run_id,
-            f"[{host.name}] Generated downloadable remediation config ({filename})",
-        )
-        results_count += 1
+            publish_remediation_log(
+                remediation_run_id,
+                f"[{host.name}] Generated downloadable remediation config ({filename})",
+            )
+            results_count += 1
 
     db.commit()
     return results_count, errors
@@ -443,6 +630,11 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
             )
             return {"error": "no hosts"}
 
+        from app.cancel_context import active_run_scope
+        from secaudit_core.run_cancel import clear_run_cancel_state
+
+        active_run_cm = active_run_scope("remediation", remediation_run_id)
+        active_run_cm.__enter__()
         try:
             profile = db.get(Profile, job.profile_id)
             if not profile:
@@ -458,8 +650,10 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
                 )
 
             if _is_run_cancelled(db, remediation_run_id):
+                transition_running_run(
+                    db, RemediationRun, remediation_run_id, JobStatus.CANCELLED
+                )
                 publish_remediation_log(remediation_run_id, "Remediation run cancelled")
-                db.commit()
                 return {"remediation_run_id": remediation_run_id, "status": JobStatus.CANCELLED.value}
 
             error_results = db.execute(
@@ -481,6 +675,27 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
             )
             remediation_run = db.get(RemediationRun, remediation_run_id)
 
+            recheck_run_id = None
+            want_recheck = bool(getattr(job, "auto_recheck_failed", False)) and not bool(
+                getattr(job, "check_mode", False)
+            )
+            if final_status == JobStatus.COMPLETED and want_recheck:
+                try:
+                    fresh_job = db.get(RemediationJob, job.id) or job
+                    recheck_run_id = _enqueue_failed_host_recheck(db, fresh_job)
+                    if recheck_run_id:
+                        db.commit()
+                        publish_remediation_log(
+                            remediation_run_id,
+                            f"Queued failed-host recheck JobRun #{recheck_run_id}",
+                        )
+                except Exception:
+                    logger.warning(
+                        "Failed to enqueue auto-recheck after remediation_run=%s",
+                        remediation_run_id,
+                        exc_info=True,
+                    )
+
             publish_remediation_log(
                 remediation_run_id, f"Remediation run finished: {remediation_run.status.value}"
             )
@@ -494,7 +709,13 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
                 error_message=remediation_run.error_message,
                 owner_sub=job.owner_sub,
             )
-            return {"remediation_run_id": remediation_run_id, "status": remediation_run.status.value}
+            result = {
+                "remediation_run_id": remediation_run_id,
+                "status": remediation_run.status.value,
+            }
+            if recheck_run_id:
+                result["reaudit_run_id"] = recheck_run_id
+            return result
 
         except InterruptedError:
             transition_running_run(
@@ -525,6 +746,9 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
                 owner_sub=job.owner_sub,
             )
             return {"remediation_run_id": remediation_run_id, "status": "failed", "error": str(exc)}
+        finally:
+            active_run_cm.__exit__(None, None, None)
+            clear_run_cancel_state(settings.redis_url, "remediation", remediation_run_id)
 
 
 @celery_app.task(name="app.tasks.remediation.run_scheduled_remediation_jobs")

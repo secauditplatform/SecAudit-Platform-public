@@ -6,12 +6,19 @@ profile as it looks on disk today.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 from secaudit_core.profile_packages import package_encoding_hint
+from secaudit_core.rule_tech_names import excluded_by_version_entries
 
 
-def profile_snapshot_from_profile(profile, version=None) -> dict:
+def profile_snapshot_from_profile(
+    profile,
+    version=None,
+    *,
+    all_rule_tech_names: Iterable[str] | None = None,
+) -> dict:
     encoding = None
     package_path = getattr(profile, "package_path", None)
     if package_path:
@@ -27,12 +34,18 @@ def profile_snapshot_from_profile(profile, version=None) -> dict:
         "encoding": encoding,
     }
     if version is not None:
+        excluded = excluded_by_version_entries(
+            all_rule_tech_names=all_rule_tech_names or (),
+            requirement_ids=version.requirement_ids,
+            version_label=version.label,
+        )
         snapshot.update(
             {
                 "version_id": version.id,
                 "version_number": version.number,
                 "version_label": version.label,
                 "enabled_requirement_count": len(version.requirement_ids or []),
+                "excluded_by_version": excluded,
             }
         )
     return snapshot

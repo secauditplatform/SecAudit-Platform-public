@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from secaudit_core.celery_dispatch import revoke_task
+from secaudit_core.run_cancel import set_run_cancel_flag
 from secaudit_core.notifications import enqueue_run_notification, events_for_terminal_status
 
 from app.services.dispatch import (
@@ -20,6 +21,7 @@ from app.core.database import get_db
 from app.models import (
     CheckScript,
     Job,
+    JobRun,
     JobStatus,
     RemediationJob,
     RemediationJobHost,
@@ -40,8 +42,11 @@ from app.schemas import (
     RemediationJobUpdate,
     RemediationRunDetail,
     RemediationRunRead,
+    RemediationWorkflowRead,
+    RemediationWorkflowReauditUpdate,
 )
 from app.services.audit_log import log_audit_event
+from app.services.demo_exec_targets import assert_demo_exec_remediation_job
 from app.services.job_webhooks import apply_webhook_fields, webhook_read_fields
 from app.services.object_rbac import (
     apply_owner_scope,
@@ -56,8 +61,8 @@ from app.services.remediation_workflow import build_remediation_suggestion
 router = APIRouter()
 
 
-def _revoke_celery_task(task_id: str) -> None:
-    revoke_task(task_id, broker_url=settings.celery_broker_url)
+def _revoke_celery_task(task_id: str, *, terminate: bool = False) -> None:
+    revoke_task(task_id, broker_url=settings.celery_broker_url, terminate=terminate)
 
 
 def _remediation_job_to_read(job: RemediationJob) -> RemediationJobRead:
@@ -75,6 +80,10 @@ def _remediation_job_to_read(job: RemediationJob) -> RemediationJobRead:
         created_at=job.created_at,
         owner_sub=job.owner_sub,
         host_ids=[jh.host_id for jh in job.job_hosts],
+        source_run_id=job.source_run_id,
+        rule_tech_names=job.rule_tech_names,
+        check_mode=bool(job.check_mode),
+        auto_recheck_failed=bool(job.auto_recheck_failed),
         **webhook_read_fields(job),
     )
 
@@ -175,6 +184,22 @@ async def create_remediation_from_run(
     if not suggestion["host_ids"]:
         raise HTTPException(status_code=400, detail="No target hosts for remediation")
 
+    selected_rules = [
+        str(name).strip()
+        for name in (data.rule_tech_names or [])
+        if str(name).strip()
+    ]
+    failed_checks = suggestion["failed_checks"]
+    if selected_rules:
+        allowed = set(selected_rules)
+        failed_checks = [item for item in failed_checks if item["rule_tech_name"] in allowed]
+        if not failed_checks:
+            raise HTTPException(status_code=400, detail="Selected rules have no failed checks")
+        selected_rules = sorted({item["rule_tech_name"] for item in failed_checks})
+    else:
+        selected_rules = sorted({item["rule_tech_name"] for item in failed_checks})
+    host_ids = sorted({int(item["host_id"]) for item in failed_checks})
+
     script_id = data.remediation_script_id or suggestion["default_remediation_script_id"]
     await _validate_remediation_script(db, suggestion["profile_id"], script_id)
 
@@ -191,24 +216,28 @@ async def create_remediation_from_run(
         db,
         scope=remediation_scope,
         profile_id=suggestion["profile_id"],
-        host_ids=suggestion["host_ids"],
+        host_ids=host_ids,
     )
 
     job = RemediationJob(
+        source_run_id=data.source_run_id,
         name=data.name or suggestion["suggested_name"],
         profile_id=suggestion["profile_id"],
         remediation_script_id=script_id,
         execution_type=suggestion["default_execution_type"],
         scope=remediation_scope,
         is_active=True,
+        rule_tech_names=selected_rules,
+        check_mode=bool(data.check_mode),
+        auto_recheck_failed=bool(data.auto_recheck_failed),
     )
     assign_owner(job, user)
     assign_host_target_scope(job, user)
     db.add(job)
     await db.flush()
 
-    await assert_hosts_accessible(db, user, suggestion["host_ids"])
-    for host_id in suggestion["host_ids"]:
+    await assert_hosts_accessible(db, user, host_ids)
+    for host_id in host_ids:
         db.add(RemediationJobHost(remediation_job_id=job.id, host_id=host_id))
 
     remediation_run_id: int | None = None
@@ -256,6 +285,9 @@ async def create_remediation_from_run(
             "source_run_id": data.source_run_id,
             "source_job_id": suggestion["source_job_id"],
             "remediation_run_id": remediation_run_id,
+            "rule_tech_names": selected_rules,
+            "check_mode": bool(data.check_mode),
+            "auto_recheck_failed": bool(data.auto_recheck_failed),
         },
     )
     await db.commit()
@@ -267,6 +299,85 @@ async def create_remediation_from_run(
         source_run_id=data.source_run_id,
         source_job_id=suggestion["source_job_id"],
     )
+
+
+_TERMINAL_RUN_STATUSES = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+
+
+async def _latest_workflow_job(
+    db: AsyncSession, user: AuthUser, source_run_id: int
+) -> RemediationJob:
+    stmt = (
+        select(RemediationJob)
+        .where(RemediationJob.source_run_id == source_run_id)
+        .order_by(RemediationJob.id.desc())
+        .limit(1)
+    )
+    job = (await db.execute(apply_owner_scope(stmt, RemediationJob.owner_sub, user))).scalar_one_or_none()
+    if job:
+        return job
+    # Allow lookup when the operator opens the re-audit run itself.
+    reaudit_stmt = (
+        select(RemediationJob)
+        .where(RemediationJob.workflow_reaudit_run_id == source_run_id)
+        .order_by(RemediationJob.id.desc())
+        .limit(1)
+    )
+    job = (
+        await db.execute(apply_owner_scope(reaudit_stmt, RemediationJob.owner_sub, user))
+    ).scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Remediation workflow not found")
+    return job
+
+
+async def _workflow_read(db: AsyncSession, job: RemediationJob) -> RemediationWorkflowRead:
+    source_run = await db.get(JobRun, job.source_run_id) if job.source_run_id else None
+    remediation_run_id = (
+        await db.execute(
+            select(RemediationRun.id)
+            .where(RemediationRun.remediation_job_id == job.id)
+            .order_by(RemediationRun.id.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    reaudit_run = (
+        await db.get(JobRun, job.workflow_reaudit_run_id) if job.workflow_reaudit_run_id else None
+    )
+    return RemediationWorkflowRead(
+        source_run_id=job.source_run_id,
+        source_job_id=source_run.job_id if source_run else None,
+        remediation_job_id=job.id,
+        remediation_run_id=remediation_run_id,
+        reaudit_run_id=job.workflow_reaudit_run_id,
+        reaudit_completed=reaudit_run is not None and reaudit_run.status in _TERMINAL_RUN_STATUSES,
+        check_mode=bool(job.check_mode),
+        auto_recheck_failed=bool(job.auto_recheck_failed),
+    )
+
+
+@router.get("/workflow/{source_run_id}", response_model=RemediationWorkflowRead)
+async def get_remediation_workflow(
+    source_run_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_remediation),
+) -> RemediationWorkflowRead:
+    return await _workflow_read(db, await _latest_workflow_job(db, user, source_run_id))
+
+
+@router.patch("/workflow/{source_run_id}/reaudit", response_model=RemediationWorkflowRead)
+async def set_remediation_workflow_reaudit(
+    source_run_id: int,
+    data: RemediationWorkflowReauditUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+) -> RemediationWorkflowRead:
+    job = await _latest_workflow_job(db, user, source_run_id)
+    if not await db.get(JobRun, data.reaudit_run_id):
+        raise HTTPException(status_code=404, detail="Re-audit run not found")
+    job.workflow_reaudit_run_id = data.reaudit_run_id
+    await db.commit()
+    return await _workflow_read(db, job)
 
 
 @router.patch("/{job_id}", response_model=RemediationJobRead)
@@ -378,6 +489,7 @@ async def run_remediation_job(
     if not job:
         raise HTTPException(status_code=404, detail="Remediation job not found")
     assert_can_access(user, job.owner_sub, detail="Remediation job not found")
+    await assert_demo_exec_remediation_job(db, job)
 
     remediation_run = RemediationRun(
         remediation_job_id=job.id,
@@ -477,6 +589,12 @@ async def stop_remediation_run(
     job = await db.get(RemediationJob, remediation_run.remediation_job_id)
     assert_can_access(user, job.owner_sub if job else None, detail="Remediation run not found")
 
+    set_run_cancel_flag(settings.redis_url, "remediation", run_id)
+    await db.refresh(remediation_run)
+
+    if remediation_run.status == JobStatus.CANCELLED:
+        return RemediationRunRead.model_validate(remediation_run)
+
     if remediation_run.status not in (JobStatus.PENDING, JobStatus.RUNNING):
         raise HTTPException(
             status_code=409, detail=f"Cannot stop run in status '{remediation_run.status.value}'"
@@ -484,14 +602,16 @@ async def stop_remediation_run(
 
     if not await cancel_active_run(db, RemediationRun, run_id):
         await db.refresh(remediation_run)
+        if remediation_run.status == JobStatus.CANCELLED:
+            return RemediationRunRead.model_validate(remediation_run)
         raise HTTPException(
             status_code=409,
             detail=f"Cannot stop run in status '{remediation_run.status.value}'",
         )
-    if remediation_run.celery_task_id:
-        _revoke_celery_task(remediation_run.celery_task_id)
-    await db.flush()
+    await db.commit()
     await db.refresh(remediation_run)
+    if remediation_run.celery_task_id:
+        _revoke_celery_task(remediation_run.celery_task_id, terminate=False)
     await log_audit_event(
         db,
         request,
