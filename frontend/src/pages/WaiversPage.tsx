@@ -49,7 +49,7 @@ export function WaiversPage() {
   const queryClient = useQueryClient();
   const { confirm } = useConfirm();
   const { isAdmin, canOperate, roles } = useAuth();
-  const canApprove = isAdmin || roles.includes("operator");
+  const canApprove = isAdmin || roles.includes("security_approver");
   const canDelete = canOperate;
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<WaiverStatus | "all">("all");
@@ -179,6 +179,15 @@ export function WaiversPage() {
       return next;
     });
   };
+
+  const reopenMutation = useMutation({
+    mutationFn: (id: number) => api.reopenWaiver(id),
+    onSuccess: () => {
+      toast.success(t("waivers.reopened"));
+      queryClient.invalidateQueries({ queryKey: ["waivers"] });
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
 
   const approveMutation = useMutation({
     mutationFn: ({ id, changeTicket }: { id: number; changeTicket?: string }) =>
@@ -530,6 +539,11 @@ export function WaiversPage() {
                         {row.host_id != null
                           ? hostLabel.get(row.host_id) ?? row.host_id
                           : t("waivers.allHosts")}
+                        {row.scope_site ? ` · ${t("waivers.scopeSite", { name: row.scope_site })}` : ""}
+                        {row.scope_environment
+                          ? ` · ${t("waivers.scopeEnvironment", { name: row.scope_environment })}`
+                          : ""}
+                        {row.scope_tag ? ` · ${t("waivers.scopeTag", { name: row.scope_tag })}` : ""}
                       </td>
                       <td>
                         <Badge variant={statusVariant(row.status)}>
@@ -587,6 +601,16 @@ export function WaiversPage() {
                                 {t("waivers.reject")}
                               </Button>
                             </>
+                          )}
+                          {canOperate && row.status === "approved" && row.is_active && (
+                            <Button
+                              variant="secondary"
+                              className="pf-btn--sm"
+                              onClick={() => reopenMutation.mutate(row.id)}
+                              disabled={reopenMutation.isPending}
+                            >
+                              {t("waivers.reopen")}
+                            </Button>
                           )}
                           {canApprove && row.status === "approved" && row.is_active && (
                             <Button

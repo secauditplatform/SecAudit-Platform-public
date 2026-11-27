@@ -403,7 +403,7 @@ export function AuditMapPage() {
   }
 
   function radarZoomBy(factor: number) {
-    setRadarZoom((current) => Math.min(2.5, Math.max(0.6, current * factor)));
+    setRadarZoom((current) => Math.min(3, Math.max(0.45, current * factor)));
   }
 
   function resetRadarView() {
@@ -936,7 +936,6 @@ export function AuditMapPage() {
             </p>
             <div className="pf-audit-map__radar-toolbar-controls">
               <div className="pf-audit-map__radar-hud pf-audit-map__radar-hud--bar">
-                <p className="pf-audit-map__radar-eyebrow">{t("auditMap.radarTotal")}</p>
                 <div className="pf-audit-map__radar-big">
                   <strong>{radarTotal}</strong>
                   <span>{t("auditMap.radarNodes")}</span>
@@ -1030,6 +1029,7 @@ export function AuditMapPage() {
               zoom={radarZoom}
               pan={radarPan}
               onPan={setRadarPan}
+              onZoomBy={radarZoomBy}
               onSelect={(node, groupKey) => openHost(node.host_id, groupKey)}
               onFocusGroup={(key) => {
                 const next = key ?? "";

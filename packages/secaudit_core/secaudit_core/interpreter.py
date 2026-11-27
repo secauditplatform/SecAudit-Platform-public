@@ -27,6 +27,14 @@ from secaudit_core.enums import CheckStatus
 
 _STATUS_TOKEN = re.compile(r"\b(PASS|FAIL|SKIP|ERROR)\b", re.IGNORECASE)
 _JSONL_STATUSES = frozenset({"pass", "fail", "skip", "error"})
+_REMEDIATION_JSONL_STATUSES = frozenset({"changed", "unchanged", "skip", "error"})
+_REMEDIATION_STATUS_ALIASES = {
+    "pass": "unchanged",
+    "ok": "unchanged",
+    "fail": "error",
+    "would_change": "changed",
+    "would-change": "changed",
+}
 
 
 def parse_jsonl_check_lines(output: str) -> list[dict[str, Any]]:
@@ -153,3 +161,46 @@ def apply_interpreter_rules(
         ordered.append(item)
 
     return ordered
+
+
+def parse_jsonl_remediation_lines(output: str) -> list[dict[str, Any]]:
+    """Parse remediation JSONL lines into per-rule CHANGED/UNCHANGED/SKIP/ERROR rows.
+
+    Contract (one JSON object per line)::
+
+        {"rule":"RULE1","status":"CHANGED","message":"..."}
+
+    Aliases: ``tech_name`` for ``rule``; ``pass``/``ok`` → ``unchanged``,
+    ``fail`` → ``error``, ``would_change`` → ``changed``.
+    """
+    results: list[dict[str, Any]] = []
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        rule = payload.get("rule") if payload.get("rule") is not None else payload.get("tech_name")
+        status_raw = payload.get("status")
+        if rule is None or status_raw is None:
+            continue
+        tech_name = str(rule).strip()
+        status_key = str(status_raw).strip().lower().replace(" ", "_")
+        status_key = _REMEDIATION_STATUS_ALIASES.get(status_key, status_key)
+        if not tech_name or status_key not in _REMEDIATION_JSONL_STATUSES:
+            continue
+        message = payload.get("message")
+        results.append(
+            {
+                "tech_name": tech_name,
+                "status": CheckStatus(status_key),
+                "message": str(message).strip() if message is not None and str(message).strip() else tech_name,
+                "raw": line,
+                "source": "jsonl",
+            }
+        )
+    return results

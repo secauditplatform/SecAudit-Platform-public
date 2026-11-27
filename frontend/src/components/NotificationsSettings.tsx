@@ -16,7 +16,10 @@ import { Spinner } from "./ui/Spinner";
 import { useToast } from "./ui/Toast";
 import { useTranslation } from "../i18n/I18nProvider";
 
-type UiChannelType = "email" | "slack" | "telegram";
+type UiChannelType = "email" | "slack" | "telegram" | "siem";
+type SiemFormat = "json" | "ecs" | "cef" | "leef";
+type SiemMode = "summary" | "findings" | "delta_only";
+type SiemTransport = "webhook" | "syslog";
 
 type ChannelForm = {
   name: string;
@@ -29,9 +32,15 @@ type ChannelForm = {
   from_address: string;
   chat_id: string;
   secret: string;
+  siem_format: SiemFormat;
+  siem_mode: SiemMode;
+  siem_transport: SiemTransport;
+  siem_host: string;
+  siem_port: string;
+  siem_protocol: "udp" | "tcp" | "tls";
 };
 
-const CHANNEL_TYPES: UiChannelType[] = ["email", "slack", "telegram"];
+const CHANNEL_TYPES: UiChannelType[] = ["email", "slack", "telegram", "siem"];
 const TELEGRAM_CHAT_ID = /^(-?\d{1,20}|@[A-Za-z][A-Za-z0-9_]{4,31})$/;
 const TELEGRAM_BOT_TOKEN = /^\d{6,16}:[A-Za-z0-9_-]{30,64}$/;
 const TELEGRAM_BOT_URL =
@@ -48,6 +57,14 @@ const RUN_EVENTS: NotificationEventType[] = [
   "waiver_expiring",
 ];
 
+const SIEM_EVENTS: NotificationEventType[] = [
+  "finding_failed",
+  "finding_regressed",
+  "finding_resolved",
+  "audit_event",
+  "audit_failed",
+];
+
 const emptyForm = (): ChannelForm => ({
   name: "",
   channel_type: "email",
@@ -59,11 +76,29 @@ const emptyForm = (): ChannelForm => ({
   from_address: "",
   chat_id: "",
   secret: "",
+  siem_format: "json",
+  siem_mode: "summary",
+  siem_transport: "webhook",
+  siem_host: "",
+  siem_port: "514",
+  siem_protocol: "udp",
 });
 
 function asUiChannelType(type: NotificationChannelType): UiChannelType {
-  if (type === "slack" || type === "telegram") return type;
+  if (type === "slack" || type === "telegram" || type === "siem") return type;
   return "email";
+}
+
+function asSiemFormat(value: unknown): SiemFormat {
+  return value === "ecs" || value === "cef" || value === "leef" || value === "json" ? value : "json";
+}
+
+function asSiemMode(value: unknown): SiemMode {
+  return value === "findings" || value === "delta_only" || value === "summary" ? value : "summary";
+}
+
+function asSiemProtocol(value: unknown): "udp" | "tcp" | "tls" {
+  return value === "tcp" || value === "tls" ? value : "udp";
 }
 
 function isTelegramBotToken(value: string): boolean {
@@ -85,6 +120,12 @@ function formFromChannel(channel: NotificationChannel): ChannelForm {
     from_address: String(config.from_address ?? ""),
     chat_id: String(config.chat_id ?? ""),
     secret: "",
+    siem_format: asSiemFormat(config.format),
+    siem_mode: asSiemMode(config.mode),
+    siem_transport: config.transport === "syslog" ? "syslog" : "webhook",
+    siem_host: String(config.host ?? ""),
+    siem_port: config.port != null && config.port !== "" ? String(config.port) : "514",
+    siem_protocol: asSiemProtocol(config.protocol),
   };
 }
 
@@ -101,6 +142,16 @@ function buildPayload(form: ChannelForm) {
   }
   if (form.channel_type === "telegram") {
     config_json.chat_id = form.chat_id.trim();
+  }
+  if (form.channel_type === "siem") {
+    config_json.format = form.siem_format;
+    config_json.mode = form.siem_mode;
+    config_json.transport = form.siem_transport;
+    if (form.siem_transport === "syslog") {
+      config_json.host = form.siem_host.trim();
+      config_json.port = Number(form.siem_port.trim() || "514");
+      config_json.protocol = form.siem_protocol;
+    }
   }
   return {
     name: form.name.trim(),
@@ -132,6 +183,7 @@ export function NotificationsSettings() {
         email: t("notifications.typeEmail"),
         slack: t("notifications.typeSlack"),
         telegram: t("notifications.typeTelegram"),
+        siem: t("notifications.typeSiem"),
       }) satisfies Record<UiChannelType, string>,
     [t]
   );
@@ -201,7 +253,10 @@ export function NotificationsSettings() {
       ...form,
       channel_type: type,
       secret: "",
-      events: ["run_failed", "run_stale", "dispatch_failed", "worker_heartbeat_stale"],
+      events:
+        type === "siem"
+          ? ["finding_failed", "finding_regressed", "finding_resolved"]
+          : ["run_failed", "run_stale", "dispatch_failed", "worker_heartbeat_stale"],
     });
     if (type !== "email") setShowSmtpAdvanced(false);
   };
@@ -252,6 +307,16 @@ export function NotificationsSettings() {
       toast.error(t("notifications.recipientsRequired"));
       return;
     }
+    if (form.channel_type === "siem") {
+      if (form.siem_transport === "syslog" && !form.siem_host.trim()) {
+        toast.error(t("notifications.siemHostRequired"));
+        return;
+      }
+      if (form.siem_transport === "webhook" && !form.secret.trim() && !isEditing) {
+        toast.error(t("notifications.secretRequired"));
+        return;
+      }
+    }
     if (form.channel_type === "telegram") {
       const chatId = form.chat_id.trim();
       if (!chatId) {
@@ -280,9 +345,10 @@ export function NotificationsSettings() {
   };
 
   const typeLabel = (type: NotificationChannelType) => {
-    if (type === "email" || type === "slack" || type === "telegram") return channelTypeLabels[type];
+    if (type === "email" || type === "slack" || type === "telegram" || type === "siem") return channelTypeLabels[type];
     return type;
   };
+  const visibleEvents = form.channel_type === "siem" ? SIEM_EVENTS : RUN_EVENTS;
 
   return (
     <div className="pf-notifications-settings">
@@ -330,7 +396,9 @@ export function NotificationsSettings() {
                         ? "ops-slack"
                         : form.channel_type === "telegram"
                           ? "ops-telegram"
-                          : "ops-email"
+                          : form.channel_type === "siem"
+                            ? "ops-siem"
+                            : "ops-email"
                     }
                     disabled={isSaving}
                   />
@@ -342,12 +410,12 @@ export function NotificationsSettings() {
                   <h5 className="pf-notify-block__title">
                     {t("notifications.events")}
                     <span className="pf-notify-block__meta">
-                      {selectedEventsCount}/{RUN_EVENTS.length}
+                      {selectedEventsCount}/{visibleEvents.length}
                     </span>
                   </h5>
                 </div>
                 <div className="pf-notify-event-grid">
-                  {RUN_EVENTS.map((event) => {
+                  {visibleEvents.map((event) => {
                     const active = form.events.includes(event);
                     return (
                       <button
@@ -447,6 +515,106 @@ export function NotificationsSettings() {
                       </div>
                     </div>
                   ) : null}
+                </>
+              ) : form.channel_type === "siem" ? (
+                <>
+                  <div className="pf-form__row">
+                    <div className="pf-form__group">
+                      <label htmlFor="settings-channel-siem-format">{t("notifications.siemFormat")}</label>
+                      <select
+                        id="settings-channel-siem-format"
+                        className="pf-select"
+                        value={form.siem_format}
+                        onChange={(e) => setForm({ ...form, siem_format: e.target.value as SiemFormat })}
+                        disabled={isSaving}
+                      >
+                        <option value="json">{t("notifications.siemFormatJson")}</option>
+                        <option value="ecs">{t("notifications.siemFormatEcs")}</option>
+                        <option value="cef">{t("notifications.siemFormatCef")}</option>
+                        <option value="leef">{t("notifications.siemFormatLeef")}</option>
+                      </select>
+                    </div>
+                    <div className="pf-form__group">
+                      <label htmlFor="settings-channel-siem-mode">{t("notifications.siemMode")}</label>
+                      <select
+                        id="settings-channel-siem-mode"
+                        className="pf-select"
+                        value={form.siem_mode}
+                        onChange={(e) => setForm({ ...form, siem_mode: e.target.value as SiemMode })}
+                        disabled={isSaving}
+                      >
+                        <option value="summary">{t("notifications.siemModeSummary")}</option>
+                        <option value="findings">{t("notifications.siemModeFindings")}</option>
+                        <option value="delta_only">{t("notifications.siemModeDelta")}</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="pf-form__group">
+                    <label htmlFor="settings-channel-siem-transport">{t("notifications.siemTransport")}</label>
+                    <select
+                      id="settings-channel-siem-transport"
+                      className="pf-select"
+                      value={form.siem_transport}
+                      onChange={(e) => setForm({ ...form, siem_transport: e.target.value as SiemTransport })}
+                      disabled={isSaving}
+                    >
+                      <option value="webhook">{t("notifications.siemTransportWebhook")}</option>
+                      <option value="syslog">{t("notifications.siemTransportSyslog")}</option>
+                    </select>
+                  </div>
+                  {form.siem_transport === "syslog" ? (
+                    <div className="pf-form__row">
+                      <div className="pf-form__group">
+                        <label htmlFor="settings-channel-siem-host">{t("notifications.siemHost")}</label>
+                        <input
+                          id="settings-channel-siem-host"
+                          className="pf-input"
+                          value={form.siem_host}
+                          onChange={(e) => setForm({ ...form, siem_host: e.target.value })}
+                          placeholder="siem.example.com"
+                          disabled={isSaving}
+                        />
+                      </div>
+                      <div className="pf-form__group">
+                        <label htmlFor="settings-channel-siem-port">{t("notifications.siemPort")}</label>
+                        <input
+                          id="settings-channel-siem-port"
+                          className="pf-input"
+                          value={form.siem_port}
+                          onChange={(e) => setForm({ ...form, siem_port: e.target.value })}
+                          placeholder="514"
+                          disabled={isSaving}
+                        />
+                      </div>
+                      <div className="pf-form__group">
+                        <label htmlFor="settings-channel-siem-protocol">{t("notifications.siemProtocol")}</label>
+                        <select
+                          id="settings-channel-siem-protocol"
+                          className="pf-select"
+                          value={form.siem_protocol}
+                          onChange={(e) =>
+                            setForm({ ...form, siem_protocol: e.target.value as "udp" | "tcp" | "tls" })
+                          }
+                          disabled={isSaving}
+                        >
+                          <option value="udp">UDP</option>
+                          <option value="tcp">TCP</option>
+                          <option value="tls">TLS</option>
+                        </select>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="pf-form__group">
+                      <label htmlFor="settings-channel-secret">{t("notifications.siemWebhookUrl")}</label>
+                      <PasswordInput
+                        id="settings-channel-secret"
+                        value={form.secret}
+                        onChange={(e) => setForm({ ...form, secret: e.target.value })}
+                        placeholder={isEditing ? t("notifications.keepSecretEmpty") : "https://siem.example.com/ingest"}
+                        disabled={isSaving}
+                      />
+                    </div>
+                  )}
                 </>
               ) : form.channel_type === "telegram" ? (
                 <>

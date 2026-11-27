@@ -12,17 +12,6 @@ from secaudit_core.scheduled_reports import deliver_scheduled_report, should_tri
 logger = logging.getLogger(__name__)
 
 
-@celery_app.task(name="app.tasks.scheduled_reports.deliver_report")
-def deliver_report_task(schedule_id: int, run_id: int | None = None) -> dict:
-    with SessionLocal() as db:
-        schedule = db.get(ScheduledReport, schedule_id)
-        if not schedule:
-            return {"delivered": False, "reason": "schedule_not_found"}
-        result = deliver_scheduled_report(db, schedule, settings, run_id=run_id)
-        db.commit()
-        return result
-
-
 @celery_app.task(name="app.tasks.scheduled_reports.run_scheduled_reports")
 def run_scheduled_reports() -> dict:
     lock_key = "beat:schedule_lock:scheduled_reports"

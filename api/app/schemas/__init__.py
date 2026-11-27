@@ -26,6 +26,11 @@ from app.models import (
 
 from secaudit_core.aag_client import AAG_MAX_TIMEOUT_SECONDS
 from secaudit_core.cron import validate_cron_expression
+from secaudit_core.directory_discovery import (
+    DIRECTORY_IMPORT_LIMIT_MAX,
+    normalize_ou_field_map,
+    validate_computer_filter,
+)
 from secaudit_core.sensitive_data import reject_secret_config
 
 T = TypeVar("T")
@@ -105,7 +110,7 @@ class SearchResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     app_name: str
-    version: str = "1.9.0"
+    version: str = "2.0.0"
 
 
 class ComponentHealth(BaseModel):
@@ -116,7 +121,7 @@ class ComponentHealth(BaseModel):
 class ReadinessResponse(BaseModel):
     status: Literal["ok", "error"]
     app_name: str
-    version: str = "1.9.0"
+    version: str = "2.0.0"
     components: dict[str, ComponentHealth]
 
 
@@ -175,6 +180,7 @@ class ProfileBase(BaseModel):
     os_version: str | None = None
     os_vendor: str | None = None
     is_active: bool = True
+    variable_schema: list[dict] = []
 
 
 class ProfileCreate(ProfileBase):
@@ -265,6 +271,7 @@ class ProfileVersionCreate(BaseModel):
     label: str | None = None
     requirement_ids: list[str] | None = None
     activate: bool = True
+    variable_values: dict | None = None
 
     @field_validator("label")
     @classmethod
@@ -297,6 +304,7 @@ class ProfileVersionRead(BaseModel):
 
 class ProfileVersionDetail(ProfileVersionRead):
     requirement_ids: list[str] = []
+    variable_values: dict | None = None
 
 
 class ProfileVersionDependencies(BaseModel):
@@ -309,6 +317,8 @@ class ProfileVersionDependencies(BaseModel):
 class ProfileDetail(ProfileRead):
     check_scripts: list[CheckScriptRead] = []
     remediation_scripts: list[CheckScriptRead] = []
+    remediation_backup_scripts: list[CheckScriptRead] = []
+    remediation_restore_scripts: list[CheckScriptRead] = []
 
 
 class ProfilesCatalogEntry(BaseModel):
@@ -465,6 +475,8 @@ class HostBase(BaseModel):
     site: str | None = None
     environment: str | None = None
     criticality: HostCriticality | None = None
+    network_vendor: NetworkVendor | None = None
+    os_family: str | None = Field(default=None, max_length=32)
     credential_id: int | None = None
     is_active: bool = True
 
@@ -513,6 +525,8 @@ class HostUpdate(BaseModel):
     site: str | None = None
     environment: str | None = None
     criticality: HostCriticality | None = None
+    network_vendor: NetworkVendor | None = None
+    os_family: str | None = Field(default=None, max_length=32)
     credential_id: int | None = None
     credential_ids: list[int] | None = None
     is_active: bool | None = None
@@ -609,6 +623,14 @@ class ProfileApplicabilityResponse(BaseModel):
     hosts_applicable: int
     hosts_inapplicable: int
     hosts: list[ProfileApplicabilityHost] = Field(default_factory=list)
+
+
+class JobPreflightStatus(BaseModel):
+    task_id: str
+    status: Literal["pending", "ready", "failed"]
+    error: str | None = None
+    probes: list[PreflightProbeResponse] = Field(default_factory=list)
+    applicability: ProfileApplicabilityResponse | None = None
 
 
 class HostSshFingerprintScanResponse(BaseModel):
@@ -829,7 +851,39 @@ class DirectorySourceCreate(BaseModel):
     bind_password: str = Field(..., min_length=1, max_length=256)
     enabled_only: bool = True
     map_ou_to_site: bool = True
+    import_limit: int | None = Field(default=None, ge=1, le=DIRECTORY_IMPORT_LIMIT_MAX)
+    computer_filter: str | None = None
+    ou_field_map: dict[str, str] | None = None
     is_active: bool = True
+    cron_expression: str | None = None
+    is_scheduled: bool = False
+    missing_host_policy: str = Field(default="none", pattern="^(none|inactive|stale)$")
+
+    @field_validator("cron_expression")
+    @classmethod
+    def validate_cron(cls, value: str | None) -> str | None:
+        return validate_cron_expression(value)
+
+    @field_validator("computer_filter")
+    @classmethod
+    def validate_filter(cls, value: str | None) -> str | None:
+        return validate_computer_filter(value)
+
+    @field_validator("ou_field_map")
+    @classmethod
+    def validate_ou_map(cls, value: dict | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        cleaned = normalize_ou_field_map(value)
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def require_cron_when_scheduled(self) -> "DirectorySourceCreate":
+        if self.is_scheduled and not self.cron_expression:
+            raise ValueError("cron_expression is required when is_scheduled is true")
+        if not self.is_scheduled:
+            self.cron_expression = None
+        return self
 
 
 class DirectorySourceUpdate(BaseModel):
@@ -844,7 +898,31 @@ class DirectorySourceUpdate(BaseModel):
     bind_password: str | None = Field(default=None, max_length=256)
     enabled_only: bool | None = None
     map_ou_to_site: bool | None = None
+    import_limit: int | None = Field(default=None, ge=1, le=DIRECTORY_IMPORT_LIMIT_MAX)
+    computer_filter: str | None = None
+    ou_field_map: dict[str, str] | None = None
     is_active: bool | None = None
+    cron_expression: str | None = None
+    is_scheduled: bool | None = None
+    missing_host_policy: str | None = Field(default=None, pattern="^(none|inactive|stale)$")
+
+    @field_validator("cron_expression")
+    @classmethod
+    def validate_cron(cls, value: str | None) -> str | None:
+        return validate_cron_expression(value)
+
+    @field_validator("computer_filter")
+    @classmethod
+    def validate_filter(cls, value: str | None) -> str | None:
+        return validate_computer_filter(value)
+
+    @field_validator("ou_field_map")
+    @classmethod
+    def validate_ou_map(cls, value: dict | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        cleaned = normalize_ou_field_map(value)
+        return cleaned or None
 
 
 class DirectorySourceRead(BaseModel):
@@ -861,7 +939,14 @@ class DirectorySourceRead(BaseModel):
     bind_dn: str
     enabled_only: bool
     map_ou_to_site: bool
+    import_limit: int | None = None
+    computer_filter: str | None = None
+    ou_field_map: dict[str, str] | None = None
     is_active: bool
+    cron_expression: str | None = None
+    is_scheduled: bool = False
+    last_scheduled_at: datetime | None = None
+    missing_host_policy: str = "none"
     has_bind_password: bool = True
     created_at: datetime
 
@@ -876,7 +961,13 @@ class DirectorySourceTest(BaseModel):
     bind_dn: str = Field(..., min_length=3, max_length=512)
     bind_password: str | None = Field(default=None, max_length=256)
     enabled_only: bool = True
+    computer_filter: str | None = None
     source_id: int | None = None
+
+    @field_validator("computer_filter")
+    @classmethod
+    def validate_filter(cls, value: str | None) -> str | None:
+        return validate_computer_filter(value)
 
 
 class DirectoryProbeRead(BaseModel):
@@ -909,6 +1000,8 @@ class CredentialBase(BaseModel):
     credential_type: CredentialType
     username: str | None = None
     service_username: str | None = None
+    become_method: str | None = None
+    become_username: str | None = None
     snmp_priv_protocol: str | None = None
     description: str | None = None
 
@@ -923,6 +1016,10 @@ class CredentialCreate(CredentialBase):
         default=None,
         description="Password or token for the target service (database, middleware, etc.)",
     )
+    become_password: str | None = Field(
+        default=None,
+        description="Password for privilege escalation (sudo/doas/su/dzdo)",
+    )
 
 
 class CredentialUpdate(BaseModel):
@@ -933,6 +1030,9 @@ class CredentialUpdate(BaseModel):
     key_passphrase: str | None = None
     service_username: str | None = None
     service_secret: str | None = None
+    become_method: str | None = None
+    become_username: str | None = None
+    become_password: str | None = None
     snmp_priv_protocol: str | None = None
     description: str | None = None
 
@@ -942,6 +1042,7 @@ class CredentialRead(CredentialBase):
 
     id: int
     has_service_secret: bool = False
+    has_become_password: bool = False
     created_at: datetime
 
 
@@ -1470,6 +1571,8 @@ class RemediationRunRead(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     error_message: str | None
+    change_ticket: str | None = None
+    backup_status: str = "none"
     created_at: datetime
 
 
@@ -1480,14 +1583,67 @@ class RemediationResultRead(BaseModel):
     remediation_run_id: int
     host_id: int
     script_name: str
+    rule_tech_name: str = ""
     status: CheckStatus
     message: str | None
     raw_output: str | None
     created_at: datetime
 
 
+class RemediationBackupArtifactRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    remediation_run_id: int
+    host_id: int
+    platform: str
+    kind: str
+    path_or_key: str
+    sha256: str
+    byte_size: int
+    created_at: datetime
+
+
 class RemediationRunDetail(RemediationRunRead):
     results: list[RemediationResultRead] = []
+    backup_artifacts: list[RemediationBackupArtifactRead] = []
+    rollback_results_json: dict | None = None
+
+
+class RemediationRunStartRequest(BaseModel):
+    change_ticket: str | None = None
+
+
+class MaintenanceWindowBase(BaseModel):
+    site: str | None = None
+    environment: str | None = None
+    days_of_week: str = "0,1,2,3,4"
+    start_time: str = "00:00"
+    end_time: str = "23:59"
+    tz: str = "UTC"
+    enabled: bool = True
+
+
+class MaintenanceWindowCreate(MaintenanceWindowBase):
+    pass
+
+
+class MaintenanceWindowUpdate(BaseModel):
+    site: str | None = None
+    environment: str | None = None
+    days_of_week: str | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    tz: str | None = None
+    enabled: bool | None = None
+
+
+class MaintenanceWindowRead(MaintenanceWindowBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class RemediationRunLogEntry(BaseModel):
@@ -1535,6 +1691,7 @@ class RemediationFromRunRequest(BaseModel):
     rule_tech_names: list[str] | None = None
     check_mode: bool = False
     auto_recheck_failed: bool = True
+    change_ticket: str | None = None
 
 
 class RemediationFromRunResponse(BaseModel):
@@ -1568,6 +1725,9 @@ class UserBase(BaseModel):
     email: str
     full_name: str | None = None
     role: UserRole = UserRole.OPERATOR
+    access_sites: list[str] = Field(default_factory=list)
+    access_environments: list[str] = Field(default_factory=list)
+    access_tags: list[str] = Field(default_factory=list)
 
 
 class UserCreate(UserBase):
@@ -1581,6 +1741,9 @@ class UserUpdate(BaseModel):
     role: UserRole | None = None
     is_active: bool | None = None
     password: str | None = Field(default=None, min_length=8)
+    access_sites: list[str] | None = None
+    access_environments: list[str] | None = None
+    access_tags: list[str] | None = None
 
 
 class UserRead(UserBase):
@@ -1657,6 +1820,9 @@ class ComplianceWaiverBase(BaseModel):
     rule_tech_name: str
     host_id: int | None = None
     job_id: int | None = None
+    scope_site: str | None = None
+    scope_environment: str | None = None
+    scope_tag: str | None = None
     reason: str
     change_ticket: str | None = None
     expires_at: datetime | None = None
@@ -1814,6 +1980,18 @@ class MultiRunCompareReport(BaseModel):
     run_ids: list[int]
     runs: list[MultiRunCompareRunSummary]
     rows: list[MultiRunCompareRow]
+
+
+class ReportArtifactRead(BaseModel):
+    id: int
+    job_run_id: int
+    kind: str
+    mode: str
+    locale: str
+    status: str
+    error_message: str | None = None
+    created_at: datetime | None = None
+    finished_at: datetime | None = None
 
 
 class JobBaselineRead(BaseModel):
@@ -1997,6 +2175,7 @@ class AuditFlowCredentialIn(BaseModel):
     key_passphrase: str | None = None
     service_username: StrippedStr | None = None
     service_secret: str | None = None
+    skip_become: bool = False
 
 
 class AuditFlowCredentialAdd(AuditFlowCredentialIn):
@@ -2112,6 +2291,7 @@ class AuditFlowTemplateCredentialRead(BaseModel):
     service_username: str | None = None
     has_secret: bool = True
     has_service_secret: bool = False
+    skip_become: bool = False
 
 
 class AuditFlowTemplateRead(BaseModel):
@@ -2141,6 +2321,7 @@ class AuditFlowCredentialRead(BaseModel):
     username: str
     service_username: str | None = None
     has_service_secret: bool = False
+    skip_become: bool = False
 
 
 class AuditFlowExtraProfilePatch(BaseModel):
@@ -2158,22 +2339,6 @@ class AuditFlowHostPatch(BaseModel):
 
 class AuditFlowHostsPatch(BaseModel):
     hosts: list[AuditFlowHostPatch] = Field(..., min_length=1)
-
-
-class AuditFlowCheckSummary(BaseModel):
-    job_run_id: int | None = None
-    job_status: str | None = None
-    error_message: str | None = None
-    total_checks: int = 0
-    passed: int = 0
-    failed: int = 0
-    skipped: int = 0
-    errors: int = 0
-    waived: int = 0
-    compliance_percent: float = 0
-    compliance_percent_raw: float | None = None
-    profile_id: int | None = None
-    profile_name: str | None = None
 
 
 class AuditFlowHostRead(BaseModel):
@@ -2384,7 +2549,8 @@ class AagTaskCreate(BaseModel):
     compare_run_id: int | None = None
     rule_tech_name: str | None = Field(default=None, max_length=256)
     host_id: int | None = Field(default=None, ge=1)
-    check_ids: list[int] = Field(default_factory=list, max_length=25)
+    # Hosts inside at most 25 finding groups. Identical FAILs share one group.
+    check_ids: list[int] = Field(default_factory=list, max_length=5000)
     profile_name: str | None = Field(default=None, max_length=128)
     profile_version: str | None = Field(default=None, max_length=32)
     target_kind: Literal["os", "software"] | None = None

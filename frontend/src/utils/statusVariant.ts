@@ -28,10 +28,10 @@ export function driftChangeVariant(change: string): StatusBadgeVariant {
 
 /** Check results and combined run/check statuses (Reports) */
 export function checkStatusVariant(status: string): StatusBadgeVariant {
-  if (status === "pass" || status === "completed") return "success";
+  if (status === "pass" || status === "completed" || status === "unchanged") return "success";
   if (status === "fail" || status === "error" || status === "failed" || status === "cancelled") return "danger";
   if (status === "skip" || status === "pending") return "warning";
-  if (status === "running") return "info";
+  if (status === "changed" || status === "running") return "info";
   return "neutral";
 }
 

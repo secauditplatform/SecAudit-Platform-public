@@ -103,7 +103,13 @@ async def create_directory_source(
         encrypted_bind_password=encrypt_secret(password, settings),
         enabled_only=data.enabled_only,
         map_ou_to_site=data.map_ou_to_site,
+        import_limit=data.import_limit,
+        computer_filter=data.computer_filter,
+        ou_field_map=data.ou_field_map,
         is_active=data.is_active,
+        cron_expression=data.cron_expression if data.is_scheduled else None,
+        is_scheduled=data.is_scheduled,
+        missing_host_policy=data.missing_host_policy,
     )
     assign_owner(source, user)
     db.add(source)
@@ -150,8 +156,23 @@ async def update_directory_source(
         source.enabled_only = bool(payload["enabled_only"])
     if "map_ou_to_site" in payload:
         source.map_ou_to_site = bool(payload["map_ou_to_site"])
+    if "import_limit" in payload:
+        source.import_limit = payload["import_limit"]
+    if "computer_filter" in payload:
+        source.computer_filter = payload["computer_filter"]
+    if "ou_field_map" in payload:
+        source.ou_field_map = payload["ou_field_map"]
     if "is_active" in payload:
         source.is_active = bool(payload["is_active"])
+    if "missing_host_policy" in payload and payload["missing_host_policy"] is not None:
+        source.missing_host_policy = payload["missing_host_policy"]
+    if "is_scheduled" in payload or "cron_expression" in payload:
+        is_scheduled = bool(payload["is_scheduled"]) if "is_scheduled" in payload else source.is_scheduled
+        cron = payload.get("cron_expression", source.cron_expression)
+        if is_scheduled and not cron:
+            raise HTTPException(status_code=400, detail="cron_expression is required when is_scheduled is true")
+        source.is_scheduled = is_scheduled
+        source.cron_expression = cron if is_scheduled else None
     if password is not None and password.strip():
         source.encrypted_bind_password = encrypt_secret(_password_or_422(password), settings)
     await db.commit()
@@ -202,6 +223,7 @@ async def test_directory_source(
         bind_dn=bind_dn,
         password=password,
         enabled_only=data.enabled_only,
+        search_filter=data.computer_filter,
     )
     try:
         result = await asyncio.to_thread(probe_directory, bind)

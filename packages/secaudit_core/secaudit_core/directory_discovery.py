@@ -6,10 +6,12 @@ Existing nmap hosts are reused when the DNS name or short name already matches.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass, field
 
 MAX_COMPUTERS = 5000
+DIRECTORY_IMPORT_LIMIT_MAX = 50000
 _PAGE_SIZE = 500
 _CONNECT_TIMEOUT = 10
 _RECEIVE_TIMEOUT = 45
@@ -30,12 +32,28 @@ _COMPUTER_ATTRIBUTES = (
 )
 _ACCOUNT_DISABLE = 0x2
 _SKIP_OUS = frozenset({"computers", "domain controllers", "users", "builtin"})
-_SERVER_RE = re.compile(
-    r"^(?:(?:\d{1,3}\.){3}\d{1,3}|"
-    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*)$"
+_HOSTNAME_RE = re.compile(
+    r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
 )
-_LINUX_MARKERS = ("linux", "ubuntu", "debian", "centos", "red hat", "rhel", "suse", "fedora")
+_LINUX_MARKERS = (
+    "linux",
+    "ubuntu",
+    "debian",
+    "centos",
+    "red hat",
+    "rhel",
+    "suse",
+    "fedora",
+    "astra",
+    "alt linux",
+    "altlinux",
+    "red os",
+    "redos",
+    "rocky",
+    "alma",
+    "oracle",
+)
 _UNIX_MARKERS = (
     "freebsd",
     "openbsd",
@@ -70,6 +88,8 @@ class DirectoryBind:
     bind_dn: str
     password: str
     enabled_only: bool = True
+    search_filter: str | None = None
+    extra_attributes: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         return (
@@ -85,6 +105,7 @@ class DirectoryComputer:
     operating_system: str | None
     distinguished_name: str
     disabled: bool
+    attributes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -107,6 +128,12 @@ class KnownHost:
     hostname: str
     os_type: str | None
     site: str | None
+    is_active: bool = True
+    directory_managed: bool = False
+    os_family: str | None = None
+    os_version: str | None = None
+    environment: str | None = None
+    criticality: str | None = None
 
 
 @dataclass
@@ -117,6 +144,10 @@ class PlannedCreate:
     os_type: str
     site: str | None
     is_active: bool = True
+    os_family: str | None = None
+    os_version: str | None = None
+    environment: str | None = None
+    criticality: str | None = None
 
 
 @dataclass
@@ -125,6 +156,18 @@ class PlannedUpdate:
     name: str | None = None
     os_type: str | None = None
     site: str | None = None
+    is_active: bool | None = None
+    os_family: str | None = None
+    os_version: str | None = None
+    environment: str | None = None
+    criticality: str | None = None
+
+
+@dataclass
+class PlannedLifecycle:
+    host_id: int
+    set_inactive: bool = False
+    tag_stale: bool = False
 
 
 @dataclass
@@ -132,6 +175,12 @@ class DirectoryImportPlan:
     creates: list[PlannedCreate] = field(default_factory=list)
     updates: list[PlannedUpdate] = field(default_factory=list)
     matched_ids: list[int] = field(default_factory=list)
+    lifecycle: list[PlannedLifecycle] = field(default_factory=list)
+
+
+DIRECTORY_MANAGED_TAG = "directory"
+DIRECTORY_STALE_TAG = "stale"
+MISSING_HOST_POLICIES = frozenset({"none", "inactive", "stale"})
 
 
 def public_error(text: str, password: str) -> str:
@@ -145,6 +194,61 @@ def computer_filter(enabled_only: bool) -> str:
     return _ENABLED_COMPUTER_FILTER if enabled_only else _COMPUTER_FILTER
 
 
+_OU_REF = re.compile(r"^ou:(\d+)$", re.IGNORECASE)
+_ATTR_RE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,63}$")
+_MAP_FIELDS = ("site", "environment", "criticality")
+_CRITICALITY = frozenset({"low", "medium", "high", "critical"})
+
+
+def validate_computer_filter(value: str | None) -> str | None:
+    """Accept an operator LDAP filter. Empty means the built-in computer filter."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > 512 or any(ord(ch) < 32 for ch in text):
+        raise ValueError("LDAP filter is invalid")
+    if not (text.startswith("(") and text.endswith(")") and text.count("(") == text.count(")")):
+        raise ValueError("LDAP filter must be a parenthesized filter")
+    return text
+
+
+def normalize_ou_field_map(raw: dict | None) -> dict[str, str]:
+    """Keep site/environment/criticality mapped to ``ou:N`` or an LDAP attribute."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("OU map must be an object")
+    cleaned: dict[str, str] = {}
+    for key in _MAP_FIELDS:
+        if key not in raw or raw[key] is None:
+            continue
+        text = str(raw[key]).strip()
+        if not text:
+            continue
+        match = _OU_REF.fullmatch(text)
+        if match:
+            index = int(match.group(1))
+            if index < 1 or index > 16:
+                raise ValueError("OU index must be between 1 and 16")
+            cleaned[key] = f"ou:{index}"
+            continue
+        if not _ATTR_RE.fullmatch(text):
+            raise ValueError("OU map values must be ou:N or an LDAP attribute name")
+        cleaned[key] = text
+    return cleaned
+
+
+def mapped_attributes(field_map: dict[str, str]) -> tuple[str, ...]:
+    return tuple(value for value in field_map.values() if not value.lower().startswith("ou:"))
+
+
+def clamp_import_limit(limit: int | None, *, default: int = MAX_COMPUTERS) -> int:
+    chosen = default if limit is None else limit
+    return max(1, min(int(chosen), DIRECTORY_IMPORT_LIMIT_MAX))
+
+
 def normalize_directory_endpoint(
     *,
     server: str,
@@ -155,11 +259,7 @@ def normalize_directory_endpoint(
     bind_dn: str,
 ) -> tuple[str, int, str, str, bool]:
     """Validate a directory endpoint. Returns server, port, base DN, bind DN, start_tls."""
-    host = server.strip()
-    if not host or len(host) > 253 or not _SERVER_RE.fullmatch(host):
-        raise ValueError("Directory server must be a hostname or IPv4 address")
-    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host) and any(int(part) > 255 for part in host.split(".")):
-        raise ValueError("Directory server must be a hostname or IPv4 address")
+    host = _normalize_directory_server(server)
     if port < 1 or port > 65535:
         raise ValueError("Directory port must be between 1 and 65535")
     if use_ssl and start_tls:
@@ -167,6 +267,26 @@ def normalize_directory_endpoint(
     base = _normalize_dn(base_dn, label="Base DN")
     bind = _normalize_dn(bind_dn, label="Bind DN")
     return host, port, base, bind, start_tls and not use_ssl
+
+
+def _normalize_directory_server(server: str) -> str:
+    """Accept a hostname, IPv4, or IPv6 (with optional ``[brackets]``)."""
+    host = server.strip()
+    if host.startswith("[") and host.endswith("]") and len(host) > 2:
+        host = host[1:-1]
+    if not host or len(host) > 253:
+        raise ValueError("Directory server must be a hostname, IPv4, or IPv6 address")
+    if "://" in host or "/" in host or " " in host:
+        raise ValueError("Directory server must be a hostname, IPv4, or IPv6 address")
+    try:
+        addr = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        if not _HOSTNAME_RE.fullmatch(host):
+            raise ValueError("Directory server must be a hostname, IPv4, or IPv6 address")
+        return host
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local:
+        raise ValueError("Directory server address is not allowed")
+    return str(addr)
 
 
 def _normalize_dn(value: str, *, label: str) -> str:
@@ -178,8 +298,9 @@ def _normalize_dn(value: str, *, label: str) -> str:
     return text
 
 
-def site_from_dn(distinguished_name: str) -> str | None:
-    """First meaningful OU, skipping the default AD containers."""
+def meaningful_ous(distinguished_name: str) -> list[str]:
+    """OU names from the object outward, skipping the default AD containers."""
+    names: list[str] = []
     for part in _split_dn(distinguished_name):
         if "=" not in part:
             continue
@@ -189,8 +310,53 @@ def site_from_dn(distinguished_name: str) -> str | None:
         name = _unescape_dn_value(raw)
         if not name or name.casefold() in _SKIP_OUS:
             continue
-        return name[:64]
-    return None
+        names.append(name[:64])
+    return names
+
+
+def site_from_dn(distinguished_name: str) -> str | None:
+    """First meaningful OU, skipping the default AD containers."""
+    names = meaningful_ous(distinguished_name)
+    return names[0] if names else None
+
+
+def os_identity_from_operating_system(value: str | None) -> tuple[str | None, str | None]:
+    text = (value or "").strip()
+    if not text:
+        return None, None
+    from secaudit_core.audit_flow_match import detect_family
+
+    family = detect_family(text)
+    match = re.search(r"\d+(?:\.\d+){0,3}", text)
+    version = match.group(0)[:64] if match else None
+    return (family[:32] if family else None), version
+
+
+def host_fields_from_computer(
+    computer: DirectoryComputer,
+    field_map: dict[str, str],
+    *,
+    map_ou_to_site: bool,
+) -> dict[str, str | None]:
+    effective = dict(field_map)
+    if map_ou_to_site and "site" not in effective:
+        effective["site"] = "ou:1"
+    ous = meaningful_ous(computer.distinguished_name)
+    result: dict[str, str | None] = {"site": None, "environment": None, "criticality": None}
+    for field_name, spec in effective.items():
+        match = _OU_REF.fullmatch(spec)
+        if match:
+            index = int(match.group(1)) - 1
+            value: str | None = ous[index] if 0 <= index < len(ous) else None
+        else:
+            value = computer.attributes.get(spec)
+        if field_name == "criticality":
+            folded = (value or "").strip().casefold()
+            value = folded if folded in _CRITICALITY else None
+        elif value:
+            value = value.strip()[:64] or None
+        result[field_name] = value
+    return result
 
 
 def os_type_from_operating_system(value: str | None) -> str:
@@ -202,7 +368,12 @@ def os_type_from_operating_system(value: str | None) -> str:
     return "windows"
 
 
-def computer_from_attributes(attributes: dict, *, dn: str | None = None) -> DirectoryComputer | None:
+def computer_from_attributes(
+    attributes: dict,
+    *,
+    dn: str | None = None,
+    extra_attributes: tuple[str, ...] = (),
+) -> DirectoryComputer | None:
     cn = (_first_str(attributes, "cn") or "").strip()
     dns = _clean_hostname(_first_str(attributes, "dNSHostName"))
     if not cn and dns:
@@ -211,12 +382,18 @@ def computer_from_attributes(attributes: dict, *, dn: str | None = None) -> Dire
     if not cn or hostname is None:
         return None
     distinguished = _first_str(attributes, "distinguishedName") or (dn or "")
+    extras: dict[str, str] = {}
+    for name in extra_attributes:
+        text = _first_str(attributes, name)
+        if text:
+            extras[name] = text[:64]
     return DirectoryComputer(
         cn=cn[:128],
         dns_hostname=dns,
         operating_system=_first_str(attributes, "operatingSystem"),
         distinguished_name=distinguished,
         disabled=_is_disabled(_first_raw(attributes, "userAccountControl")),
+        attributes=extras,
     )
 
 
@@ -226,8 +403,14 @@ def plan_directory_import(
     *,
     aliases: dict[str, int] | None = None,
     map_ou_to_site: bool,
+    missing_host_policy: str = "none",
+    ou_field_map: dict[str, str] | None = None,
 ) -> DirectoryImportPlan:
     """Match directory computers to inventory hosts. Never touches another owner's rows."""
+    policy = (missing_host_policy or "none").strip().lower()
+    if policy not in MISSING_HOST_POLICIES:
+        policy = "none"
+    field_map = normalize_ou_field_map(ou_field_map)
     by_id = {host.id: host for host in known_hosts}
     index: dict[str, int] = {}
 
@@ -245,10 +428,13 @@ def plan_directory_import(
         remember(alias, host_id)
 
     plan = DirectoryImportPlan()
+    seen_ids: set[int] = set()
     for computer in computers:
         host = _lookup_host(computer, index, by_id)
         if host is None:
-            created = _plan_create(computer, map_ou_to_site=map_ou_to_site)
+            if computer.disabled:
+                continue
+            created = _plan_create(computer, map_ou_to_site=map_ou_to_site, field_map=field_map)
             if created is None:
                 continue
             plan.creates.append(created)
@@ -259,6 +445,7 @@ def plan_directory_import(
                 hostname=created.hostname,
                 os_type=created.os_type,
                 site=created.site,
+                directory_managed=True,
             )
             remember(created.hostname, synthetic_id)
             remember(created.name, synthetic_id)
@@ -267,10 +454,19 @@ def plan_directory_import(
             continue
         if host.id < 0:
             continue
+        seen_ids.add(host.id)
         if computer.disabled:
             plan.matched_ids.append(host.id)
+            if policy != "none":
+                plan.lifecycle.append(
+                    PlannedLifecycle(
+                        host_id=host.id,
+                        set_inactive=policy == "inactive",
+                        tag_stale=policy == "stale",
+                    )
+                )
             continue
-        update = _plan_update(host, computer, map_ou_to_site=map_ou_to_site)
+        update = _plan_update(host, computer, map_ou_to_site=map_ou_to_site, field_map=field_map)
         if update is None:
             plan.matched_ids.append(host.id)
         else:
@@ -281,8 +477,29 @@ def plan_directory_import(
                 host.os_type = update.os_type
             if update.site is not None:
                 host.site = update.site
+            if update.os_family is not None:
+                host.os_family = update.os_family
+            if update.os_version is not None:
+                host.os_version = update.os_version
+            if update.environment is not None:
+                host.environment = update.environment
+            if update.criticality is not None:
+                host.criticality = update.criticality
+            if update.is_active is not None:
+                host.is_active = update.is_active
             remember(host.name, host.id)
             remember(host.hostname, host.id)
+    if policy != "none":
+        for host in known_hosts:
+            if host.id < 0 or not host.directory_managed or host.id in seen_ids:
+                continue
+            plan.lifecycle.append(
+                PlannedLifecycle(
+                    host_id=host.id,
+                    set_inactive=policy == "inactive",
+                    tag_stale=policy == "stale",
+                )
+            )
     return plan
 
 
@@ -301,17 +518,22 @@ def probe_directory(bind: DirectoryBind) -> DirectoryProbeResult:
     )
 
 
-def search_computers(bind: DirectoryBind, *, limit: int = MAX_COMPUTERS) -> DirectorySearchResult:
-    limit = max(1, min(limit, MAX_COMPUTERS))
+def search_computers(bind: DirectoryBind, *, limit: int | None = None) -> DirectorySearchResult:
+    limit = clamp_import_limit(limit)
+    search_filter = bind.search_filter or computer_filter(bind.enabled_only)
     try:
-        raw, truncated = _ldap_search(bind, computer_filter(bind.enabled_only), limit)
+        raw, truncated = _ldap_search(bind, search_filter, limit)
     except _MatchingRuleUnsupported:
-        if not bind.enabled_only:
+        if bind.search_filter or not bind.enabled_only:
             raise
         raw, truncated = _ldap_search(bind, computer_filter(False), limit)
     computers: list[DirectoryComputer] = []
     for item in raw:
-        computer = computer_from_attributes(item["attributes"], dn=item.get("dn"))
+        computer = computer_from_attributes(
+            item["attributes"],
+            dn=item.get("dn"),
+            extra_attributes=bind.extra_attributes,
+        )
         if computer is None:
             continue
         if bind.enabled_only and computer.disabled:
@@ -363,7 +585,9 @@ def _ldap_search(bind: DirectoryBind, search_filter: str, limit: int) -> tuple[l
                 search_base=bind.base_dn,
                 search_filter=search_filter,
                 search_scope=SUBTREE,
-                attributes=list(_COMPUTER_ATTRIBUTES),
+                attributes=list(_COMPUTER_ATTRIBUTES) + [
+                    name for name in bind.extra_attributes if name not in _COMPUTER_ATTRIBUTES
+                ],
                 paged_size=min(_PAGE_SIZE, limit),
                 generator=True,
                 size_limit=limit,
@@ -434,19 +658,34 @@ def _lookup_host(
     return None
 
 
-def _plan_create(computer: DirectoryComputer, *, map_ou_to_site: bool) -> PlannedCreate | None:
+def _plan_create(
+    computer: DirectoryComputer,
+    *,
+    map_ou_to_site: bool,
+    field_map: dict[str, str],
+) -> PlannedCreate | None:
     hostname = computer.dns_hostname or _clean_hostname(computer.cn)
     if hostname is None:
         return None
     os_type = os_type_from_operating_system(computer.operating_system)
+    family, version = os_identity_from_operating_system(computer.operating_system)
+    fields = host_fields_from_computer(computer, field_map, map_ou_to_site=map_ou_to_site)
     return PlannedCreate(
         name=computer.cn[:128],
         hostname=hostname,
         port=_SSH_PORT if os_type in {"linux", "unix"} else _WINRM_PORT,
         os_type=os_type,
-        site=site_from_dn(computer.distinguished_name) if map_ou_to_site else None,
+        site=fields["site"],
         is_active=not computer.disabled,
+        os_family=family,
+        os_version=version,
+        environment=fields["environment"],
+        criticality=fields["criticality"],
     )
+
+
+def _empty(value: str | None) -> bool:
+    return not (value or "").strip()
 
 
 def _plan_update(
@@ -454,19 +693,44 @@ def _plan_update(
     computer: DirectoryComputer,
     *,
     map_ou_to_site: bool,
+    field_map: dict[str, str],
 ) -> PlannedUpdate | None:
     name = computer.cn[:128] if host.name.startswith("discovered-") and computer.cn else None
-    os_type = None
-    if not (host.os_type or "").strip():
-        os_type = os_type_from_operating_system(computer.operating_system)
-    site = None
-    if map_ou_to_site and not (host.site or "").strip():
-        site = site_from_dn(computer.distinguished_name)
-    if name is None and os_type is None and site is None:
+    os_type = os_type_from_operating_system(computer.operating_system) if _empty(host.os_type) else None
+    family, version = os_identity_from_operating_system(computer.operating_system)
+    if not _empty(host.os_family):
+        family = None
+    if not _empty(host.os_version):
+        version = None
+    fields = host_fields_from_computer(computer, field_map, map_ou_to_site=map_ou_to_site)
+    site = fields["site"] if _empty(host.site) else None
+    environment = fields["environment"] if _empty(host.environment) else None
+    criticality = fields["criticality"] if _empty(host.criticality) else None
+    is_active = True if not host.is_active else None
+    if (
+        name is None
+        and os_type is None
+        and site is None
+        and is_active is None
+        and family is None
+        and version is None
+        and environment is None
+        and criticality is None
+    ):
         return None
     if host.id < 0:
         return None
-    return PlannedUpdate(host_id=host.id, name=name, os_type=os_type, site=site)
+    return PlannedUpdate(
+        host_id=host.id,
+        name=name,
+        os_type=os_type,
+        site=site,
+        is_active=is_active,
+        os_family=family,
+        os_version=version,
+        environment=environment,
+        criticality=criticality,
+    )
 
 
 def _split_dn(distinguished_name: str) -> list[str]:

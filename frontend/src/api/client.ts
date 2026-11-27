@@ -213,6 +213,19 @@ export interface Profile {
   rules_count?: number;
   audit_scripts_count?: number;
   remediation_scripts_count?: number;
+  variable_schema?: ProfileVariable[];
+}
+
+export interface ProfileVariable {
+  name: string;
+  type: "int" | "string" | "bool" | "enum";
+  default: string | number | boolean;
+  min?: number | null;
+  max?: number | null;
+  enum?: string[] | null;
+  description?: string;
+  requirement_ids?: string[];
+  xccdf_value_id?: string | null;
 }
 
 export interface HostsSummary {
@@ -235,6 +248,19 @@ export interface PreflightProbeResponse {
   checks: PreflightCheckResult[];
   duration_ms: number;
   error?: string | null;
+}
+
+export interface JobPreflightStatus {
+  task_id: string;
+  status: "pending" | "ready" | "failed";
+  error?: string | null;
+  probes: PreflightProbeResponse[];
+  applicability?: {
+    rules_count: number;
+    hosts_applicable: number;
+    hosts_inapplicable: number;
+    hosts?: ProfileApplicabilityHost[];
+  } | null;
 }
 
 export interface ProfileApplicabilityHost {
@@ -351,7 +377,7 @@ export interface CheckScript {
   name: string;
   execution_type: string;
   script_file: string;
-  script_kind?: "audit" | "remediation";
+  script_kind?: "audit" | "remediation" | "remediation_backup" | "remediation_restore";
   is_primary?: boolean;
   description?: string | null;
   interpreter_rules: InterpreterRule[];
@@ -360,6 +386,8 @@ export interface CheckScript {
 export interface ProfileDetail extends Profile {
   check_scripts: CheckScript[];
   remediation_scripts?: CheckScript[];
+  remediation_backup_scripts?: CheckScript[];
+  remediation_restore_scripts?: CheckScript[];
 }
 
 export interface ProfileRule {
@@ -411,6 +439,7 @@ export interface ProfileVersion {
 
 export interface ProfileVersionDetail extends ProfileVersion {
   requirement_ids: string[];
+  variable_values?: Record<string, string | number | boolean> | null;
 }
 
 export interface ProfileVersionDependencies {
@@ -431,13 +460,16 @@ export interface Credential {
   credential_type: string;
   username?: string;
   service_username?: string | null;
+  become_method?: string | null;
+  become_username?: string | null;
   snmp_priv_protocol?: string | null;
   has_service_secret?: boolean;
+  has_become_password?: boolean;
   description?: string;
   created_at: string;
 }
 
-export type UserRole = "admin" | "operator" | "auditor";
+export type UserRole = "admin" | "operator" | "auditor" | "security_approver";
 
 export interface PlatformUser {
   id: number;
@@ -445,6 +477,9 @@ export interface PlatformUser {
   email: string;
   full_name?: string | null;
   role: UserRole;
+  access_sites?: string[];
+  access_environments?: string[];
+  access_tags?: string[];
   is_active: boolean;
   mfa_enabled?: boolean;
   created_at: string;
@@ -480,7 +515,10 @@ export type NotificationEventType =
   | "compliance_regressed"
   | "waiver_expiring"
   | "audit_event"
-  | "audit_failed";
+  | "audit_failed"
+  | "finding_failed"
+  | "finding_regressed"
+  | "finding_resolved";
 
 export interface NotificationChannel {
   id: number;
@@ -581,6 +619,24 @@ export interface HostCsvImportResult {
   rejected: { row: number; reason: string }[];
 }
 
+export type NetworkVendor =
+  | "cisco_ios"
+  | "cisco_nxos"
+  | "cisco_asa"
+  | "juniper_junos"
+  | "arista_eos"
+  | "huawei"
+  | "h3c"
+  | "fortinet"
+  | "palo_alto"
+  | "check_point"
+  | "eltex"
+  | "mikrotik"
+  | "usergate"
+  | "continent"
+  | "qtech"
+  | "generic";
+
 export interface Host {
   id: number;
   name: string;
@@ -590,6 +646,8 @@ export interface Host {
   site?: string | null;
   environment?: string | null;
   criticality?: HostCriticality | null;
+  network_vendor?: NetworkVendor | null;
+  os_family?: string | null;
   credential_id?: number | null;
   credential_ids?: number[];
   linked_credentials?: HostLinkedCredential[];
@@ -604,6 +662,7 @@ export interface AuditFlowCredential {
   label: string;
   credential_type: "ssh_password" | "ssh_key" | "winrm";
   username: string;
+  skip_become?: boolean;
 }
 
 export interface AuditFlowHost {
@@ -681,6 +740,7 @@ export interface AuditFlowTemplateCredential {
   service_username?: string | null;
   has_secret?: boolean;
   has_service_secret?: boolean;
+  skip_become?: boolean;
 }
 
 export interface AuditFlowInventoryScope {
@@ -781,6 +841,8 @@ export interface InventoryScanDetail extends InventoryScan {
   results: InventoryScanResult[];
 }
 
+export type DirectoryMissingHostPolicy = "none" | "inactive" | "stale";
+
 export interface DirectorySource {
   id: number;
   name: string;
@@ -793,7 +855,14 @@ export interface DirectorySource {
   bind_dn: string;
   enabled_only: boolean;
   map_ou_to_site: boolean;
+  import_limit?: number | null;
+  computer_filter?: string | null;
+  ou_field_map?: { site?: string; environment?: string; criticality?: string } | null;
   is_active: boolean;
+  cron_expression?: string | null;
+  is_scheduled: boolean;
+  last_scheduled_at?: string | null;
+  missing_host_policy: DirectoryMissingHostPolicy;
   has_bind_password: boolean;
   created_at: string;
 }
@@ -810,7 +879,13 @@ export interface DirectorySourceInput {
   bind_password?: string;
   enabled_only: boolean;
   map_ou_to_site: boolean;
+  import_limit?: number | null;
+  computer_filter?: string | null;
+  ou_field_map?: { site?: string; environment?: string; criticality?: string } | null;
   is_active: boolean;
+  cron_expression?: string | null;
+  is_scheduled: boolean;
+  missing_host_policy: DirectoryMissingHostPolicy;
 }
 
 export interface DirectorySync {
@@ -831,18 +906,6 @@ export type WebhookEventKey = "run_completed" | "run_failed" | "run_stale" | "di
 
 export type OperationsScope = "standard" | "network";
 export type NetworkCheckMode = "remote" | "config_upload" | "both";
-export type NetworkVendor =
-  | "cisco_ios"
-  | "cisco_nxos"
-  | "cisco_asa"
-  | "juniper_junos"
-  | "arista_eos"
-  | "huawei"
-  | "h3c"
-  | "fortinet"
-  | "palo_alto"
-  | "check_point"
-  | "generic";
 
 export interface Job {
   id: number;
@@ -957,6 +1020,9 @@ export interface ComplianceWaiver {
   rule_tech_name: string;
   host_id?: number | null;
   job_id?: number | null;
+  scope_site?: string | null;
+  scope_environment?: string | null;
+  scope_tag?: string | null;
   reason: string;
   change_ticket?: string | null;
   status: WaiverStatus;
@@ -1270,6 +1336,8 @@ export interface RemediationRun {
   started_at?: string;
   finished_at?: string;
   error_message?: string;
+  change_ticket?: string | null;
+  backup_status?: string;
   created_at: string;
 }
 
@@ -1278,14 +1346,42 @@ export interface RemediationResult {
   remediation_run_id: number;
   host_id: number;
   script_name: string;
+  rule_tech_name?: string;
   status: string;
   message?: string;
   raw_output?: string;
   created_at: string;
 }
 
+export interface RemediationBackupArtifact {
+  id: number;
+  remediation_run_id: number;
+  host_id: number;
+  platform: string;
+  kind: string;
+  path_or_key: string;
+  sha256: string;
+  byte_size: number;
+  created_at: string;
+}
+
 export interface RemediationRunDetail extends RemediationRun {
   results: RemediationResult[];
+  backup_artifacts?: RemediationBackupArtifact[];
+  rollback_results_json?: { items?: Array<{ host_id: number; path?: string; status: string; message?: string }> } | null;
+}
+
+export interface MaintenanceWindow {
+  id: number;
+  site?: string | null;
+  environment?: string | null;
+  days_of_week: string;
+  start_time: string;
+  end_time: string;
+  tz: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface AuditLog {
@@ -1573,6 +1669,7 @@ export interface AagArtifact {
     validation_errors?: string[];
     imported_profile_name?: string;
     profile_name?: string;
+    stream_chars?: number;
     checks?: { rule: string; host?: string; status: string; title?: string }[];
   } | null;
   paragraphs?: AagParagraph[];
@@ -1738,7 +1835,12 @@ export const api = {
     request<ProfileVersionDetail>(`/profiles/${id}/versions/${versionId}`),
   createProfileVersion: (
     id: number,
-    data: { label?: string | null; requirement_ids: string[]; activate?: boolean }
+    data: {
+      label?: string | null;
+      requirement_ids: string[];
+      activate?: boolean;
+      variable_values?: Record<string, string | number | boolean> | null;
+    }
   ) =>
     request<ProfileVersionDetail>(`/profiles/${id}/versions`, {
       method: "POST",
@@ -1774,7 +1876,7 @@ export const api = {
     }),
   uploadCheckScripts: (
     profileId: number,
-    kind: "audit" | "remediation",
+    kind: "audit" | "remediation" | "remediation_restore",
     files: File[],
     rulesFrom?: string
   ) => {
@@ -1847,6 +1949,9 @@ export const api = {
     key_passphrase?: string;
     service_username?: string;
     service_secret?: string;
+    become_method?: string | null;
+    become_username?: string;
+    become_password?: string;
     snmp_priv_protocol?: string | null;
     description?: string;
   }) => request<Credential>("/credentials", { method: "POST", body: JSON.stringify(data) }),
@@ -1861,6 +1966,9 @@ export const api = {
       key_passphrase?: string;
       service_username?: string;
       service_secret?: string;
+      become_method?: string | null;
+      become_username?: string | null;
+      become_password?: string;
       snmp_priv_protocol?: string | null;
       description?: string;
     }
@@ -1872,6 +1980,9 @@ export const api = {
     full_name?: string;
     role: UserRole;
     password: string;
+    access_sites?: string[];
+    access_environments?: string[];
+    access_tags?: string[];
   }) => request<PlatformUser>("/users", { method: "POST", body: JSON.stringify(data) }),
   updateUser: (
     id: number,
@@ -1882,6 +1993,9 @@ export const api = {
       role?: UserRole;
       is_active?: boolean;
       password?: string;
+      access_sites?: string[];
+      access_environments?: string[];
+      access_tags?: string[];
     }
   ) => request<PlatformUser>(`/users/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   deleteUser: (id: number) => request<void>(`/users/${id}`, { method: "DELETE" }),
@@ -2097,8 +2211,9 @@ export const api = {
       active_only?: boolean;
       is_active?: boolean;
       search?: string;
+      ids?: number[];
     },
-  ) => request<PaginatedResponse<Host>>(`/hosts${buildQuery(params)}`),
+  ) => request<PaginatedResponse<Host>>(`/hosts${buildQuery({ ...params, ids: params?.ids?.join(",") })}`),
   hostsSummary: () => request<HostsSummary>("/hosts/summary"),
   getHost: (id: number) => request<Host>(`/hosts/${id}`),
   hostTags: () => request<{ id: number; name: string; created_at: string }[]>("/hosts/tags"),
@@ -2138,6 +2253,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ host_id: hostId }),
     }),
+  preflightJob: (jobId: number) =>
+    request<JobPreflightStatus>(`/jobs/${jobId}/preflight`, { method: "POST" }),
+  preflightJobStatus: (taskId: string) =>
+    request<JobPreflightStatus>(`/jobs/preflight/${encodeURIComponent(taskId)}`),
   profileApplicability: (
     profileId: number,
     data: { host_ids: number[]; profile_version_id?: number | null }
@@ -2220,6 +2339,7 @@ export const api = {
     bind_dn: string;
     bind_password?: string;
     enabled_only: boolean;
+    computer_filter?: string | null;
     source_id?: number;
   }) =>
     request<{ computers: number; sample: string[]; truncated: boolean }>("/directory/sources/test", {
@@ -2397,12 +2517,24 @@ export const api = {
       `report-${runId}.html`,
       locale
     ),
-  downloadReportPdf: (runId: number, locale = "en") =>
+  downloadReportPdf: (runId: number, locale = "en", mode: "executive" | "full" = "executive") =>
     downloadFile(
-      `/reports/runs/${runId}/report.pdf?locale=${encodeURIComponent(locale)}`,
-      `report-${runId}.pdf`,
+      `/reports/runs/${runId}/report.pdf?locale=${encodeURIComponent(locale)}&mode=${mode}`,
+      `report-${runId}-${mode}.pdf`,
       locale
     ),
+  getReportArtifact: (artifactId: number) =>
+    request<{
+      id: number;
+      job_run_id: number;
+      kind: string;
+      mode: string;
+      locale: string;
+      status: string;
+      error_message?: string | null;
+    }>(`/reports/artifacts/${artifactId}`),
+  downloadReportArtifact: (artifactId: number, runId: number) =>
+    downloadFile(`/reports/artifacts/${artifactId}/download`, `report-${runId}-pack.zip`),
   cveFeedStatus: () => request<CveFeedStatus>("/cve-feed"),
   replaceCveFeed: (payload: unknown) =>
     request<CveFeedStatus>("/cve-feed", { method: "PUT", body: JSON.stringify(payload) }),
@@ -2421,12 +2553,59 @@ export const api = {
       `/reports/runs/${runId}/report.csv${buildQuery(filters)}`,
       `report-${runId}.csv`
     ),
-  downloadReportPack: (runId: number, locale = "en") =>
+  downloadReportSarif: (
+    runId: number,
+    filters?: { status?: string; severity?: string; host_id?: number | string; rule?: string }
+  ) =>
     downloadFile(
-      `/reports/runs/${runId}/report.pack.zip?locale=${encodeURIComponent(locale)}`,
-      `report-${runId}-pack.zip`,
-      locale
+      `/reports/runs/${runId}/report.sarif${buildQuery(filters)}`,
+      `report-${runId}.sarif`
     ),
+  downloadReportXlsx: (
+    runId: number,
+    filters?: { status?: string; severity?: string; host_id?: number | string; rule?: string }
+  ) =>
+    downloadFile(
+      `/reports/runs/${runId}/report.xlsx${buildQuery(filters)}`,
+      `report-${runId}.xlsx`
+    ),
+  downloadReportPack: async (runId: number, locale = "en") => {
+    const headers: Record<string, string> = {
+      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+      "Accept-Language": locale,
+    };
+    const path = `/reports/runs/${runId}/report.pack.zip?locale=${encodeURIComponent(locale)}`;
+    const response = await fetch(`${API_BASE}${path}`, { headers });
+    if (response.status === 202) {
+      const artifact = (await response.json()) as { id: number; status: string };
+      const deadline = Date.now() + 10 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const status = await api.getReportArtifact(artifact.id);
+        if (status.status === "ready") {
+          await api.downloadReportArtifact(artifact.id, runId);
+          return;
+        }
+        if (status.status === "failed") {
+          throw new Error(status.error_message || "Pack build failed");
+        }
+      }
+      throw new Error("Pack build timed out");
+    }
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || `HTTP ${response.status}`);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `report-${runId}-pack.zip`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  },
   downloadRunsCompareCsv: (runIds: number[]) =>
     downloadFile(
       `/reports/compare.csv${buildQuery({ run_ids: runIds.join(",") })}`,
@@ -2456,6 +2635,9 @@ export const api = {
     rule_tech_name: string;
     host_id?: number | null;
     job_id?: number | null;
+    scope_site?: string | null;
+    scope_environment?: string | null;
+    scope_tag?: string | null;
     reason: string;
     change_ticket?: string | null;
     expires_at?: string | null;
@@ -2489,6 +2671,8 @@ export const api = {
     }),
   revokeWaiver: (id: number) =>
     request<ComplianceWaiver>(`/waivers/${id}/revoke`, { method: "POST" }),
+  reopenWaiver: (id: number) =>
+    request<ComplianceWaiver>(`/waivers/${id}/reopen`, { method: "POST" }),
   deleteWaiver: (id: number) => request<void>(`/waivers/${id}`, { method: "DELETE" }),
   createRemediation: (data: {
     name: string;
@@ -2522,8 +2706,11 @@ export const api = {
   ) => request<RemediationJob>(`/remediations/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
   remediationRuns: (params?: ListParams) =>
     request<PaginatedResponse<RemediationRun>>(`/remediations/runs${listQuery(params)}`),
-  runRemediation: (jobId: number) =>
-    request<RemediationRun>(`/remediations/${jobId}/run`, { method: "POST" }),
+  runRemediation: (jobId: number, data?: { change_ticket?: string | null }) =>
+    request<RemediationRun>(`/remediations/${jobId}/run`, {
+      method: "POST",
+      body: JSON.stringify(data ?? {}),
+    }),
   stopRemediationRun: (runId: number) =>
     request<RemediationRun>(`/remediations/runs/${runId}/stop`, { method: "POST" }),
   deleteRemediationRun: (runId: number) =>
@@ -2532,6 +2719,25 @@ export const api = {
     request<void>(`/remediations/${jobId}`, { method: "DELETE" }),
   getRemediationRun: (runId: number) =>
     request<RemediationRunDetail>(`/remediations/runs/${runId}`),
+  rollbackRemediationRun: (runId: number, hostId?: number) =>
+    request<RemediationRunDetail>(
+      `/remediations/runs/${runId}/rollback${hostId != null ? buildQuery({ host_id: hostId }) : ""}`,
+      { method: "POST" },
+    ),
+  downloadRemediationBackup: (runId: number, artifactId: number, filename?: string) =>
+    downloadFile(
+      `/remediations/runs/${runId}/backups/${artifactId}/download`,
+      filename ?? `remediation-${runId}-backup-${artifactId}.txt`,
+    ),
+  maintenanceWindows: () => request<MaintenanceWindow[]>("/maintenance-windows"),
+  createMaintenanceWindow: (data: Omit<MaintenanceWindow, "id" | "created_at" | "updated_at">) =>
+    request<MaintenanceWindow>("/maintenance-windows", { method: "POST", body: JSON.stringify(data) }),
+  updateMaintenanceWindow: (
+    id: number,
+    data: Partial<Omit<MaintenanceWindow, "id" | "created_at" | "updated_at">>,
+  ) => request<MaintenanceWindow>(`/maintenance-windows/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+  deleteMaintenanceWindow: (id: number) =>
+    request<void>(`/maintenance-windows/${id}`, { method: "DELETE" }),
   auditLogs: (params?: {
     offset?: number;
     limit?: number;
@@ -2596,6 +2802,7 @@ export const api = {
       key_passphrase?: string;
       service_username?: string;
       service_secret?: string;
+      skip_become?: boolean;
     }>;
     save_to_inventory?: boolean;
   }) => request<AuditFlowRun>("/audit-flow/runs", { method: "POST", body: JSON.stringify(data) }),
@@ -2612,6 +2819,7 @@ export const api = {
       key_passphrase?: string;
       service_username?: string;
       service_secret?: string;
+      skip_become?: boolean;
     }>;
     save_to_inventory?: boolean;
     inventory_scope?: { tags: string[]; site?: string | null } | null;
@@ -2634,6 +2842,7 @@ export const api = {
         key_passphrase?: string;
         service_username?: string;
         service_secret?: string;
+        skip_become?: boolean;
       }>;
       save_to_inventory?: boolean;
       inventory_scope?: { tags: string[]; site?: string | null } | null;
@@ -2679,6 +2888,7 @@ export const api = {
       key_passphrase?: string;
       service_username?: string;
       service_secret?: string;
+      skip_become?: boolean;
       host_id?: number;
     }
   ) =>
@@ -2724,6 +2934,7 @@ export const api = {
   createAagTask: (data: AagTaskInput) =>
     request<AagArtifact>("/aag/tasks", { method: "POST", body: JSON.stringify(data) }),
   deleteAagTask: (id: number) => request<void>(`/aag/tasks/${id}`, { method: "DELETE" }),
+  cancelAagTask: (id: number) => request<AagArtifact>(`/aag/tasks/${id}/cancel`, { method: "POST" }),
   retryAagTask: (id: number) => request<AagArtifact>(`/aag/tasks/${id}/retry`, { method: "POST" }),
   aagExplainCandidates: (runId: number) =>
     request<AagExplainCandidate[]>(`/aag/explain/candidates${buildQuery({ run_id: runId })}`),

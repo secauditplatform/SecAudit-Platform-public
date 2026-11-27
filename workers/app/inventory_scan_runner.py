@@ -32,6 +32,7 @@ from secaudit_core.inventory_scan_state import (
     set_scan_pid,
 )
 from secaudit_core.models import Credential, Host, InventoryScan, InventoryScanResult, JobStatus
+from secaudit_core.network_vendor_registry import infer_vendor_from_snmp, os_family_for
 from secaudit_core.run_state import (
     claim_pending_run,
     release_running_run_for_retry,
@@ -210,13 +211,22 @@ def _find_existing_host(
     owner_sub: str | None,
     ip: str,
     resolved_hostname: str | None,
+    ssh_fingerprint: str | None = None,
 ) -> Host | None:
     """Find a reusable host for this scan owner (or legacy unowned host).
 
-    Matches by IP or resolved DNS against Host.hostname / Host.name so rescans
-    do not create duplicates when the inventory already contains the target.
-    Other owners' hosts are never linked (object RBAC isolation).
+    Prefers stable asset identities (SSH fingerprint, …), then IP / DNS against
+    Host.hostname / Host.name. Other owners' hosts are never linked.
     """
+    from secaudit_core.asset_identity import find_host_by_identities, retarget_host_address
+
+    by_identity = find_host_by_identities(
+        db, owner_sub=owner_sub, ssh_fingerprint=ssh_fingerprint
+    )
+    if by_identity is not None:
+        retarget_host_address(by_identity, ip)
+        return by_identity
+
     keys = _identity_keys(ip, resolved_hostname)
     if not keys:
         return None
@@ -323,10 +333,14 @@ def _apply_snmp_hits(db: Session, scan: InventoryScan, hits: list) -> None:
     """
     discovered = []
     hints: dict[str, str | None] = {}
+    vendors: dict[str, object] = {}
     for hit in hits:
         name = (hit.sys_name or "").strip()[:256] or None
         discovered.append({"ip": hit.ip, "hostname": name})
         hints[hit.ip] = platform_hint(hit.sys_descr, hit.sys_object_id)
+        vendor = infer_vendor_from_snmp(hit.sys_descr, hit.sys_object_id)
+        if vendor is not None:
+            vendors[hit.ip] = vendor
     _persist_discovered_hosts(db, scan, discovered)
     rows = list(
         db.execute(select(InventoryScanResult).where(InventoryScanResult.scan_id == scan.id)).scalars()
@@ -336,7 +350,12 @@ def _apply_snmp_hits(db: Session, scan: InventoryScan, hits: list) -> None:
         row.open_ports = "[]"
         row.is_active = True
         row.platform_hint = hints.get(row.ip_address)
+        vendor = vendors.get(row.ip_address)
         if row.host_id is not None:
+            host = db.get(Host, row.host_id)
+            if host is not None and vendor is not None and host.network_vendor is None:
+                host.network_vendor = vendor
+                host.os_family = host.os_family or os_family_for(vendor)
             continue
         existing = _find_existing_host(
             db,
@@ -347,6 +366,9 @@ def _apply_snmp_hits(db: Session, scan: InventoryScan, hits: list) -> None:
         if existing:
             if existing.owner_sub is None and scan.owner_sub is not None:
                 existing.owner_sub = scan.owner_sub
+            if vendor is not None and existing.network_vendor is None:
+                existing.network_vendor = vendor
+                existing.os_family = existing.os_family or os_family_for(vendor)
             row.host_id = existing.id
             continue
         created = Host(
@@ -356,6 +378,8 @@ def _apply_snmp_hits(db: Session, scan: InventoryScan, hits: list) -> None:
             os_type="network",
             is_active=True,
             owner_sub=scan.owner_sub,
+            network_vendor=vendor,
+            os_family=os_family_for(vendor) if vendor else None,
         )
         db.add(created)
         db.flush()

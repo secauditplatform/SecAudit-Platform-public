@@ -20,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from secaudit_core.base import Base
 from secaudit_core.enums import (
+    AssetIdentityKind,
     AuditFlowStatus,
     CategoryType,
     CheckStatus,
@@ -51,6 +52,7 @@ def _pg_str_enum(enum_cls, name: str) -> Enum:
         values_callable=lambda choices: [item.value for item in choices],
         create_constraint=False,
         native_enum=True,
+        create_type=False,
     )
 
 
@@ -90,6 +92,8 @@ class Profile(Base):
     os_version: Mapped[str | None] = mapped_column(String(64))
     os_vendor: Mapped[str | None] = mapped_column(String(128))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Declarations from the package variables.json. Empty until the package is synced.
+    variable_schema: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     category: Mapped["Category | None"] = relationship(back_populates="profiles")
@@ -118,6 +122,8 @@ class ProfileVersion(Base):
     number: Mapped[int] = mapped_column(Integer, nullable=False)
     label: Mapped[str | None] = mapped_column(String(128))
     requirement_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    # Frozen at create. Null means the package defaults from variable_schema.
+    variable_values: Mapped[dict | None] = mapped_column(JSON)
     # At most one active version per profile; enforced by a partial unique index.
     is_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(128))
@@ -214,6 +220,10 @@ class User(Base):
     totp_secret_encrypted: Mapped[str | None] = mapped_column(Text)
     # Bcrypt hashes of single-use recovery codes; plaintext is shown once at enrollment.
     mfa_recovery_codes_json: Mapped[list[str] | None] = mapped_column(JSON)
+    # Empty lists mean the operator is not limited. Admin and auditor ignore these.
+    access_sites: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    access_environments: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    access_tags: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
 
 
 class ApiKey(Base):
@@ -284,6 +294,10 @@ class Credential(Base):
     encrypted_key_passphrase: Mapped[str | None] = mapped_column(Text)
     service_username: Mapped[str | None] = mapped_column(String(128))
     encrypted_service_secret: Mapped[str | None] = mapped_column(Text)
+    become_method: Mapped[str | None] = mapped_column(String(32))
+    become_username: Mapped[str | None] = mapped_column(String(128))
+    encrypted_become_secret: Mapped[str | None] = mapped_column(Text)
+    skip_become: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     snmp_priv_protocol: Mapped[str | None] = mapped_column(String(32))
     description: Mapped[str | None] = mapped_column(Text)
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
@@ -308,6 +322,11 @@ class Host(Base):
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
     ssh_host_key_fingerprint: Mapped[str | None] = mapped_column(String(128))
     ssh_known_hosts_entry: Mapped[str | None] = mapped_column(Text)
+    network_vendor: Mapped[NetworkVendor | None] = mapped_column(
+        _pg_str_enum(NetworkVendor, "networkvendor"), nullable=True
+    )
+    os_family: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    os_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     credential: Mapped["Credential | None"] = relationship()
@@ -317,6 +336,32 @@ class Host(Base):
     tags: Mapped[list["HostTagLink"]] = relationship(
         back_populates="host", cascade="all, delete-orphan"
     )
+    identities: Mapped[list["AssetIdentity"]] = relationship(
+        back_populates="host", cascade="all, delete-orphan"
+    )
+
+
+class AssetIdentity(Base):
+    """Stable hardware/software identity used to merge hosts when the IP changes."""
+
+    __tablename__ = "asset_identities"
+    __table_args__ = (
+        UniqueConstraint("kind", "value", name="uq_asset_identity_kind_value"),
+        Index("ix_asset_identities_host_id", "host_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    host_id: Mapped[int] = mapped_column(
+        ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[AssetIdentityKind] = mapped_column(
+        _pg_str_enum(AssetIdentityKind, "assetidentitykind"),
+        nullable=False,
+    )
+    value: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    host: Mapped["Host"] = relationship(back_populates="identities")
 
 
 class InventoryScan(Base):
@@ -379,7 +424,16 @@ class DirectorySource(Base):
     encrypted_bind_password: Mapped[str] = mapped_column(Text, nullable=False)
     enabled_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     map_ou_to_site: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    import_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    computer_filter: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    ou_field_map: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    cron_expression: Mapped[str | None] = mapped_column(String(128))
+    is_scheduled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    last_scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    missing_host_policy: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none", server_default="none"
+    )
     owner_sub: Mapped[str | None] = mapped_column(String(256), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -617,10 +671,33 @@ class JobRun(Base):
     source_run_id: Mapped[int | None] = mapped_column(
         ForeignKey("job_runs.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    # Denormalised check counters; null until backfilled / written at run completion.
+    pass_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fail_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    skip_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    check_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     job: Mapped["Job"] = relationship(back_populates="runs", foreign_keys=[job_id])
     check_results: Mapped[list["CheckResult"]] = relationship(back_populates="job_run")
+
+
+class ReportArtifact(Base):
+    __tablename__ = "report_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_run_id: Mapped[int] = mapped_column(
+        ForeignKey("job_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    locale: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    file_path: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class CheckResult(Base):
@@ -643,7 +720,7 @@ class CheckResult(Base):
     )
     message: Mapped[str | None] = mapped_column(Text)
     raw_output: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     job_run: Mapped["JobRun"] = relationship(back_populates="check_results")
     host: Mapped["Host"] = relationship()
@@ -657,6 +734,9 @@ class ComplianceWaiver(Base):
     rule_tech_name: Mapped[str] = mapped_column(String(256), nullable=False)
     host_id: Mapped[int | None] = mapped_column(ForeignKey("hosts.id"), nullable=True, index=True)
     job_id: Mapped[int | None] = mapped_column(ForeignKey("jobs.id"), nullable=True, index=True)
+    scope_site: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scope_environment: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scope_tag: Mapped[str | None] = mapped_column(String(64), nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     change_ticket: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     status: Mapped[WaiverStatus] = mapped_column(
@@ -757,10 +837,62 @@ class RemediationRun(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     celery_task_id: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(Text)
+    change_ticket: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # none | skipped | ok | failed
+    backup_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none", server_default="none"
+    )
+    rollback_results_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     remediation_job: Mapped["RemediationJob"] = relationship(back_populates="runs")
     results: Mapped[list["RemediationResult"]] = relationship(back_populates="remediation_run")
+    backup_artifacts: Mapped[list["RemediationBackupArtifact"]] = relationship(
+        back_populates="remediation_run", cascade="all, delete-orphan"
+    )
+
+
+class RemediationBackupArtifact(Base):
+    """Encrypted pre-remediation snapshot for one path/key/config on one host."""
+
+    __tablename__ = "remediation_backup_artifacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    remediation_run_id: Mapped[int] = mapped_column(
+        ForeignKey("remediation_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id", ondelete="CASCADE"), nullable=False, index=True)
+    platform: Mapped[str] = mapped_column(String(16), nullable=False)  # linux | windows | network
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)  # file | registry | running_config
+    path_or_key: Mapped[str] = mapped_column(String(1024), nullable=False)
+    encrypted_blob: Mapped[str | None] = mapped_column(Text)
+    storage_ref: Mapped[str | None] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    remediation_run: Mapped["RemediationRun"] = relationship(back_populates="backup_artifacts")
+    host: Mapped["Host"] = relationship()
+
+
+class MaintenanceWindow(Base):
+    """Weekly change window by site/environment. Outside the window remediation is blocked."""
+
+    __tablename__ = "maintenance_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    site: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    environment: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    # Comma-separated weekday numbers 0=Mon .. 6=Sun (ISO), e.g. "0,1,2,3,4"
+    days_of_week: Mapped[str] = mapped_column(String(32), nullable=False, default="0,1,2,3,4")
+    start_time: Mapped[str] = mapped_column(String(8), nullable=False, default="00:00")  # HH:MM local
+    end_time: Mapped[str] = mapped_column(String(8), nullable=False, default="23:59")
+    tz: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class RemediationResult(Base):
@@ -770,7 +902,8 @@ class RemediationResult(Base):
             "remediation_run_id",
             "host_id",
             "script_name",
-            name="uq_remediation_result_run_host_script",
+            "rule_tech_name",
+            name="uq_remediation_result_run_host_script_rule",
         ),
     )
 
@@ -780,6 +913,8 @@ class RemediationResult(Base):
     )
     host_id: Mapped[int] = mapped_column(ForeignKey("hosts.id"), nullable=False, index=True)
     script_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Empty string = script-level row (legacy / no per-rule JSONL).
+    rule_tech_name: Mapped[str] = mapped_column(String(256), nullable=False, default="")
     status: Mapped[CheckStatus] = mapped_column(
         Enum(CheckStatus, name="checkstatus", create_constraint=False, native_enum=True),
         nullable=False,
@@ -1001,6 +1136,7 @@ class AuditFlowCredential(Base):
     encrypted_key_passphrase: Mapped[str | None] = mapped_column(Text)
     service_username: Mapped[str | None] = mapped_column(String(128))
     encrypted_service_secret: Mapped[str | None] = mapped_column(Text)
+    skip_become: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     run: Mapped["AuditFlowRun"] = relationship(back_populates="credentials")
 

@@ -59,26 +59,6 @@ def resolve_filter_host_ids(
     return list(db.execute(stmt).scalars().all())
 
 
-def find_existing_inventory_host(
-    db: Session,
-    *,
-    owner_sub: str | None,
-    ip: str,
-    hostname: str | None = None,
-    ssh_host_key_fingerprint: str | None = None,
-) -> Host | None:
-    """Reuse a durable inventory host for this owner (never another tenant, never ephemeral)."""
-    from secaudit_core.audit_flow_inventory import find_inventory_host
-
-    return find_inventory_host(
-        db,
-        owner_sub=owner_sub,
-        ip=ip,
-        hostname=hostname,
-        ssh_host_key_fingerprint=ssh_host_key_fingerprint,
-    )
-
-
 def resolve_remediation_host_ids(
     db: Session,
     remediation_job_id: int,

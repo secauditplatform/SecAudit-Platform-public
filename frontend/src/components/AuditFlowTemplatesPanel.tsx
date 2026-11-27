@@ -40,6 +40,7 @@ type AuditFlowTemplatesPanelProps = {
     key_passphrase?: string;
     service_username?: string;
     service_secret?: string;
+    skip_become?: boolean;
   }>;
   saveToInventory: boolean;
   onRunStarted?: (run: AuditFlowRun) => void;

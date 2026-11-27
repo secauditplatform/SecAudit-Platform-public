@@ -9,8 +9,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser
+from app.core.config import settings
 from app.models import ComplianceWaiver, Job, Profile, UserRole, WaiverStatus
-from app.services.object_rbac import apply_owner_scope, assert_can_access
+from app.services.object_rbac import apply_owner_scope, apply_waiver_scope, assert_can_access
 from secaudit_core.object_rbac import ownership_sub_for_create
 
 
@@ -61,7 +62,9 @@ def transition_approve(
 ) -> None:
     if waiver.status != WaiverStatus.PENDING or not waiver.is_active:
         raise HTTPException(status_code=400, detail="Only pending waivers can be approved")
-    if waiver.requested_by == actor_name(user) and not user.has_role(UserRole.ADMIN):
+    if waiver.requested_by == actor_name(user) and (
+        settings.waiver_strict_four_eyes or not user.has_role(UserRole.ADMIN)
+    ):
         raise HTTPException(status_code=400, detail="Requester cannot approve their own waiver")
     now = datetime.now(UTC)
     waiver.status = WaiverStatus.APPROVED
@@ -85,6 +88,15 @@ def transition_reject(waiver: ComplianceWaiver, user: AuthUser, reason: str | No
     waiver.rejected_at = now
     waiver.rejection_reason = reason
     waiver.is_active = False
+
+
+def transition_reopen(waiver: ComplianceWaiver) -> None:
+    if waiver.status != WaiverStatus.APPROVED or not waiver.is_active:
+        raise HTTPException(status_code=400, detail="Only an approved waiver can be reopened")
+    waiver.status = WaiverStatus.PENDING
+    waiver.approved_by = None
+    waiver.approved_at = None
+    waiver.is_active = True
 
 
 def transition_revoke(waiver: ComplianceWaiver, _user: AuthUser) -> None:
@@ -142,7 +154,7 @@ async def list_waivers(
     active_only: bool | None = None,
 ) -> list[ComplianceWaiver]:
     stmt = select(ComplianceWaiver).order_by(ComplianceWaiver.id.desc())
-    stmt = apply_owner_scope(stmt, ComplianceWaiver.owner_sub, user)
+    stmt = apply_waiver_scope(apply_owner_scope(stmt, ComplianceWaiver.owner_sub, user), user)
     if profile_id is not None:
         stmt = stmt.where(ComplianceWaiver.profile_id == profile_id)
     if host_id is not None:

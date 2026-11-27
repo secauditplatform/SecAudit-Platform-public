@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
 import redis
 import redis.asyncio as aioredis
@@ -92,6 +91,3 @@ def async_redis(redis_url: str, settings: SecAuditSettings | None = None, **over
         )
     return aioredis.from_url(redis_url, **_standalone_kwargs(settings, **overrides))
 
-
-def redis_url_host(redis_url: str) -> str:
-    return urlparse(redis_url).hostname or "localhost"

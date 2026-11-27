@@ -26,6 +26,16 @@ It is built for security and infrastructure teams that need a controlled, audita
 - **Security built in** — Keycloak OIDC or local users, object-level RBAC, encrypted credentials, audit trail, and SIEM export.
 - **Production-ready packaging** — develop on lab Compose; deploy with hardened Compose or Helm on your infrastructure.
 
+## What's new in v2.0.0
+
+v2.0.0 lets an operator tune a check, run only the rules that matter, and put a host back after remediation.
+
+- **Typed check parameters** — `variables.json` is an optional package file: name, type, default, and the rules it binds. A profile version stores the chosen values, and the audit reads them as `SECAUDIT_VAR_*`.
+- **A run can execute a subset of rules** — audit and remediation take a rule allowlist across shell, Ansible, and SCAP. The Review step uses the same Audit and Re-audit badges as the rest of the run.
+- **Remediation has a way back** — Linux, Services, and UNIX Platform ship `*_remediation_restore.sh` beside the remediation script. Restore replays the on-host journal and `*.secaudit.bak`. The platform also accepts a backup/restore script pair, a maintenance window, and a production change ticket. Package upgrades, bootloader arguments, and a few service-side changes stay as they are.
+- **Matching and login follow the machine** — profile fit uses the distro and OS version. AuditFlow no longer treats a loose distro string as a match, and a check starts only from Run. An SSH login can run the check as itself, without sudo. Directory import can be limited and scheduled.
+- **A thin target still produces a result** — failed remediation rows name the host. JSONL check output is parsed, and OVAL is evaluated on the worker when `oscap` is missing on the host. Deleting a profile asks which playbooks, jobs, and reports to remove with it. A waiver can be scoped to a site, environment, or tag, and a Security Approver can be limited to those.
+
 ## What's new in v1.9.0
 
 - **Remediation from failed rules** — pick which failed rules to remediate from a finished run, dry-run with Ansible `--check --diff`, and optionally re-audit when remediation finishes.
@@ -37,14 +47,6 @@ It is built for security and infrastructure teams that need a controlled, audita
 - **Profile versions and script variants** — named check sets with one active version, optional job pinning, and a version snapshot in every run; add or remove audit and remediation scripts without re-importing, and see which jobs, runs, and results a version deletion removes.
 - **UNIX hosts** — FreeBSD, OpenBSD, NetBSD, Solaris/illumos, AIX, HP-UX, and macOS get a platform tab, host filter, SSH fingerprint, playbook scope, and inventory playbook.
 - **Service credentials only where needed** — a profile asks for a service login only when its audit script reads one; remote commands get EOF on stdin, so a waiting tool cannot hold a run until timeout.
-=======
-## What's new in v1.8.0
-
-v1.8.0 makes the check set in every run explicit and adds UNIX as a first-class platform.
-
-- **Profile versions and script variants** — build a named check set, make it active, and optionally pin a job to it; every run records the version and evaluates only its checks across reports, CSV, compliance, drift, trends, and waivers. Audit and remediation scripts can be added or removed without re-importing, and deleting a version shows which jobs, runs, and results will be removed with it.
-- **UNIX hosts** — FreeBSD, OpenBSD, NetBSD, Solaris/illumos, AIX, HP-UX, and macOS get their own platform tab, host filter, SSH fingerprint, playbook scope, and inventory playbook.
-- **Service credentials only where needed** — a profile asks for a service login only when its audit script reads one; remote commands also get EOF on stdin, so a waiting tool cannot hold a run until timeout.
 
 ## What's new in v1.7.0
 

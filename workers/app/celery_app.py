@@ -41,6 +41,7 @@ celery_app = create_celery_app(
         "app.tasks.audit_flow",
         "app.tasks.preflight",
         "app.tasks.scheduled_reports",
+        "app.tasks.report_artifacts",
     ],
 )
 
@@ -57,8 +58,12 @@ celery_app.conf.update(
     task_time_limit=settings.celery_task_time_limit,
     task_routes={
         "app.tasks.run_compliance_job": {"queue": "compliance"},
+        "app.tasks.run_compliance_shard": {"queue": "compliance"},
+        "app.tasks.finalize_compliance_job": {"queue": "compliance"},
+        "app.tasks.finalize_compliance_job_error": {"queue": "compliance"},
         "app.tasks.compliance.*": {"queue": "compliance"},
         "app.tasks.run_remediation_job": {"queue": "remediation"},
+        "app.tasks.run_remediation_rollback": {"queue": "remediation"},
         "app.tasks.remediation.*": {"queue": "remediation"},
         "app.tasks.inventory.*": {"queue": "inventory"},
         "app.tasks.directory.*": {"queue": "inventory"},
@@ -67,6 +72,7 @@ celery_app.conf.update(
         "app.tasks.preflight.*": {"queue": "inventory"},
         "app.tasks.maintenance.*": {"queue": "maintenance"},
         "app.tasks.scheduled_reports.*": {"queue": "maintenance"},
+        "app.tasks.report_artifacts.*": {"queue": "maintenance"},
     },
     beat_schedule={
         "heartbeat-every-minute": {
@@ -81,6 +87,11 @@ celery_app.conf.update(
         },
         "run-scheduled-audit-flow-templates": {
             "task": "app.tasks.audit_flow.run_scheduled_audit_flow_templates",
+            "schedule": 60.0,
+            "options": {"queue": "inventory"},
+        },
+        "run-scheduled-directory-sources": {
+            "task": "app.tasks.directory.run_scheduled_directory_sources",
             "schedule": 60.0,
             "options": {"queue": "inventory"},
         },
@@ -101,6 +112,11 @@ celery_app.conf.update(
         },
         "purge-old-job-runs": {
             "task": "app.tasks.maintenance.purge_old_job_runs",
+            "schedule": 3600.0,
+            "options": {"queue": "maintenance"},
+        },
+        "archive-check-raw-output": {
+            "task": "app.tasks.maintenance.archive_check_raw_output",
             "schedule": 3600.0,
             "options": {"queue": "maintenance"},
         },

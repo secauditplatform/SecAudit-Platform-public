@@ -22,6 +22,7 @@ from app.api.v1.routers import (
     notifications,
     playbooks,
     remediations,
+    maintenance_windows,
     reports,
     scheduled_reports,
     search,
@@ -53,6 +54,9 @@ api_router.include_router(jobs.router, prefix="/jobs", tags=["jobs"])
 api_router.include_router(network_operations.router, prefix="/network", tags=["network"])
 api_router.include_router(job_templates.router, prefix="/job-templates", tags=["job-templates"])
 api_router.include_router(remediations.router, prefix="/remediations", tags=["remediations"])
+api_router.include_router(
+    maintenance_windows.router, prefix="/maintenance-windows", tags=["maintenance-windows"]
+)
 api_router.include_router(playbooks.router, prefix="/playbooks", tags=["playbooks"])
 api_router.include_router(reports.router, prefix="/reports", tags=["reports"])
 api_router.include_router(cve_feed.router, prefix="/cve-feed", tags=["cve-feed"])

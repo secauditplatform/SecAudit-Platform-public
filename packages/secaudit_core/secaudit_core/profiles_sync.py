@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, selectinload
 from secaudit_core.enums import ScriptKind
 from secaudit_core.models import Category, CheckScript, InterpreterRule, Rule, Profile
 from secaudit_core.settings import SecAuditSettings
+from secaudit_core.profile_variables import load_package_variables
 from secaudit_core.profile_packages import (
     DEFAULT_PROFILE_VERSION,
     load_profile_package,
@@ -99,6 +100,8 @@ def import_package_from_mount(
     meta = package["profile"]
     scripts = package["scripts"]
     remediation_scripts = package.get("remediation_scripts", [])
+    remediation_backup_scripts = package.get("remediation_backup_scripts", [])
+    remediation_restore_scripts = package.get("remediation_restore_scripts", [])
     category_slug = meta.get("category_slug") or package.get("category_slug")
     category = _resolve_category(db, category_slug)
     resolved_format = meta.get("source_format") or "custom"
@@ -153,6 +156,7 @@ def import_package_from_mount(
             os_version=os_fields["os_version"],
             os_vendor=os_fields["os_vendor"],
             is_active=meta.get("is_active", True),
+            variable_schema=load_package_variables(package_dir),
         )
         db.add(profile)
         db.flush()
@@ -172,6 +176,7 @@ def import_package_from_mount(
         profile.os_version = os_fields["os_version"]
         profile.os_vendor = os_fields["os_vendor"]
         profile.is_active = meta.get("is_active", True)
+        profile.variable_schema = load_package_variables(package_dir)
         job_script_files = capture_remediation_script_links(db, profile.id)
         detach_remediation_script_links(db, profile.id)
         delete_profile_rules_and_scripts(db, profile.id)
@@ -219,6 +224,36 @@ def import_package_from_mount(
             )
         )
 
+    for item in remediation_backup_scripts:
+        script_path = package_dir / item["script_file"]
+        if not script_path.is_file():
+            raise FileNotFoundError(f"Backup script not found: {item['script_file']}")
+        db.add(
+            CheckScript(
+                profile_id=profile.id,
+                name=item["name"],
+                execution_type=map_execution_type(item.get("type", "SSH")),
+                script_file=item["script_file"],
+                script_kind=ScriptKind.REMEDIATION_BACKUP,
+                description=item.get("description"),
+            )
+        )
+
+    for item in remediation_restore_scripts:
+        script_path = package_dir / item["script_file"]
+        if not script_path.is_file():
+            raise FileNotFoundError(f"Restore script not found: {item['script_file']}")
+        db.add(
+            CheckScript(
+                profile_id=profile.id,
+                name=item["name"],
+                execution_type=map_execution_type(item.get("type", "SSH")),
+                script_file=item["script_file"],
+                script_kind=ScriptKind.REMEDIATION_RESTORE,
+                description=item.get("description"),
+            )
+        )
+
     if job_script_files:
         restore_remediation_script_links(db, profile.id, job_script_files)
 
@@ -230,34 +265,18 @@ def import_package_from_mount(
     return profile
 
 
-def summarize_catalog_sync_queue(
-    db: Session,
-    profiles_path: str,
-    *,
-    families: frozenset[str] | None = None,
-) -> dict[str, int]:
-    """Count custom profiles waiting for scheduled import or update."""
-    allowed = families or DEFAULT_SYNC_FAMILIES
-    catalog = build_catalog_sync(db, profiles_path)
-    targets = [entry for entry in catalog if entry.get("profile_family") in allowed]
-
-    latest_by_name: dict[str, dict] = {}
-    for entry in targets:
-        if entry.get("is_latest"):
-            latest_by_name[entry["profile_name"]] = entry
-
-    pending_imports = 0
-    pending_updates = 0
-    for entry in latest_by_name.values():
-        if entry.get("imported_version") is None:
-            pending_imports += 1
-        elif entry.get("update_available"):
-            pending_updates += 1
-
-    return {
-        "pending_imports": pending_imports,
-        "pending_updates": pending_updates,
-    }
+def _refresh_variable_schema(db: Session, profile_name: str, package_dir: Path, errors: list) -> None:
+    """Pick up variables.json without rebuilding the package. Full resync still sets it too."""
+    profile = db.execute(select(Profile).where(Profile.profile_name == profile_name)).scalar_one_or_none()
+    if profile is None:
+        return
+    try:
+        schema = load_package_variables(package_dir)
+    except ValueError as exc:
+        errors.append({"package_path": str(package_dir), "message": str(exc)})
+        return
+    if profile.variable_schema != schema:
+        profile.variable_schema = schema
 
 
 def sync_profiles_catalog(
@@ -331,6 +350,7 @@ def sync_profiles_catalog(
                 errors.append({"package_path": package_path, "message": str(exc)})
             continue
 
+        _refresh_variable_schema(db, str(entry["profile_name"]), Path(package_path), errors)
         skipped.append(package_path)
 
     from secaudit_core.compliance_playbooks import dedupe_orphaned_compliance_templates

@@ -6,33 +6,6 @@ const DEFAULT_PAGE_SIZE = 25;
 
 export { DEFAULT_PAGE_SIZE };
 
-export function useServerPagination(total: number, pageSize = DEFAULT_PAGE_SIZE) {
-  const [page, setPage] = useState(1);
-  const totalPages = Math.max(1, Math.ceil(total / pageSize));
-
-  useEffect(() => {
-    if (page > totalPages) {
-      setPage(totalPages);
-    }
-  }, [page, totalPages]);
-
-  const safePage = Math.min(page, totalPages);
-  const offset = (safePage - 1) * pageSize;
-  const from = total === 0 ? 0 : offset + 1;
-  const to = Math.min(offset + pageSize, total);
-
-  return {
-    page: safePage,
-    setPage,
-    pageSize,
-    offset,
-    total,
-    totalPages,
-    from,
-    to,
-  };
-}
-
 export function usePagination<T>(items: T[], pageSize = DEFAULT_PAGE_SIZE) {
   const [page, setPage] = useState(1);
 

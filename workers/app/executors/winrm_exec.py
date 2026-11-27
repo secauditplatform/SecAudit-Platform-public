@@ -16,7 +16,6 @@ _settings = SecAuditSettings()
 
 WINRM_HTTP_PORT = 5985
 WINRM_HTTPS_PORT = 5986
-SSH_DEFAULT_PORT = 22
 # Ports commonly stored on Windows hosts from inventory discovery (not WinRM).
 WINRM_DISCOVERY_PORTS = frozenset({22, 0, 139, 445, 3389})
 # pywinrm run_ps() wraps content in `powershell -encodedcommand ...` (~8191 char Windows limit).

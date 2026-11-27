@@ -105,6 +105,7 @@ def run_to_read(
                 "username": cred.username,
                 "service_username": cred.service_username,
                 "has_service_secret": bool(getattr(cred, "encrypted_service_secret", None)),
+                "skip_become": bool(getattr(cred, "skip_become", False)),
             }
             for cred in (run.credentials or [])
         ],

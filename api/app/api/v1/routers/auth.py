@@ -25,7 +25,6 @@ from app.services.audit_log import log_audit_event
 from app.services.auth_sessions import (
     acquire_auth_session,
     auth_idle_enabled,
-    is_auth_token_revoked,
     release_auth_session,
     revoke_auth_token,
     touch_auth_session,

@@ -42,6 +42,9 @@ class AuthUser:
     local_source: str | None = None
     scopes: list[str] | None = None
     token_version: int = 0
+    access_sites: tuple[str, ...] = ()
+    access_environments: tuple[str, ...] = ()
+    access_tags: tuple[str, ...] = ()
 
     def has_role(self, *roles: UserRole | str) -> bool:
         allowed = {r.value if isinstance(r, UserRole) else r for r in roles}
@@ -294,7 +297,22 @@ def _decode_keycloak_token_with_jwks(token: str, jwks: dict) -> AuthUser:
         or payload.get("email")
         or payload.get("sub", "unknown")
     )
-    return AuthUser(sub=payload.get("sub", ""), username=username, roles=roles, auth_mode="sso")
+    from secaudit_core.access_scope import scope_from_labels
+
+    labels = [str(item) for item in roles]
+    groups = payload.get("groups") or []
+    if isinstance(groups, list):
+        labels.extend(str(item) for item in groups)
+    access = scope_from_labels(labels)
+    return AuthUser(
+        sub=payload.get("sub", ""),
+        username=username,
+        roles=roles,
+        auth_mode="sso",
+        access_sites=access.sites,
+        access_environments=access.environments,
+        access_tags=access.tags,
+    )
 
 
 async def _decode_keycloak_token(token: str) -> AuthUser:
@@ -370,6 +388,9 @@ async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
         current_version = int(db_user.token_version or 0)
         if int(user.token_version or 0) != current_version:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token revoked")
+        access_sites = tuple(db_user.access_sites or [])
+        access_environments = tuple(db_user.access_environments or [])
+        access_tags = tuple(db_user.access_tags or [])
         if not settings.local_auth_revalidate_user:
             return AuthUser(
                 sub=user.sub,
@@ -379,6 +400,9 @@ async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
                 local_source=user.local_source,
                 scopes=user.scopes,
                 token_version=current_version,
+                access_sites=access_sites,
+                access_environments=access_environments,
+                access_tags=access_tags,
             )
         role = db_user.role.value
         return AuthUser(
@@ -388,6 +412,9 @@ async def _enforce_local_access_token(token: str, user: AuthUser) -> AuthUser:
             auth_mode="local",
             local_source="database",
             token_version=current_version,
+            access_sites=access_sites,
+            access_environments=access_environments,
+            access_tags=access_tags,
         )
 
 

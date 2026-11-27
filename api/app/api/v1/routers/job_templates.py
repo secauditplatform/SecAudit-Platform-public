@@ -1,5 +1,3 @@
-from datetime import UTC, datetime
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +18,6 @@ from app.schemas import (
     DynamicHostFilter,
     JobCreate,
     JobRead,
-    JobRunRead,
     JobTemplateApply,
     JobTemplateCreate,
     JobTemplateRead,

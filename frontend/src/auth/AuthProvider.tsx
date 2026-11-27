@@ -28,6 +28,7 @@ const LOCAL_LAST_ACTIVITY_KEY = "secaudit_last_activity";
 const ADMIN_ROLE = "admin";
 const OPERATOR_ROLE = "operator";
 const AUDITOR_ROLE = "auditor";
+const SECURITY_APPROVER_ROLE = "security_approver";
 const LEGACY_OPERATOR_ROLES = ["engineer", "viewer"];
 
 export type PrimaryRole = "admin" | "operator" | "auditor";
@@ -458,7 +459,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     !authEnabled ||
     roles.includes(ADMIN_ROLE) ||
     roles.includes(OPERATOR_ROLE) ||
-    roles.includes(AUDITOR_ROLE);
+    roles.includes(AUDITOR_ROLE) ||
+    roles.includes(SECURITY_APPROVER_ROLE);
   const canSeeObjectOwners = !authEnabled || roles.includes(ADMIN_ROLE) || roles.includes(OPERATOR_ROLE);
   const canViewAuditLogs = !authEnabled || roles.includes(ADMIN_ROLE) || roles.includes(OPERATOR_ROLE);
   const isAuditorPortal = authEnabled && primaryRole === "auditor";

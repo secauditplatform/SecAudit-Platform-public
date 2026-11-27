@@ -9,7 +9,14 @@ import { Panel } from "./ui/Panel";
 import { PasswordInput } from "./ui/PasswordInput";
 import { useToast } from "./ui/Toast";
 
-type DirectoryForm = DirectorySourceInput & { bind_password: string };
+type DirectoryForm = Omit<DirectorySourceInput, "import_limit" | "computer_filter" | "ou_field_map"> & {
+  bind_password: string;
+  import_limit: string;
+  computer_filter: string;
+  ou_site: string;
+  ou_environment: string;
+  ou_criticality: string;
+};
 
 const EMPTY_FORM: DirectoryForm = {
   name: "",
@@ -23,8 +30,24 @@ const EMPTY_FORM: DirectoryForm = {
   bind_password: "",
   enabled_only: true,
   map_ou_to_site: true,
+  import_limit: "",
+  computer_filter: "",
+  ou_site: "",
+  ou_environment: "",
+  ou_criticality: "",
   is_active: true,
+  is_scheduled: false,
+  cron_expression: "",
+  missing_host_policy: "none",
 };
+
+function ouFieldMap(form: DirectoryForm): DirectorySourceInput["ou_field_map"] {
+  const map: { site?: string; environment?: string; criticality?: string } = {};
+  if (form.ou_site.trim()) map.site = form.ou_site.trim();
+  if (form.ou_environment.trim()) map.environment = form.ou_environment.trim();
+  if (form.ou_criticality.trim()) map.criticality = form.ou_criticality.trim();
+  return Object.keys(map).length ? map : null;
+}
 
 function statusVariant(status: string): "success" | "danger" | "warning" | "info" | "neutral" {
   switch (status) {
@@ -100,7 +123,13 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
       bind_dn: form.bind_dn.trim(),
       enabled_only: form.enabled_only,
       map_ou_to_site: form.map_ou_to_site,
+      import_limit: form.import_limit.trim() ? Number(form.import_limit) : null,
+      computer_filter: form.computer_filter.trim() || null,
+      ou_field_map: ouFieldMap(form),
       is_active: form.is_active,
+      is_scheduled: form.is_scheduled,
+      cron_expression: form.is_scheduled ? (form.cron_expression || "").trim() || null : null,
+      missing_host_policy: form.missing_host_policy,
     };
     if (form.bind_password.trim()) body.bind_password = form.bind_password;
     return body;
@@ -142,6 +171,7 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
         base_dn: body.base_dn,
         bind_dn: body.bind_dn,
         enabled_only: body.enabled_only,
+        computer_filter: body.computer_filter,
         ...(body.bind_password ? { bind_password: body.bind_password } : {}),
         ...(editingId != null ? { source_id: editingId } : {}),
       });
@@ -195,7 +225,15 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
       bind_password: "",
       enabled_only: source.enabled_only,
       map_ou_to_site: source.map_ou_to_site,
+      import_limit: source.import_limit == null ? "" : String(source.import_limit),
+      computer_filter: source.computer_filter ?? "",
+      ou_site: source.ou_field_map?.site ?? "",
+      ou_environment: source.ou_field_map?.environment ?? "",
+      ou_criticality: source.ou_field_map?.criticality ?? "",
       is_active: source.is_active,
+      is_scheduled: source.is_scheduled,
+      cron_expression: source.cron_expression ?? "",
+      missing_host_policy: source.missing_host_policy ?? "none",
     });
   };
 
@@ -208,7 +246,13 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
     }));
   };
 
-  const formReady = Boolean(form.name.trim() && form.server.trim() && form.base_dn.trim() && form.bind_dn.trim());
+  const formReady = Boolean(
+    form.name.trim() &&
+      form.server.trim() &&
+      form.base_dn.trim() &&
+      form.bind_dn.trim() &&
+      (!form.is_scheduled || (form.cron_expression || "").trim())
+  );
   const busy = saveMutation.isPending || testMutation.isPending;
 
   return (
@@ -221,7 +265,7 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
         ) : null}
         <div className="pf-form pf-form--wide pf-directory__form">
           <div className="pf-directory__grid">
-            <div className="pf-form__group pf-directory__col-4">
+            <div className="pf-form__group pf-directory__col-3">
               <label htmlFor="directory-name">{t("hosts.directoryName")}</label>
               <input
                 id="directory-name"
@@ -231,13 +275,13 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
                 onChange={(event) => setForm({ ...form, name: event.target.value })}
               />
             </div>
-            <div className="pf-form__group pf-directory__col-6">
+            <div className="pf-form__group pf-directory__col-7">
               <label htmlFor="directory-server">{t("hosts.directoryServer")}</label>
               <input
                 id="directory-server"
                 className="pf-input"
                 value={form.server}
-                placeholder="dc.corp.local"
+                placeholder="dc.corp.local / 2001:db8::10"
                 autoComplete="off"
                 spellCheck={false}
                 onChange={(event) => setForm({ ...form, server: event.target.value })}
@@ -269,7 +313,7 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
                 onChange={(event) => setForm({ ...form, base_dn: event.target.value })}
               />
             </div>
-            <div className="pf-form__group pf-directory__col-4">
+            <div className="pf-form__group pf-directory__col-5">
               <label htmlFor="directory-bind-dn">{t("hosts.directoryBindDn")}</label>
               <input
                 id="directory-bind-dn"
@@ -281,7 +325,7 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
                 onChange={(event) => setForm({ ...form, bind_dn: event.target.value })}
               />
             </div>
-            <div className="pf-form__group pf-directory__col-4">
+            <div className="pf-form__group pf-directory__col-3">
               <label htmlFor="directory-password">{t("hosts.directoryPassword")}</label>
               <PasswordInput
                 id="directory-password"
@@ -367,6 +411,125 @@ export function DirectoryDiscoveryPanel({ canExecute }: { canExecute: boolean })
                   />
                   <span>{t("hosts.directoryActive")}</span>
                 </label>
+              </div>
+            </div>
+            <div className="pf-directory__option-card" role="group" aria-labelledby="directory-group-lifecycle">
+              <div id="directory-group-lifecycle" className="pf-directory__option-title">
+                {t("hosts.directoryLifecycle")}
+              </div>
+              <div className="pf-directory__option-stack">
+                <label className="pf-directory__toggle" htmlFor="directory-scheduled">
+                  <input
+                    id="directory-scheduled"
+                    type="checkbox"
+                    className="pf-checkbox-control"
+                    checked={form.is_scheduled}
+                    onChange={(event) => setForm({ ...form, is_scheduled: event.target.checked })}
+                  />
+                  <span>{t("hosts.directoryScheduled")}</span>
+                </label>
+                {form.is_scheduled ? (
+                  <div className="pf-form__group pf-directory__field">
+                    <label htmlFor="directory-cron">{t("hosts.directoryCron")}</label>
+                    <input
+                      id="directory-cron"
+                      className="pf-input pf-directory__mono"
+                      value={form.cron_expression ?? ""}
+                      placeholder="0 2 * * *"
+                      autoComplete="off"
+                      spellCheck={false}
+                      onChange={(event) => setForm({ ...form, cron_expression: event.target.value })}
+                    />
+                  </div>
+                ) : null}
+                <div className="pf-form__group pf-directory__field">
+                  <label htmlFor="directory-missing-policy">{t("hosts.directoryMissingPolicy")}</label>
+                  <select
+                    id="directory-missing-policy"
+                    className="pf-input"
+                    value={form.missing_host_policy}
+                    onChange={(event) =>
+                      setForm({
+                        ...form,
+                        missing_host_policy: event.target.value as DirectoryForm["missing_host_policy"],
+                      })
+                    }
+                  >
+                    <option value="none">{t("hosts.directoryMissingNone")}</option>
+                    <option value="inactive">{t("hosts.directoryMissingInactive")}</option>
+                    <option value="stale">{t("hosts.directoryMissingStale")}</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div className="pf-directory__details">
+              <div className="pf-directory__pair">
+                <div className="pf-form__group pf-directory__field">
+                  <label htmlFor="directory-import-limit">{t("hosts.directoryImportLimit")}</label>
+                  <input
+                    id="directory-import-limit"
+                    className="pf-input"
+                    type="number"
+                    min={1}
+                    max={50000}
+                    inputMode="numeric"
+                    value={form.import_limit}
+                    onChange={(event) => setForm({ ...form, import_limit: event.target.value })}
+                  />
+                </div>
+                <div className="pf-form__group pf-directory__field">
+                  <label htmlFor="directory-computer-filter">{t("hosts.directoryComputerFilter")}</label>
+                  <input
+                    id="directory-computer-filter"
+                    className="pf-input pf-directory__mono"
+                    value={form.computer_filter}
+                    spellCheck={false}
+                    autoComplete="off"
+                    placeholder="(operatingSystem=*Linux*)"
+                    onChange={(event) => setForm({ ...form, computer_filter: event.target.value })}
+                  />
+                </div>
+                <p className="pf-form__hint">{t("hosts.directoryImportLimitHint")}</p>
+                <p className="pf-form__hint">{t("hosts.directoryComputerFilterHint")}</p>
+              </div>
+              <div className="pf-directory__map">
+                <div className="pf-form__group pf-directory__field">
+                  <label htmlFor="directory-ou-site">{t("hosts.directoryOuSite")}</label>
+                  <input
+                    id="directory-ou-site"
+                    className="pf-input"
+                    value={form.ou_site}
+                    placeholder="ou:1"
+                    spellCheck={false}
+                    autoComplete="off"
+                    onChange={(event) => setForm({ ...form, ou_site: event.target.value })}
+                  />
+                </div>
+                <div className="pf-form__group pf-directory__field">
+                  <label htmlFor="directory-ou-environment">{t("hosts.directoryOuEnvironment")}</label>
+                  <input
+                    id="directory-ou-environment"
+                    className="pf-input"
+                    value={form.ou_environment}
+                    placeholder="ou:2"
+                    spellCheck={false}
+                    autoComplete="off"
+                    onChange={(event) => setForm({ ...form, ou_environment: event.target.value })}
+                  />
+                </div>
+                <div className="pf-form__group pf-directory__field">
+                  <label htmlFor="directory-ou-criticality">{t("hosts.directoryOuCriticality")}</label>
+                  <input
+                    id="directory-ou-criticality"
+                    className="pf-input"
+                    value={form.ou_criticality}
+                    placeholder="description"
+                    spellCheck={false}
+                    autoComplete="off"
+                    onChange={(event) => setForm({ ...form, ou_criticality: event.target.value })}
+                  />
+                </div>
+                <p className="pf-form__hint pf-directory__map-hint">{t("hosts.directoryOuMapHint")}</p>
               </div>
             </div>
           </div>

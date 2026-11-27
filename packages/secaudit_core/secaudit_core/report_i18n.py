@@ -6,10 +6,6 @@ Unsupported locales fall back to English.
 
 from __future__ import annotations
 
-SUPPORTED_REPORT_LOCALES = frozenset(
-    {"en", "ru", "zh", "es", "hi", "ar", "bn", "pt", "ja", "fr", "de", "ko"}
-)
-
 DEFAULT_REPORT_LOCALE = "en"
 
 _EN: dict[str, str] = {

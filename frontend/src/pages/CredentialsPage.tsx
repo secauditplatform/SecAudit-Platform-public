@@ -21,6 +21,9 @@ type CredentialForm = {
   key_passphrase: string;
   service_username: string;
   service_secret: string;
+  become_method: string;
+  become_username: string;
+  become_password: string;
   snmp_priv_protocol: string;
   description: string;
 };
@@ -33,9 +36,14 @@ const emptyForm = (): CredentialForm => ({
   key_passphrase: "",
   service_username: "",
   service_secret: "",
+  become_method: "",
+  become_username: "",
+  become_password: "",
   snmp_priv_protocol: "",
   description: "",
 });
+
+const BECOME_METHODS = ["sudo", "doas", "su", "dzdo"] as const;
 
 const SNMP_AUTH_PROTOCOLS = ["MD5", "SHA", "SHA224", "SHA256", "SHA384", "SHA512"] as const;
 const SNMP_PRIV_PROTOCOLS = ["DES", "AES", "AES192", "AES256"] as const;
@@ -147,6 +155,9 @@ export function CredentialsPage() {
       key_passphrase: "",
       service_username: cred.service_username ?? (cred.credential_type === "snmp_v3" ? "SHA256" : ""),
       service_secret: "",
+      become_method: cred.become_method ?? "",
+      become_username: cred.become_username ?? "",
+      become_password: "",
       snmp_priv_protocol: cred.snmp_priv_protocol ?? "",
       description: cred.description ?? "",
     });
@@ -352,6 +363,56 @@ export function CredentialsPage() {
               />
             </div>
           </div>
+          {(form.credential_type === "ssh_password" || form.credential_type === "ssh_key") ? (
+            <>
+              <div className="pf-form__group pf-form__group--divider">
+                <div className="pf-form__hint">{t("credentials.becomeSection")}</div>
+              </div>
+              <div className="pf-form__row">
+                <div className="pf-form__group">
+                  <label htmlFor="cred-become-method">{t("credentials.becomeMethod")}</label>
+                  <select
+                    id="cred-become-method"
+                    className="pf-select"
+                    value={form.become_method}
+                    onChange={(e) => setForm({ ...form, become_method: e.target.value })}
+                  >
+                    <option value="">{t("credentials.becomeNone")}</option>
+                    {BECOME_METHODS.map((method) => (
+                      <option key={method} value={method}>
+                        {method}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="pf-form__group">
+                  <label htmlFor="cred-become-user">{t("credentials.becomeUser")}</label>
+                  <input
+                    id="cred-become-user"
+                    className="pf-input"
+                    value={form.become_username}
+                    onChange={(e) => setForm({ ...form, become_username: e.target.value })}
+                    placeholder="root"
+                    disabled={!form.become_method}
+                  />
+                </div>
+                <div className="pf-form__group">
+                  <label htmlFor="cred-become-secret">{t("credentials.becomeSecret")}</label>
+                  <PasswordInput
+                    id="cred-become-secret"
+                    value={form.become_password}
+                    onChange={(e) => setForm({ ...form, become_password: e.target.value })}
+                    disabled={!form.become_method}
+                    placeholder={
+                      isEditing && editingCredential?.has_become_password
+                        ? t("credentials.keepBecomeSecretEmpty")
+                        : t("common.optional")
+                    }
+                  />
+                </div>
+              </div>
+            </>
+          ) : null}
           </>
           ) : null}
           <div className="pf-form__group">
@@ -386,6 +447,11 @@ export function CredentialsPage() {
                           : {
                               ...(form.service_username ? { service_username: form.service_username } : {}),
                               ...(form.service_secret ? { service_secret: form.service_secret } : {}),
+                              become_method: form.become_method || null,
+                              become_username: form.become_method
+                                ? form.become_username.trim() || null
+                                : null,
+                              ...(form.become_password ? { become_password: form.become_password } : {}),
                             }),
                       },
                     })
@@ -416,6 +482,17 @@ export function CredentialsPage() {
                       : {
                           ...(form.service_username ? { service_username: form.service_username } : {}),
                           ...(form.service_secret ? { service_secret: form.service_secret } : {}),
+                          ...(form.become_method
+                            ? {
+                                become_method: form.become_method,
+                                ...(form.become_username.trim()
+                                  ? { become_username: form.become_username.trim() }
+                                  : {}),
+                                ...(form.become_password
+                                  ? { become_password: form.become_password }
+                                  : {}),
+                              }
+                            : {}),
                         }),
                   })
                 }
@@ -500,27 +577,43 @@ export function CredentialsPage() {
             ) : (
               <>
                 <div className="pf-table-wrap">
-                  <table className="pf-table">
+                  <table className="pf-table pf-credentials-table">
+                    <colgroup>
+                      <col className="pf-credentials-table__name" />
+                      <col className="pf-credentials-table__type" />
+                      <col className="pf-credentials-table__user" />
+                      <col className="pf-credentials-table__service" />
+                      <col className="pf-credentials-table__become" />
+                      <col className="pf-credentials-table__created" />
+                      <col className="pf-credentials-table__probe" />
+                      <col className="pf-credentials-table__actions" />
+                    </colgroup>
                     <thead>
                       <tr>
                         <th>{t("hosts.name")}</th>
                         <th>{t("credentials.type")}</th>
                         <th>{t("credentials.user")}</th>
                         <th>{t("credentials.serviceUser")}</th>
+                        <th>{t("credentials.becomeMethod")}</th>
                         <th>{t("credentials.created")}</th>
+                        <th className="pf-cred-probe-cell">{t("preflight.probeHost")}</th>
                         <th className="pf-table__col-actions">{t("common.actions")}</th>
                       </tr>
                     </thead>
                     <tbody>
                       {visibleCredentials.map((cred) => (
                         <tr key={cred.id} className={editingId === cred.id ? "pf-table__row--selected" : undefined}>
-                          <td>{cred.name}</td>
+                          <td className="pf-credentials-table__clip" title={cred.name}>
+                            {cred.name}
+                          </td>
                           <td>
                             <Badge variant="info" literal>
                               {cred.credential_type}
                             </Badge>
                           </td>
-                          <td>{cred.username || t("common.dash")}</td>
+                          <td className="pf-credentials-table__clip" title={cred.username || undefined}>
+                            {cred.username || t("common.dash")}
+                          </td>
                           <td>
                             {cred.service_username || cred.has_service_secret ? (
                               <span title={cred.has_service_secret ? t("credentials.serviceSecretSet") : undefined}>
@@ -530,17 +623,35 @@ export function CredentialsPage() {
                               t("common.dash")
                             )}
                           </td>
-                          <td>{new Date(cred.created_at).toLocaleString(dateLocale)}</td>
-                          <td className="pf-table__col-actions">
-                            <div className="pf-table__actions">
+                          <td>
+                            {cred.become_method ? (
+                              <span title={cred.has_become_password ? t("credentials.becomeSecretSet") : undefined}>
+                                {cred.become_method}
+                                {cred.become_username ? ` → ${cred.become_username}` : ""}
+                              </span>
+                            ) : (
+                              t("common.dash")
+                            )}
+                          </td>
+                          <td
+                            className="pf-credentials-table__clip"
+                            title={new Date(cred.created_at).toLocaleString(dateLocale)}
+                          >
+                            {new Date(cred.created_at).toLocaleString(dateLocale, {
+                              dateStyle: "short",
+                              timeStyle: "short",
+                            })}
+                          </td>
+                          <td className="pf-cred-probe-cell">
+                            <div className="pf-cred-probe">
                               <select
-                                className="pf-select pf-select--sm"
+                                className="pf-select pf-cred-probe__host"
                                 aria-label={t("preflight.probeHost")}
-                                value={probeHostByCred[cred.id] ?? ""}
-                                onChange={(e) =>
+                                value={probeHostByCred[cred.id] ? String(probeHostByCred[cred.id]) : ""}
+                                onChange={(event) =>
                                   setProbeHostByCred((prev) => ({
                                     ...prev,
-                                    [cred.id]: e.target.value ? Number(e.target.value) : "",
+                                    [cred.id]: event.target.value ? Number(event.target.value) : "",
                                   }))
                                 }
                               >
@@ -556,10 +667,7 @@ export function CredentialsPage() {
                                 className="pf-btn--sm"
                                 onClick={() => {
                                   const hostId = probeHostByCred[cred.id];
-                                  if (!hostId) {
-                                    toast.error(t("preflight.pickHost"));
-                                    return;
-                                  }
+                                  if (!hostId) return;
                                   preflightMutation.mutate({ credentialId: cred.id, hostId });
                                 }}
                                 disabled={preflightMutation.isPending || !probeHostByCred[cred.id]}
@@ -567,6 +675,10 @@ export function CredentialsPage() {
                               >
                                 {t("preflight.checkAccess")}
                               </Button>
+                            </div>
+                          </td>
+                          <td className="pf-table__col-actions">
+                            <div className="pf-table__actions">
                               <Button variant="secondary" className="pf-btn--sm" onClick={() => startEdit(cred)}>
                                 {t("common.edit")}
                               </Button>

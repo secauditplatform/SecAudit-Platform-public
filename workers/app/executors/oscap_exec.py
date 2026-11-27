@@ -9,7 +9,12 @@ import uuid
 from pathlib import Path
 
 import asyncssh
-from secaudit_core.oscap import parse_oval_results_xml, parse_xccdf_results_xml
+from secaudit_core.oscap import (
+    oval_result_to_xccdf_result,
+    parse_oval_results_xml,
+    parse_xccdf_results_xml,
+    parse_xccdf_rule_oval_map,
+)
 from secaudit_core.oval_worker_eval import (
     build_fact_collection_script,
     build_probe_plan,
@@ -21,6 +26,7 @@ from secaudit_core.ssh_connect import build_ssh_connect_kwargs
 from secaudit_core.tracing import start_span
 
 from app.cancel_context import get_cancel_event, raise_if_cancelled
+from app.executors.ssh import wrap_command_with_become
 
 _settings = SecAuditSettings()
 _thread_local = threading.local()
@@ -100,6 +106,9 @@ async def _run_worker_side_oval_async(
     oval_xml: bytes,
     *,
     timeout: int,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
 ) -> tuple[dict[str, str], str]:
     """Collect remote facts over SSH and evaluate a limited OVAL subset on the worker."""
     plan = build_probe_plan(oval_xml)
@@ -111,11 +120,20 @@ async def _run_worker_side_oval_async(
     async with conn.start_sftp_client() as sftp:
         async with sftp.open(remote_path, "w") as remote_file:
             await remote_file.write(script)
-    result = await conn.run(
+    inner_cmd = (
         f"trap 'rm -f {shlex.quote(remote_path)}' EXIT; "
-        f"chmod +x {shlex.quote(remote_path)} && sh {shlex.quote(remote_path)}",
+        f"chmod +x {shlex.quote(remote_path)} && sh {shlex.quote(remote_path)}"
+    )
+    remote_cmd, stdin_data = wrap_command_with_become(
+        inner_cmd,
+        become_method=become_method,
+        become_username=become_username,
+        become_password=become_password,
+    )
+    result = await conn.run(
+        remote_cmd,
         timeout=timeout,
-        stdin=asyncssh.DEVNULL,
+        stdin=stdin_data if stdin_data is not None else asyncssh.DEVNULL,
     )
     combined = (result.stdout or "") + (result.stderr or "")
     facts = parse_fact_collection_output(combined)
@@ -127,6 +145,41 @@ async def _run_worker_side_oval_async(
         f"(defs={len(outcomes)} files={len(plan.files)} packages={len(plan.packages)})\n"
     )
     return outcomes, header + combined
+
+
+async def _run_worker_side_xccdf_async(
+    conn: asyncssh.SSHClientConnection,
+    benchmark_path: Path,
+    oval_xml: bytes,
+    *,
+    timeout: int,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+) -> tuple[dict[str, str], str]:
+    """Worker-side XCCDF via rule→OVAL map when remote oscap is missing."""
+    rule_map = parse_xccdf_rule_oval_map(benchmark_path.read_bytes())
+    if not rule_map:
+        raise OscapNotAvailableError(
+            "OpenSCAP (oscap) is not installed on the target host and the XCCDF "
+            "benchmark has no OVAL check-content-ref mappings for worker-side evaluation."
+        )
+    oval_outcomes, raw = await _run_worker_side_oval_async(
+        conn,
+        oval_xml,
+        timeout=timeout,
+        become_method=become_method,
+        become_username=become_username,
+        become_password=become_password,
+    )
+    xccdf_outcomes: dict[str, str] = {}
+    for rule_id, def_id in rule_map.items():
+        if def_id in oval_outcomes:
+            xccdf_outcomes[rule_id] = oval_result_to_xccdf_result(oval_outcomes[def_id])
+    if not xccdf_outcomes:
+        raise RuntimeError("Worker-side XCCDF evaluation produced no rule results")
+    header = f"[secaudit] worker-side XCCDF via OVAL map (rules={len(xccdf_outcomes)})\n"
+    return xccdf_outcomes, header + raw
 
 
 async def _upload_content(
@@ -175,6 +228,11 @@ async def _run_oscap_eval_async(
     known_hosts_entry: str | None = None,
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+    rule_ids: list[str] | None = None,
+    tailoring_file: Path | None = None,
 ) -> tuple[dict[str, str], str]:
     raise_if_cancelled()
     session_id = uuid.uuid4().hex
@@ -193,32 +251,72 @@ async def _run_oscap_eval_async(
             try:
                 await _ensure_oscap(conn)
             except OscapNotAvailableError:
-                # Worker-side path evaluates OVAL definition ids; only safe for oval mode
-                # (XCCDF scap_rule_id values are rule ids, not definition ids).
-                if mode != "oval":
-                    raise
                 oval_xml = _oval_xml_for_worker_side(benchmark_path, content_files, mode)
                 if oval_xml is None:
                     raise
-                return await _run_worker_side_oval_async(conn, oval_xml, timeout=timeout)
+                if mode == "oval":
+                    return await _run_worker_side_oval_async(
+                        conn,
+                        oval_xml,
+                        timeout=timeout,
+                        become_method=become_method,
+                        become_username=become_username,
+                        become_password=become_password,
+                    )
+                if mode == "xccdf":
+                    return await _run_worker_side_xccdf_async(
+                        conn,
+                        benchmark_path,
+                        oval_xml,
+                        timeout=timeout,
+                        become_method=become_method,
+                        become_username=become_username,
+                        become_password=become_password,
+                    )
+                raise
 
-            await _upload_content(conn, remote_dir, content_files)
+            upload_files = list(content_files)
+            # shortcut: worker-side OVAL/XCCDF fallback ignores tailoring.xml
+            if tailoring_file is not None and mode == "xccdf":
+                upload_files.append(tailoring_file)
+            await _upload_content(conn, remote_dir, upload_files)
 
             subcommand = "oval eval" if mode == "oval" else "xccdf eval"
             profile_arg = ""
-            if mode == "xccdf" and profile_id:
+            tailoring_arg = ""
+            if mode == "xccdf" and tailoring_file is not None:
+                profile_arg = "--profile secaudit_tailored "
+                tailoring_arg = f"--tailoring-file {shlex.quote(tailoring_file.name)} "
+            elif mode == "xccdf" and profile_id:
                 profile_arg = f"--profile {shlex.quote(profile_id)} "
+            select_args = ""
+            clean_ids = [str(rid).strip() for rid in (rule_ids or []) if str(rid).strip()]
+            if clean_ids:
+                if mode == "oval":
+                    select_args = " ".join(f"--id {shlex.quote(rid)}" for rid in clean_ids) + " "
+                else:
+                    select_args = " ".join(f"--rule {shlex.quote(rid)}" for rid in clean_ids) + " "
             eval_cmd = (
                 f"trap 'rm -rf {shlex.quote(remote_dir)}' EXIT; "
                 f"cd {shlex.quote(remote_dir)} && "
-                f"oscap {subcommand} {profile_arg}--results {shlex.quote('results.xml')} "
+                f"oscap {subcommand} {profile_arg}{tailoring_arg}{select_args}--results {shlex.quote('results.xml')} "
                 f"{shlex.quote(benchmark_name)} 2>&1; "
                 f"EVAL_EXIT=$?; "
                 f"if [ -f results.xml ]; then cat results.xml; fi; "
                 f"exit $EVAL_EXIT"
             )
+            remote_cmd, stdin_data = wrap_command_with_become(
+                eval_cmd,
+                become_method=become_method,
+                become_username=become_username,
+                become_password=become_password,
+            )
             raise_if_cancelled()
-            result = await conn.run(eval_cmd, timeout=timeout, stdin=asyncssh.DEVNULL)
+            result = await conn.run(
+                remote_cmd,
+                timeout=timeout,
+                stdin=stdin_data if stdin_data is not None else asyncssh.DEVNULL,
+            )
             raise_if_cancelled()
             combined = (result.stdout or "") + (result.stderr or "")
 
@@ -262,11 +360,17 @@ def run_oscap_eval_over_ssh(
     known_hosts_entry: str | None = None,
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+    rule_ids: list[str] | None = None,
+    tailoring_file: Path | None = None,
 ) -> tuple[dict[str, str], str]:
     """Evaluate an XCCDF benchmark (or SCAP data-stream) on a remote host via ``oscap``.
 
     ``content_files`` may include referenced OVAL/CPE files; all are uploaded together so
     ``oscap`` can resolve ``check-content-ref`` hrefs. Defaults to just the benchmark.
+    Optional ``rule_ids`` maps to repeated ``oscap xccdf eval --rule`` flags.
     """
     if not benchmark_path.is_file():
         raise FileNotFoundError(f"SCAP benchmark not found: {benchmark_path}")
@@ -299,6 +403,11 @@ def run_oscap_eval_over_ssh(
                 known_hosts_entry=known_hosts_entry,
                 cancel_event=cancel_event,
                 key_passphrase=key_passphrase,
+                become_method=become_method,
+                become_username=become_username,
+                become_password=become_password,
+                rule_ids=rule_ids,
+                tailoring_file=tailoring_file,
             )
         )
 
@@ -315,6 +424,10 @@ def run_oval_eval_over_ssh(
     known_hosts_entry: str | None = None,
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+    rule_ids: list[str] | None = None,
 ) -> tuple[dict[str, str], str]:
     """Evaluate a standalone OVAL definitions file on a remote host via ``oscap oval eval``."""
     if not oval_path.is_file():
@@ -343,6 +456,10 @@ def run_oval_eval_over_ssh(
                 known_hosts_entry=known_hosts_entry,
                 cancel_event=cancel_event,
                 key_passphrase=key_passphrase,
+                become_method=become_method,
+                become_username=become_username,
+                become_password=become_password,
+                rule_ids=rule_ids,
             )
         )
 

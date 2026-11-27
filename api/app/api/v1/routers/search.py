@@ -9,7 +9,7 @@ from app.core.roles import require_operate
 from app.core.database import get_db
 from app.models import Host, Job, JobRun, JobScope, Profile, RemediationJob
 from app.schemas import SearchResponse, SearchResultItem
-from app.services.object_rbac import apply_owner_scope
+from app.services.object_rbac import apply_host_scope, apply_job_scope, apply_owner_scope
 
 router = APIRouter()
 
@@ -91,7 +91,7 @@ async def global_search(
         .order_by(Host.name.asc())
         .limit(per_type)
     )
-    host_stmt = apply_owner_scope(host_stmt, Host.owner_sub, user)
+    host_stmt = apply_host_scope(apply_owner_scope(host_stmt, Host.owner_sub, user), user)
     host_rows = (await db.execute(host_stmt)).scalars().all()
     for host in host_rows:
         items.append(
@@ -106,7 +106,7 @@ async def global_search(
         )
 
     job_stmt = select(Job).where(Job.name.ilike(pattern)).order_by(Job.name.asc()).limit(per_type)
-    job_stmt = apply_owner_scope(job_stmt, Job.owner_sub, user)
+    job_stmt = apply_job_scope(apply_owner_scope(job_stmt, Job.owner_sub, user), user)
     job_rows = (await db.execute(job_stmt)).scalars().all()
     for job in job_rows:
         items.append(
@@ -130,7 +130,7 @@ async def global_search(
         .order_by(JobRun.id.desc())
         .limit(per_type)
     )
-    run_stmt = apply_owner_scope(run_stmt, Job.owner_sub, user)
+    run_stmt = apply_job_scope(apply_owner_scope(run_stmt, Job.owner_sub, user), user)
     run_rows = (await db.execute(run_stmt)).all()
     for job_run, job in run_rows:
         status_value = job_run.status.value if hasattr(job_run.status, "value") else str(job_run.status)

@@ -1,7 +1,26 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { api, type Host, type HostCriticality, type InventoryScan } from "../api/client";
+import { api, type Host, type HostCriticality, type InventoryScan, type NetworkVendor } from "../api/client";
+
+const NETWORK_VENDORS: NetworkVendor[] = [
+  "cisco_ios",
+  "cisco_nxos",
+  "cisco_asa",
+  "juniper_junos",
+  "arista_eos",
+  "huawei",
+  "h3c",
+  "fortinet",
+  "palo_alto",
+  "check_point",
+  "eltex",
+  "mikrotik",
+  "usergate",
+  "continent",
+  "qtech",
+  "generic",
+];
 import { HostCredentialPopover } from "../components/HostCredentialPopover";
 import { DirectoryDiscoveryPanel } from "../components/DirectoryDiscoveryPanel";
 import { HostCsvImportPanel } from "../components/HostCsvImportPanel";
@@ -341,6 +360,8 @@ export function HostsPage() {
     site: "",
     environment: "",
     criticality: "" as HostCriticality | "",
+    network_vendor: "" as NetworkVendor | "",
+    os_family: "",
     credential_id: "" as number | "",
     is_active: true,
     tags: "",
@@ -457,6 +478,8 @@ export function HostsPage() {
         site: host.site ?? "",
         environment: host.environment ?? "",
         criticality: host.criticality ?? "",
+        network_vendor: host.network_vendor ?? "",
+        os_family: host.os_family ?? "",
         credential_id: host.credential_id ?? "",
         is_active: host.is_active,
         tags: (host.tags ?? []).join(", "),
@@ -1111,6 +1134,29 @@ export function HostsPage() {
                 <option value="network">{t("hosts.osNetwork")}</option>
               </select>
             </div>
+            {form.os_type === "network" ? (
+              <div className="pf-form__group">
+                <label htmlFor="host-network-vendor">{t("hosts.networkVendor")}</label>
+                <select
+                  id="host-network-vendor"
+                  className="pf-select"
+                  value={form.network_vendor}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      network_vendor: e.target.value as NetworkVendor | "",
+                    })
+                  }
+                >
+                  <option value="">{t("common.dash")}</option>
+                  {NETWORK_VENDORS.map((vendor) => (
+                    <option key={vendor} value={vendor}>
+                      {vendor}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : null}
             <div className="pf-form__group">
               <label htmlFor="host-site">{t("hosts.site")}</label>
               <input
@@ -1226,6 +1272,8 @@ export function HostsPage() {
                         site: form.site.trim() || null,
                         environment: form.environment.trim() || null,
                         criticality: form.criticality || null,
+                        network_vendor: form.os_type === "network" ? form.network_vendor || null : null,
+                        os_family: form.os_type === "network" ? form.os_family.trim() || null : null,
                         credential_id: form.credential_id === "" ? null : form.credential_id,
                         is_active: form.is_active,
                       },
@@ -1252,6 +1300,8 @@ export function HostsPage() {
                       site: form.site.trim() || null,
                       environment: form.environment.trim() || null,
                       criticality: form.criticality || null,
+                      network_vendor: form.os_type === "network" ? form.network_vendor || null : null,
+                      os_family: form.os_type === "network" ? form.os_family.trim() || null : null,
                       credential_id: form.credential_id === "" ? undefined : form.credential_id,
                       is_active: true,
                     },

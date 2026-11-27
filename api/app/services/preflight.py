@@ -13,17 +13,68 @@ from sqlalchemy.orm import selectinload
 
 from app.core.blocking import run_blocking
 from app.core.config import settings
-from app.models import Host, Profile, ProfileVersion
+from app.models import Host, InventoryScanResult, Profile, ProfileVersion
+from secaudit_core.audit_map import parse_open_ports
 from secaudit_core.celery_dispatch import send_task
 from secaudit_core.celery_redis import create_celery_app
-from secaudit_core.preflight import platforms_compatible, profile_platform
+from secaudit_core.preflight import profile_fit, profile_platform
 from secaudit_core.profile_packages import count_profile_rules_metadata
 
 
+_results_app = None
+
+
+def celery_results_app():
+    """One Celery app for preflight result reads. send_task already caches its own client."""
+    global _results_app
+    if _results_app is None:
+        _results_app = create_celery_app("secaudit-preflight-wait", settings)
+    return _results_app
+
+
 def _wait_preflight_result(task_id: str, *, timeout: float = 25.0) -> dict:
-    app = create_celery_app("secaudit-preflight-wait", settings)
-    async_result = AsyncResult(task_id, app=app)
+    async_result = AsyncResult(task_id, app=celery_results_app())
     return async_result.get(timeout=timeout)
+
+
+def enqueue_job_preflight(job_id: int) -> str:
+    return send_task(
+        "app.tasks.preflight.probe_job",
+        args=[job_id],
+        broker_url=settings.celery_broker_url,
+        queue="inventory",
+    )
+
+
+def read_job_preflight(task_id: str) -> dict:
+    result = AsyncResult(task_id, app=celery_results_app())
+    state = result.state
+    if state == "SUCCESS":
+        payload = result.result if isinstance(result.result, dict) else {}
+        return {
+            "task_id": task_id,
+            "status": "ready",
+            "error": payload.get("error"),
+            "probes": payload.get("probes") or [],
+            "applicability": payload.get("applicability"),
+        }
+    if state in {"FAILURE", "REVOKED"}:
+        detail = result.result
+        message = str(getattr(detail, "message", detail) or state)[:500]
+        return {
+            "task_id": task_id,
+            "status": "failed",
+            "error": message,
+            "probes": [],
+            "applicability": None,
+        }
+    return {
+        "task_id": task_id,
+        "status": "pending",
+        "error": None,
+        "probes": [],
+        "applicability": None,
+    }
 
 
 async def dispatch_host_probe(host_id: int, credential_id: int | None = None) -> dict:
@@ -88,19 +139,32 @@ async def profile_applicability(
         rows = await db.execute(select(Host).where(Host.id.in_(host_ids), Host.is_ephemeral.is_(False)))
         hosts = list(rows.scalars().all())
 
+    slug = getattr(profile.category, "slug", None) if profile.category else None
+    ports = await _latest_open_ports(db, [host.id for host in hosts]) if (slug or "").lower() == "services" else {}
+
     host_rows = []
     applicable = 0
     for host in hosts:
-        ok = platforms_compatible(host.os_type, plat)
-        if ok:
+        verdict = profile_fit(
+            host_os_type=host.os_type,
+            host_os_family=host.os_family,
+            host_os_version=host.os_version,
+            profile_os_name=profile.os_name,
+            profile_os_version=profile.os_version,
+            profile_name=profile.profile_name,
+            profile_plat=plat,
+            category_slug=slug,
+            open_ports=ports.get(host.id),
+        )
+        if verdict == "match":
             applicable += 1
         host_rows.append(
             {
                 "host_id": host.id,
                 "host_name": host.name or host.hostname,
                 "os_type": host.os_type,
-                "applicable": ok,
-                "reason": None if ok else "os_mismatch",
+                "applicable": verdict == "match",
+                "reason": verdict,
             }
         )
 
@@ -115,3 +179,19 @@ async def profile_applicability(
         "hosts_inapplicable": total - applicable,
         "hosts": host_rows,
     }
+
+
+async def _latest_open_ports(db: AsyncSession, host_ids: list[int]) -> dict[int, list[int]]:
+    if not host_ids:
+        return {}
+    rows = await db.execute(
+        select(InventoryScanResult.host_id, InventoryScanResult.open_ports)
+        .where(InventoryScanResult.host_id.in_(host_ids))
+        .distinct(InventoryScanResult.host_id)
+        .order_by(
+            InventoryScanResult.host_id,
+            InventoryScanResult.created_at.desc(),
+            InventoryScanResult.id.desc(),
+        )
+    )
+    return {host_id: parse_open_ports(raw) for host_id, raw in rows if host_id is not None}

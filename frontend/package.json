@@ -1,7 +1,7 @@
 {
   "name": "secaudit-frontend",
   "private": true,
-  "version": "1.9.0",
+  "version": "2.0.0",
   "license": "FSL-1.1-ALv2",
   "author": "secauditplatform@proton.me",
   "type": "module",

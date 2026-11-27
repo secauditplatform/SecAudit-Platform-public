@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from urllib.parse import urlparse
 
 
@@ -49,8 +48,3 @@ def celery_transport_options(
     if sentinel_password:
         options["sentinel_kwargs"] = {"password": sentinel_password}
     return options
-
-
-@lru_cache
-def transport_options_cache_key(master_name: str, sentinel_password: str | None) -> str:
-    return f"{master_name}|{sentinel_password or ''}"

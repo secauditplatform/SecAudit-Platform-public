@@ -15,11 +15,14 @@ from typing import TypedDict
 MAX_CIDR_PREFIX_LEN = 20
 # Absolute floor even for admins — /8 would be ~16M hosts and is never allowed.
 MIN_CIDR_PREFIX_LEN_ABSOLUTE = 8
+# IPv6: only tight prefixes (/120 ≈ 256 addresses … /128 = one host).
+MIN_IPV6_PREFIX_LEN = 120
 # A hostname is one target, not a subnet. More addresses than an AuditFlow
 # target list would let one name stand in for a v4 prefix.
 MAX_HOSTNAME_ADDRESSES = 16
 IPV6_PREFIX_ERROR = (
-    "IPv6 prefixes are not supported. Enter one IPv6 address or a hostname."
+    f"IPv6 network too large; use /{MIN_IPV6_PREFIX_LEN}–/128 "
+    "(or one IPv6 address / hostname)"
 )
 
 # Phase 2 uses nmap -F (fast scan): top 100 TCP ports per nmap's frequency ranking,
@@ -122,6 +125,12 @@ def _validate_ipv4_network_prefix(
         )
 
 
+def _validate_ipv6_network_prefix(net: ipaddress.IPv6Network) -> None:
+    """Allow only /120–/128 so discovery cannot explode into a /64."""
+    if net.prefixlen < MIN_IPV6_PREFIX_LEN or net.prefixlen > 128:
+        raise ValueError(IPV6_PREFIX_ERROR)
+
+
 def validate_scan_target(target: str, *, max_prefix_len: int | None = None) -> str:
     cleaned = target.strip()
     if not cleaned or len(cleaned) > 256:
@@ -135,9 +144,8 @@ def validate_scan_target(target: str, *, max_prefix_len: int | None = None) -> s
         except ValueError as exc:
             raise ValueError("Invalid CIDR notation") from exc
         if isinstance(net, ipaddress.IPv6Network):
-            # A /64 is not another /24. Reject it before nmap starts.
-            raise ValueError(IPV6_PREFIX_ERROR)
-        if isinstance(net, ipaddress.IPv4Network):
+            _validate_ipv6_network_prefix(net)
+        elif isinstance(net, ipaddress.IPv4Network):
             _validate_ipv4_network_prefix(net, max_prefix_len=prefix_limit)
         _assert_network_not_blocked(net)
         return str(net)
@@ -194,7 +202,7 @@ def _assert_nmap_range_not_blocked(target: str) -> None:
 
 
 def expand_scan_target(target: str) -> list[str] | None:
-    """Expand a single IP or IPv4 CIDR. None means nmap must interpret the target."""
+    """Expand a single IP or tight CIDR. None means nmap must interpret the target."""
     cleaned = target.strip()
     if "/" in cleaned:
         try:
@@ -202,7 +210,8 @@ def expand_scan_target(target: str) -> list[str] | None:
         except ValueError:
             return None
         if isinstance(net, ipaddress.IPv6Network):
-            raise ValueError(IPV6_PREFIX_ERROR)
+            _validate_ipv6_network_prefix(net)
+            return [str(ip) for ip in net]
         if isinstance(net, ipaddress.IPv4Network):
             return [str(ip) for ip in net.hosts()]
         return None
@@ -391,10 +400,11 @@ def nmap_calls_for_target(target: str) -> list[tuple[list[str], list[str]]]:
     """Split one scan target into nmap invocations.
 
     Each item is ``(extra_flags, targets)``. IPv4 and IPv6 cannot share one
-    nmap process. A single IPv6 address is passed with ``-6``. A hostname that
-    resolves to AAAA is passed as those addresses, not left as an unparsed
-    name. An IPv6 prefix is rejected. A name that resolves to more addresses
-    than the target-list ceiling is rejected so it cannot stand in for a v4 subnet.
+    nmap process. A single IPv6 address or allowed IPv6 CIDR (``/120``–``/128``)
+    is passed with ``-6``. A hostname that resolves to AAAA is passed as those
+    addresses, not left as an unparsed name. A name that resolves to more
+    addresses than the target-list ceiling is rejected so it cannot stand in
+    for a v4 subnet.
     """
     cleaned = target.strip()
     if "/" in cleaned or NMAP_RANGE_PATTERN.fullmatch(cleaned):
@@ -404,7 +414,8 @@ def nmap_calls_for_target(target: str) -> list[tuple[list[str], list[str]]]:
             except ValueError:
                 return [([], [cleaned])]
             if isinstance(net, ipaddress.IPv6Network):
-                raise ValueError(IPV6_PREFIX_ERROR)
+                _validate_ipv6_network_prefix(net)
+                return [(["-6"], [str(net)])]
             return [([], [str(net)])]
         return [([], [cleaned])]
     try:

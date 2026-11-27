@@ -73,7 +73,7 @@ export function ReportsPage() {
   const [checkSeverityFilter, setCheckSeverityFilter] = useState("all");
   const [checkMessageFilter, setCheckMessageFilter] = useState("");
   const [downloadError, setDownloadError] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState<"html" | "pdf" | "csv" | "pack" | null>(null);
+  const [downloading, setDownloading] = useState<"html" | "pdf" | "csv" | "sarif" | "xlsx" | "pack" | null>(null);
   const [compareBaselineRunId, setCompareBaselineRunId] = useState<number | null>(null);
   const [driftChangeFilter, setDriftChangeFilter] = useState("all");
   const [driftHostFilter, setDriftHostFilter] = useState("all");
@@ -95,11 +95,6 @@ export function ReportsPage() {
     refetchInterval: 15000,
   });
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs() });
-  const hosts = useQuery({
-    queryKey: ["hosts", "reports-labels"],
-    queryFn: () => api.hosts({ offset: 0, limit: 500 }),
-  });
-
   const jobNameById = useMemo(() => {
     const map = new Map<number, string>();
     jobs.data?.forEach((j) => map.set(j.id, j.name));
@@ -136,6 +131,16 @@ export function ReportsPage() {
     enabled: activeRunId !== null,
   });
 
+  const resultHostIds = useMemo(
+    () => [...new Set(detail.data?.check_results?.map((row) => row.host_id) ?? [])].sort((a, b) => a - b),
+    [detail.data],
+  );
+  const hosts = useQuery({
+    queryKey: ["hosts", "reports-labels", resultHostIds],
+    queryFn: () => api.hosts({ ids: resultHostIds }),
+    enabled: resultHostIds.length > 0,
+  });
+
   const hostLabelById = useMemo(() => {
     const map = new Map<number, string>();
     hosts.data?.items?.forEach((host) => {
@@ -170,7 +175,7 @@ export function ReportsPage() {
     deleteRunMutation.mutate(run.id);
   };
 
-  const handleDownload = async (format: "html" | "pdf" | "csv" | "pack") => {
+  const handleDownload = async (format: "html" | "pdf" | "csv" | "sarif" | "xlsx" | "pack") => {
     if (activeRunId == null) return;
     setDownloadError(null);
     setDownloading(format);
@@ -182,12 +187,15 @@ export function ReportsPage() {
       } else if (format === "pack") {
         await api.downloadReportPack(activeRunId, locale);
       } else {
-        await api.downloadReportCsv(activeRunId, {
+        const filters = {
           status: checkStatusFilter !== "all" ? checkStatusFilter : undefined,
           severity: checkSeverityFilter !== "all" ? checkSeverityFilter : undefined,
           host_id: checkHostFilter !== "all" ? checkHostFilter : undefined,
           rule: checkRuleFilter.trim() || undefined,
-        });
+        };
+        if (format === "sarif") await api.downloadReportSarif(activeRunId, filters);
+        else if (format === "xlsx") await api.downloadReportXlsx(activeRunId, filters);
+        else await api.downloadReportCsv(activeRunId, filters);
       }
     } catch (err) {
       setDownloadError(err instanceof Error ? err.message : t("reports.downloadError"));
@@ -508,13 +516,19 @@ export function ReportsPage() {
                   {downloading === "html" ? t("reports.downloading") : t("reports.downloadHtml")}
                 </Button>
                 <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("pdf")} disabled={downloading !== null}>
-                  {downloading === "pdf" ? t("reports.downloading") : t("reports.downloadPdf")}
+                  {downloading === "pdf" ? t("reports.downloading") : t("reports.downloadExecutivePdf")}
                 </Button>
                 <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("csv")} disabled={downloading !== null}>
                   {downloading === "csv" ? t("reports.downloading") : t("reports.downloadCsv")}
                 </Button>
+                <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("sarif")} disabled={downloading !== null}>
+                  {downloading === "sarif" ? t("reports.downloading") : t("reports.downloadSarif")}
+                </Button>
+                <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("xlsx")} disabled={downloading !== null}>
+                  {downloading === "xlsx" ? t("reports.downloading") : t("reports.downloadXlsx")}
+                </Button>
                 <Button variant="secondary" className="pf-btn--sm" onClick={() => handleDownload("pack")} disabled={downloading !== null}>
-                  {downloading === "pack" ? t("reports.downloading") : t("reports.downloadPack")}
+                  {downloading === "pack" ? t("reports.packBuilding") : t("reports.downloadPack")}
                 </Button>
                 {canOperate && selectedRun?.status === "completed" && !selectedRun.is_partial && (
                   <Button

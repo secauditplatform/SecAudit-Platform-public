@@ -96,6 +96,7 @@ def _attach_snapshot_credentials(db, run_id: int, snapshots: list) -> None:
                     str(item["service_username"])[:128] if item.get("service_username") else None
                 ),
                 encrypted_service_secret=item.get("encrypted_service_secret"),
+                skip_become=bool(item.get("skip_become")),
             )
         )
 

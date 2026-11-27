@@ -14,7 +14,6 @@ from secaudit_core.network_scope import (
     assert_scope_matches_profile,
     assert_standard_hosts,
     default_network_check_mode,
-    profile_is_network,
 )
 
 
@@ -62,8 +61,3 @@ async def validate_job_scope(
     if network_check_mode is not None:
         raise HTTPException(status_code=400, detail="network_check_mode applies only to network jobs")
     return None
-
-
-def profile_allowed_for_scope(profile: Profile, scope: JobScope) -> bool:
-    is_network = profile_is_network(profile)
-    return is_network if scope == JobScope.NETWORK else not is_network

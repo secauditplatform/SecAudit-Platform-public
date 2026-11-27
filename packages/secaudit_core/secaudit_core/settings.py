@@ -7,7 +7,7 @@ class SecAuditSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
-    app_version: str = "1.9.0"
+    app_version: str = "2.0.0"
     secret_key: str = "dev-secret-key"
 
     # Data-at-rest encryption backend: fernet (dev), vault (Transit), aws_kms (BYO-KMS).
@@ -66,6 +66,8 @@ class SecAuditSettings(BaseSettings):
     host_lock_wait_seconds: float | None = None
     job_host_concurrency: int = 4
     job_host_concurrency_max: int = 16
+    # Split large JobRuns into Celery chord shards when host count exceeds this.
+    job_host_shard_size: int = 64
     # Wall-clock budget per host when sizing soft time limit for a JobRun.
     job_host_time_budget_seconds: int = 180
     # Hard wall-clock for one ansible-playbook child (kills hung SSH/process tree).
@@ -75,10 +77,22 @@ class SecAuditSettings(BaseSettings):
     job_log_ttl_seconds: int = 86400
     # Purge terminal JobRuns older than N days (0 = disabled). Protects baselines / waiver jobs.
     job_run_retention_days: int = 0
+    # Null check_results.raw_output older than N days (0 = keep). Not a monthly partition:
+    # see archive_check_raw_output.
+    check_result_raw_retention_days: int = 0
+    # Default computer cap for a directory import when the source has no import_limit.
+    directory_max_computers: int = 5000
     raw_output_max_chars: int = 16000
 
     profiles_path: str = "/profiles"
     profiles_storage_path: str = "/data/profiles"
+    # Under profiles volume so lab/prod mounts stay writable without a separate reports volume.
+    report_artifacts_path: str = "/data/profiles/reports"
+    remediation_backups_path: str = "/data/profiles/remediation_backups"
+    remediation_require_ticket_envs: str = "prod"
+    remediation_backup_max_bytes: int = 2 * 1024 * 1024
+    evidence_signing_key_path: str = "/data/profiles/reports/evidence_ed25519.pem"
+    report_pack_async_threshold: int = 2000
     profiles_auto_seed: bool = False
     profiles_catalog_sync_enabled: bool = False
     profiles_catalog_sync_interval_seconds: int = 3600
@@ -108,6 +122,8 @@ class SecAuditSettings(BaseSettings):
 
     scheduled_reports_enabled: bool = True
     object_rbac_enabled: bool = True
+    # When true, nobody can approve a waiver they requested, including an admin.
+    waiver_strict_four_eyes: bool = False
     # AAG (AI Audit Generation): advisory-only contour, off by default.
     # Task screens never write check results; provider is perimeter-local or external API.
     ai_enabled: bool = False
@@ -116,6 +132,8 @@ class SecAuditSettings(BaseSettings):
     ai_external_base_url: str | None = None
     ai_model: str | None = None
     ai_timeout_seconds: int = 120 * 60
+    # Abort an AAG stream when the provider sends no tokens for this long.
+    ai_idle_read_timeout_seconds: int = 90
     ai_max_tokens: int = 2000
     ai_retry_on_network_error: bool = True
     s3_endpoint_url: str | None = None

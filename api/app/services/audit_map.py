@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from fastapi import HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, selectinload
 
@@ -162,8 +162,65 @@ async def build_audit_map(
         )
         manual = [{"id": row.id, "host_id": row.host_id, "port": row.port} for row in service_rows.scalars()]
 
+        # Latest terminal run per host, per (host, executor), and per (host, profile).
+        # Rollup only needs those slices, so older runs stay in the database.
         job_profile = aliased(Profile)
         playbook_profile = aliased(Profile)
+        def latest_order():
+            # Fresh clauses: one case()/desc() cannot be attached to three OVER windows.
+            return (
+                case((JobRun.finished_at.is_(None), 1), else_=0),
+                JobRun.finished_at.desc(),
+                JobRun.id.desc(),
+            )
+
+        def profile_id_expr():
+            return func.coalesce(Job.profile_id, Playbook.profile_id)
+
+        ranked = (
+            select(
+                CheckResult.host_id.label("host_id"),
+                CheckResult.job_run_id.label("job_run_id"),
+                func.row_number()
+                .over(partition_by=CheckResult.host_id, order_by=latest_order())
+                .label("rn_host"),
+                func.row_number()
+                .over(
+                    partition_by=(CheckResult.host_id, Job.execution_type),
+                    order_by=latest_order(),
+                )
+                .label("rn_exec"),
+                func.row_number()
+                .over(
+                    partition_by=(CheckResult.host_id, profile_id_expr()),
+                    order_by=latest_order(),
+                )
+                .label("rn_profile"),
+                profile_id_expr().label("profile_id"),
+            )
+            .join(JobRun, JobRun.id == CheckResult.job_run_id)
+            .join(Job, Job.id == JobRun.job_id)
+            .outerjoin(Playbook, Playbook.id == Job.playbook_id)
+            .where(
+                CheckResult.host_id.in_(host_ids),
+                JobRun.status.in_([JobStatus.COMPLETED, JobStatus.FAILED]),
+            )
+        )
+        if profile_id is not None:
+            ranked = ranked.where(or_(Job.profile_id == profile_id, Playbook.profile_id == profile_id))
+        ranked_sq = ranked.subquery()
+        winners = (
+            select(ranked_sq.c.host_id, ranked_sq.c.job_run_id)
+            .where(
+                or_(
+                    ranked_sq.c.rn_host == 1,
+                    ranked_sq.c.rn_exec == 1,
+                    and_(ranked_sq.c.profile_id.is_not(None), ranked_sq.c.rn_profile == 1),
+                )
+            )
+            .distinct()
+            .subquery()
+        )
         check_stmt = (
             select(
                 CheckResult.host_id,
@@ -182,15 +239,15 @@ async def build_audit_map(
             .outerjoin(Playbook, Playbook.id == Job.playbook_id)
             .outerjoin(job_profile, job_profile.id == Job.profile_id)
             .outerjoin(playbook_profile, playbook_profile.id == Playbook.profile_id)
-            .where(
-                CheckResult.host_id.in_(host_ids),
-                JobRun.status.in_([JobStatus.COMPLETED, JobStatus.FAILED]),
+            .join(
+                winners,
+                and_(
+                    winners.c.host_id == CheckResult.host_id,
+                    winners.c.job_run_id == CheckResult.job_run_id,
+                ),
             )
+            .where(CheckResult.host_id.in_(host_ids))
         )
-        if profile_id is not None:
-            check_stmt = check_stmt.where(
-                or_(Job.profile_id == profile_id, Playbook.profile_id == profile_id)
-            )
         check_result = await db.execute(check_stmt)
         for (
             host_id,

@@ -1,4 +1,3 @@
-import re
 import shutil
 import tarfile
 import tempfile
@@ -7,13 +6,10 @@ from pathlib import Path, PurePosixPath
 
 from secaudit_core.interpreter import apply_interpreter_rules as apply_interpreter_rules
 from secaudit_core.profile_packages import (
-    EXCLUDED_SCRIPT_MARKERS,
     REMEDIATION_SCRIPT_MARKER,
-    SCRIPT_EXTENSIONS,
     _find_profile_file,
     discover_check_scripts,
     discover_remediation_scripts,
-    execution_type_for_extension,
     infer_category_from_package_dir,
     infer_category_slug,
     load_profile_package,
@@ -28,28 +24,8 @@ from secaudit_core.profile_packages import (
     validate_profile_package,
 )
 
-from app.models import CheckStatus, ExecutionType
-
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_FILES = 500
-
-
-def parse_check_line(line: str) -> tuple[str | None, CheckStatus | None, str | None]:
-    """Parse output line like: RULE1= PASS: description"""
-    match = re.match(
-        r"^(?:RULE|REQ)\d+\s*=\s*(PASS|FAIL|SKIP|ERROR)\s*:\s*(.*)$",
-        line.strip(),
-        re.IGNORECASE,
-    )
-    if not match:
-        return None, None, None
-    status_map = {
-        "PASS": CheckStatus.PASS,
-        "FAIL": CheckStatus.FAIL,
-        "SKIP": CheckStatus.SKIP,
-        "ERROR": CheckStatus.ERROR,
-    }
-    return None, status_map.get(match.group(1).upper()), match.group(2).strip()
 
 
 def _safe_extract_zip(archive: zipfile.ZipFile, dest: Path) -> None:
@@ -157,7 +133,3 @@ def materialize_uploaded_package(
     for filename, content in uploads:
         _write_upload_file(flat_root, filename, content)
     return flat_root, temp_dir
-
-
-# Compatibility alias
-package_charset_hint = package_encoding_hint

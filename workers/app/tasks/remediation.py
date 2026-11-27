@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,45 +10,44 @@ from sqlalchemy.orm import Session
 from app.celery_app import celery_app, settings
 from app.tasks.compliance import SessionLocal, _credential_secret, _primary_credential
 from secaudit_core.credential_auth import ssh_auth_from_credential
-from secaudit_core.host_credentials import linked_credentials
 from secaudit_core.beat_lock import acquire_beat_lock, release_beat_lock
 from secaudit_core.celery_reliability import TASK_RETRY_KWARGS
 from secaudit_core.package_paths import resolve_script_under_package
+from secaudit_core.profile_packages import rule_identity_keys
+from secaudit_core.script_subset import materialize_subset_script, normalize_allowed_ids
 from secaudit_core.transient import reraise_if_transient
 from secaudit_core.models import (
     CheckResult,
     CheckScript,
     CheckStatus,
-    CredentialType,
     ExecutionType,
     Host,
     Job,
     JobRun,
     JobStatus,
+    MaintenanceWindow,
     NetworkRemediationConfig,
     RemediationJob,
     RemediationResult,
     RemediationRun,
+    Rule,
     ScriptKind,
     Profile,
 )
+from secaudit_core.maintenance_windows import remediation_blocked_by_windows
+from secaudit_core.remediation_backup import ticket_envs
 from secaudit_core.job_run_subset import classify_host_outcomes, resolve_subset_host_ids
-from secaudit_core.enums import JobScope, NetworkVendor
+from secaudit_core.enums import JobScope
+from secaudit_core.network_vendor_registry import resolve_host_vendor
 from secaudit_core.network_config import generate_remediation_config
-from secaudit_core.network_scope import host_is_network
-from app.executors.ansible_exec import run_playbook
-from app.executors.python_exec import (
-    run_script_locally_with_resource_env,
-    run_script_over_ssh as run_python_over_ssh,
-)
-from app.executors.ssh import run_package_script_over_ssh, run_script_over_ssh
-from app.executors.winrm_exec import run_script_over_winrm
 from app.host_lock_guard import hold_host_lock, host_tcp_ready, wrap_process_host
 from app.host_parallel import run_hosts_parallel
 from app.logging_pub import publish_remediation_log
 from app.notify import emit_run_notification
 from secaudit_core.hosts import load_active_hosts, resolve_remediation_host_ids
 from secaudit_core.run_state import claim_pending_run, current_run_status, transition_running_run
+from secaudit_core.interpreter import parse_jsonl_remediation_lines
+from secaudit_core.profile_packages import package_supports_check_mode
 from secaudit_core.result_upsert import upsert_remediation_result
 from secaudit_core.script_selection import select_active_scripts
 from secaudit_core.task_outbox import enqueue_outbox_row
@@ -133,11 +133,88 @@ def _is_run_cancelled(db: Session, remediation_run_id: int) -> bool:
     )
 
 
-def _remediate_rules_env(rule_tech_names: list[str] | None) -> dict[str, str] | None:
+def _remediation_extra_env(
+    rule_tech_names: list[str] | None,
+    *,
+    check_mode: bool = False,
+) -> dict[str, str] | None:
+    env: dict[str, str] = {}
+    rules = [str(name).strip() for name in (rule_tech_names or []) if str(name).strip()]
+    if rules:
+        env["SECAUDIT_REMEDIATE_RULES"] = ",".join(rules)
+    if check_mode:
+        env["SECAUDIT_CHECK_MODE"] = "1"
+    return env or None
+
+
+def _remediation_ansible_tags(
+    db: Session,
+    profile_id: int | None,
+    rule_tech_names: list[str] | None,
+) -> list[str] | None:
+    """Tags for ansible --tags: tech_name plus matching scap_rule_id when present."""
     rules = [str(name).strip() for name in (rule_tech_names or []) if str(name).strip()]
     if not rules:
         return None
-    return {"SECAUDIT_REMEDIATE_RULES": ",".join(rules)}
+    tags = list(rules)
+    if profile_id is None:
+        return tags
+    db_rules = db.execute(select(Rule).where(Rule.profile_id == profile_id)).scalars().all()
+    expanded = normalize_allowed_ids(rules) or set(rules)
+    for rule in db_rules:
+        if not rule.scap_rule_id:
+            continue
+        if rule.tech_name in expanded or any(
+            key in expanded for key in rule_identity_keys(rule.tech_name or "")
+        ):
+            sid = str(rule.scap_rule_id).strip()
+            if sid and sid not in tags:
+                tags.append(sid)
+    return tags
+
+
+def _store_remediation_script_results(
+    db: Session,
+    *,
+    remediation_run_id: int,
+    host_id: int,
+    script_name: str,
+    output: str,
+    raw_limit: int,
+    rule_tech_names: list[str] | None,
+) -> int:
+    """Persist per-rule JSONL rows when present; otherwise one script-level row."""
+    parsed = parse_jsonl_remediation_lines(output)
+    if rule_tech_names:
+        allowed = {str(name).strip() for name in rule_tech_names if str(name).strip()}
+        if allowed:
+            parsed = [item for item in parsed if item["tech_name"] in allowed]
+    raw = output[:raw_limit]
+    if parsed:
+        for item in parsed:
+            upsert_remediation_result(
+                db,
+                remediation_run_id=remediation_run_id,
+                host_id=host_id,
+                script_name=script_name,
+                rule_tech_name=item["tech_name"],
+                status=item["status"],
+                message=str(item.get("message") or item["tech_name"])[:500],
+                raw_output=raw,
+            )
+        return len(parsed)
+    summary = output.split("\n", 1)[0][:500]
+    upsert_remediation_result(
+        db,
+        remediation_run_id=remediation_run_id,
+        host_id=host_id,
+        script_name=script_name,
+        rule_tech_name="",
+        status=CheckStatus.PASS,
+        message=summary or "Remediation completed successfully",
+        raw_output=raw,
+    )
+    return 1
 
 
 def _execute_remediation(
@@ -149,6 +226,9 @@ def _execute_remediation(
     *,
     rule_tech_names: list[str] | None = None,
     check_mode: bool = False,
+    extra_env: dict[str, str] | None = None,
+    log_label: str = "remediation",
+    ansible_tags: list[str] | None = None,
 ) -> str:
     cred = _primary_credential(host)
     if not cred:
@@ -157,103 +237,50 @@ def _execute_remediation(
     secret = _credential_secret(cred)
     username = cred.username or "root"
     password, private_key, key_passphrase = ssh_auth_from_credential(cred, secret, settings)
-    extra_env = _remediate_rules_env(rule_tech_names)
-    tags = [str(name).strip() for name in (rule_tech_names or []) if str(name).strip()] or None
+    merged_env = dict(_remediation_extra_env(rule_tech_names, check_mode=check_mode) or {})
+    if extra_env:
+        merged_env.update({str(k): str(v) for k, v in extra_env.items() if v is not None})
+    extra_env = merged_env or None
+    tags = ansible_tags or (
+        [str(name).strip() for name in (rule_tech_names or []) if str(name).strip()] or None
+    )
 
     mode_note = " (check mode)" if check_mode else ""
     publish_remediation_log(
         remediation_run_id,
-        f"[{host.name}] Running remediation {execution_type.value}: {script.script_file}{mode_note}",
+        f"[{host.name}] Running {log_label} {execution_type.value}: {script.script_file}{mode_note}",
     )
     known_hosts_entry = host.ssh_known_hosts_entry
+    script_path = resolve_script_under_package(package_dir, script.script_file)
+    run_script_path = materialize_subset_script(script_path, rule_tech_names, kind="remediation")
+    script_override: str | None = None
+    if run_script_path != script_path:
+        script_override = run_script_path.read_text(encoding="utf-8", errors="replace")
 
-    if execution_type == ExecutionType.WINRM:
-        winrm_cred = next(
-            (item for item in linked_credentials(host) if item.credential_type == CredentialType.WINRM),
-            None,
-        )
-        if not winrm_cred:
-            raise ValueError(f"Host '{host.name}' has no winrm credential assigned")
-        script_path = resolve_script_under_package(package_dir, script.script_file)
-        return run_script_over_winrm(
-            hostname=host.hostname,
-            port=host.port,
-            username=winrm_cred.username or "root",
-            password=_credential_secret(winrm_cred),
-            script_path=script_path,
-            server_cert_validation=settings.winrm_server_cert_validation_effective,
-            extra_env=extra_env,
-        )
+    try:
+        from app.executors.adapter import run_remediation_script
 
-    if execution_type == ExecutionType.PYTHON:
-        script_path = resolve_script_under_package(package_dir, script.script_file)
-        if host_is_network(host):
-            return run_script_locally_with_resource_env(
-                hostname=host.hostname.strip(),
-                port=host.port or 22,
-                username=username,
-                password=password,
-                private_key=private_key,
-                script_path=script_path,
-                key_passphrase=key_passphrase,
-                extra_env=extra_env,
-            )
-        return run_python_over_ssh(
-            hostname=host.hostname,
-            port=host.port or 22,
+        return run_remediation_script(
+            host,
+            execution_type,
+            cred=cred,
+            secret=secret,
             username=username,
             password=password,
             private_key=private_key,
-            script_path=script_path,
-            known_hosts_entry=known_hosts_entry,
             key_passphrase=key_passphrase,
+            package_dir=package_dir,
+            script=script,
+            run_script_path=run_script_path,
+            script_override=script_override,
             extra_env=extra_env,
-        )
-
-    if execution_type == ExecutionType.ANSIBLE:
-        script_path = resolve_script_under_package(package_dir, script.script_file)
-        content = script_path.read_text(encoding="utf-8", errors="replace")
-        inv = [
-            {
-                "name": host.name.strip(),
-                "hostname": host.hostname.strip(),
-                "port": host.port or 22,
-                "ansible_vars": {},
-                "ssh_known_hosts_entry": known_hosts_entry,
-            }
-        ]
-        creds: dict = {"username": username}
-        if cred.credential_type == CredentialType.SSH_PASSWORD:
-            creds["password"] = secret
-        elif cred.credential_type == CredentialType.SSH_KEY:
-            creds["private_key"] = secret
-            if key_passphrase:
-                creds["key_passphrase"] = key_passphrase
-        elif cred.credential_type == CredentialType.WINRM:
-            creds["password"] = secret
-            inv[0]["ansible_vars"] = {"ansible_connection": "winrm"}
-        return run_playbook(
-            content,
-            inv,
-            credentials=creds,
-            connection_mode="auto",
             check_mode=check_mode,
             tags=tags,
-            extravars={"secaudit_remediate_rules": tags or []},
+            known_hosts_entry=known_hosts_entry,
         )
-
-    return run_package_script_over_ssh(
-        hostname=host.hostname,
-        port=host.port or 22,
-        username=username,
-        password=password,
-        private_key=private_key,
-        package_dir=package_dir,
-        script_file=script.script_file,
-        known_hosts_entry=known_hosts_entry,
-        key_passphrase=key_passphrase,
-        extra_env=extra_env,
-    )
+    finally:
+        if run_script_path != script_path:
+            run_script_path.unlink(missing_ok=True)
 
 
 def _enqueue_failed_host_recheck(db: Session, remediation_job: RemediationJob) -> int | None:
@@ -344,7 +371,13 @@ def _run_remediation_job(
     rule_tech_names = [
         str(name).strip() for name in (job.rule_tech_names or []) if str(name).strip()
     ] or None
+    ansible_tags = _remediation_ansible_tags(db, profile.id, rule_tech_names)
     check_mode = bool(getattr(job, "check_mode", False))
+    if check_mode and not package_supports_check_mode(package_dir, execution_type):
+        raise ValueError(
+            "check_mode is not supported for this package/execution type; "
+            "set supports_check_mode in description.json (Ansible always allowed)"
+        )
 
     def process_host(host: Host) -> tuple[int, list[str]]:
         with SessionLocal() as host_db:
@@ -353,6 +386,55 @@ def _run_remediation_job(
 
             host_results = 0
             host_errors: list[str] = []
+            run_row = host_db.get(RemediationRun, remediation_run_id)
+            if run_row is not None and (run_row.backup_status or "") != "skipped":
+                try:
+                    from app.remediation_backup_ops import collect_host_script_backup
+
+                    def _run_backup_script(backup_script: CheckScript) -> str:
+                        return _execute_remediation(
+                            host,
+                            package_dir,
+                            backup_script,
+                            execution_type,
+                            remediation_run_id,
+                            rule_tech_names=rule_tech_names,
+                            check_mode=False,
+                            log_label="backup",
+                        )
+
+                    written = collect_host_script_backup(
+                        host_db,
+                        run=run_row,
+                        job=job,
+                        host=host,
+                        package_dir=package_dir,
+                        execute_script=_run_backup_script,
+                    )
+                    if written:
+                        publish_remediation_log(
+                            remediation_run_id,
+                            f"[{host.name}] Pre-remediation backup script stored {written} artifact(s)",
+                        )
+                except Exception as exc:
+                    reraise_if_transient(exc)
+                    publish_remediation_log(
+                        remediation_run_id,
+                        f"ERROR [{host.name}] backup: {exc}",
+                        level="error",
+                    )
+                    host_errors.append(f"{host.name}: backup failed: {exc}")
+                    upsert_remediation_result(
+                        host_db,
+                        remediation_run_id=remediation_run_id,
+                        host_id=host.id,
+                        script_name="PRE_REMEDIATION_BACKUP",
+                        status=CheckStatus.ERROR,
+                        message=str(exc)[:500],
+                    )
+                    host_results += 1
+                    host_db.commit()
+                    return host_results, host_errors
             for script in scripts:
                 if _is_run_cancelled(host_db, remediation_run_id):
                     raise InterruptedError("Remediation run cancelled")
@@ -365,16 +447,16 @@ def _run_remediation_job(
                         remediation_run_id,
                         rule_tech_names=rule_tech_names,
                         check_mode=check_mode,
+                        ansible_tags=ansible_tags,
                     )
-                    summary = output.split("\n", 1)[0][:500]
-                    upsert_remediation_result(
+                    host_results += _store_remediation_script_results(
                         host_db,
                         remediation_run_id=remediation_run_id,
                         host_id=host.id,
                         script_name=script.name,
-                        status=CheckStatus.PASS,
-                        message=summary or "Remediation completed successfully",
-                        raw_output=output[:raw_limit],
+                        output=output,
+                        raw_limit=raw_limit,
+                        rule_tech_names=rule_tech_names,
                     )
                     publish_remediation_log(
                         remediation_run_id,
@@ -396,11 +478,12 @@ def _run_remediation_job(
                         remediation_run_id=remediation_run_id,
                         host_id=host.id,
                         script_name=script.name,
+                        rule_tech_name="",
                         status=CheckStatus.ERROR,
                         message=message.split("\n", 1)[0][:500],
                         raw_output=message[:raw_limit],
                     )
-                host_results += 1
+                    host_results += 1
 
             host_db.commit()
             return host_results, host_errors
@@ -424,31 +507,37 @@ def _run_remediation_job(
     return results_count, errors
 
 
-def _commands_from_remediation_script(package_dir: Path, script: CheckScript) -> list[str]:
+def _commands_from_remediation_script(
+    package_dir: Path,
+    script: CheckScript,
+    *,
+    rule_tech_names: list[str] | None = None,
+) -> list[str]:
     script_path = resolve_script_under_package(package_dir, script.script_file)
+    text = script_path.read_text(encoding="utf-8", errors="replace")
+    allowed = normalize_allowed_ids(rule_tech_names)
+    rule_header = re.compile(r"^#\s*(?:SECAUDIT_RULE_BEGIN\s+)?(RULE\d+)\b", re.IGNORECASE)
+    has_markers = any(rule_header.match(line.strip()) for line in text.splitlines())
+    if allowed is None or not has_markers:
+        return [
+            line.strip()
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
     commands: list[str] = []
-    for line in script_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    current_ok = False
+    for line in text.splitlines():
         stripped = line.strip()
+        header = rule_header.match(stripped)
+        if header:
+            rid = header.group(1).upper()
+            current_ok = rid in allowed or any(k in allowed for k in rule_identity_keys(rid))
+            continue
         if not stripped or stripped.startswith("#"):
             continue
-        commands.append(stripped)
+        if current_ok:
+            commands.append(stripped)
     return commands
-
-
-def _infer_host_vendor(host: Host) -> NetworkVendor:
-    for token in (host.name, host.hostname, host.description or ""):
-        lowered = token.lower()
-        if "junos" in lowered or "juniper" in lowered:
-            return NetworkVendor.JUNIPER_JUNOS
-        if "nxos" in lowered or "nexus" in lowered:
-            return NetworkVendor.CISCO_NXOS
-        if "asa" in lowered:
-            return NetworkVendor.CISCO_ASA
-        if "arista" in lowered or "eos" in lowered:
-            return NetworkVendor.ARISTA_EOS
-        if "forti" in lowered:
-            return NetworkVendor.FORTINET
-    return NetworkVendor.CISCO_IOS
 
 
 def _run_network_remediation_job(
@@ -473,13 +562,6 @@ def _run_network_remediation_job(
     results_count = 0
     errors: list[str] = []
 
-    default_commands = [
-        "aaa new-model",
-        "aaa authentication login default local",
-        "ip ssh version 2",
-        "service password-encryption",
-    ]
-
     for host in hosts:
         if _is_run_cancelled(db, remediation_run_id):
             break
@@ -497,19 +579,68 @@ def _run_network_remediation_job(
                 skipped, _ = _skip_remediation_host_busy(remediation_run_id, host)
                 results_count += skipped
                 continue
+            rule_tech_names = [
+                str(name).strip() for name in (job.rule_tech_names or []) if str(name).strip()
+            ] or None
             commands: list[str] = []
             for script in scripts:
                 try:
-                    commands.extend(_commands_from_remediation_script(package_dir, script))
+                    commands.extend(
+                        _commands_from_remediation_script(
+                            package_dir, script, rule_tech_names=rule_tech_names
+                        )
+                    )
                 except Exception as exc:
                     reraise_if_transient(exc)
                     errors.append(
                         f"{host.name}: failed to read remediation script {script.name}: {exc}"
                     )
             if not commands:
-                commands = list(default_commands)
+                upsert_remediation_result(
+                    db,
+                    remediation_run_id=remediation_run_id,
+                    host_id=host.id,
+                    script_name="network_remediation_config",
+                    status=CheckStatus.SKIP,
+                    message="No remediation script commands; refusing vendor-specific defaults",
+                    raw_output="",
+                )
+                publish_remediation_log(
+                    remediation_run_id,
+                    f"[{host.name}] Skipped network remediation: no script commands",
+                    level="warning",
+                )
+                results_count += 1
+                continue
 
-            vendor = _infer_host_vendor(host)
+            try:
+                from app.remediation_backup_ops import collect_network_snapshot
+
+                collect_network_snapshot(db, run=remediation_run, host=host)
+                publish_remediation_log(
+                    remediation_run_id,
+                    f"[{host.name}] Captured running-config snapshot before generating rem config",
+                )
+            except Exception as exc:
+                reraise_if_transient(exc)
+                upsert_remediation_result(
+                    db,
+                    remediation_run_id=remediation_run_id,
+                    host_id=host.id,
+                    script_name="NETWORK_CONFIG_SNAPSHOT",
+                    status=CheckStatus.ERROR,
+                    message=str(exc)[:500],
+                )
+                publish_remediation_log(
+                    remediation_run_id,
+                    f"ERROR [{host.name}] network snapshot: {exc}",
+                    level="error",
+                )
+                results_count += 1
+                errors.append(f"{host.name}: snapshot failed: {exc}")
+                continue
+
+            vendor = resolve_host_vendor(host)
             content = generate_remediation_config(vendor, hostname=host.name, commands=commands)
             filename = f"remediation-{remediation_run_id}-{host.name}-{vendor.value}.cfg"
             db.add(
@@ -630,6 +761,24 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
             )
             return {"error": "no hosts"}
 
+        windows = list(db.execute(select(MaintenanceWindow).where(MaintenanceWindow.enabled.is_(True))).scalars().all())
+        blocked = remediation_blocked_by_windows(windows, hosts)
+        if blocked:
+            transition_running_run(
+                db, RemediationRun, remediation_run_id, JobStatus.FAILED, error_message=blocked
+            )
+            publish_remediation_log(remediation_run_id, blocked, level="error")
+            return {"error": "maintenance_window", "message": blocked}
+
+        need_ticket = ticket_envs(settings)
+        if need_ticket and any((host.environment or "").strip().lower() in need_ticket for host in hosts):
+            if not (remediation_run.change_ticket or "").strip():
+                msg = "change_ticket is required for production remediation"
+                transition_running_run(
+                    db, RemediationRun, remediation_run_id, JobStatus.FAILED, error_message=msg
+                )
+                return {"error": "change_ticket", "message": msg}
+
         from app.cancel_context import active_run_scope
         from secaudit_core.run_cancel import clear_run_cancel_state
 
@@ -640,6 +789,28 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
             if not profile:
                 raise ValueError("Profile not found")
 
+            # Mark backup_status before host work (updated after).
+            package_dir = Path(profile.package_path) if profile.package_path else Path(settings.profiles_path)
+            if job.scope == JobScope.NETWORK:
+                remediation_run.backup_status = "ok"
+            else:
+                from app.remediation_backup_ops import resolve_backup_restore_scripts
+
+                backup_script, restore_script = resolve_backup_restore_scripts(
+                    db, profile_id=job.profile_id, execution_type=job.execution_type
+                )
+                if backup_script and restore_script:
+                    remediation_run.backup_status = "ok"
+                else:
+                    remediation_run.backup_status = "skipped"
+                    publish_remediation_log(
+                        remediation_run_id,
+                        "WARNING: no remediation_backup/restore script pair for this "
+                        "profile/execution type; continuing without restore flow",
+                        level="warning",
+                    )
+            db.commit()
+
             if job.scope == JobScope.NETWORK:
                 results_count, errors = _run_network_remediation_job(
                     db, job, remediation_run, profile, hosts
@@ -648,6 +819,18 @@ def run_remediation_job(self, remediation_run_id: int, **_kwargs) -> dict:
                 results_count, errors = _run_remediation_job(
                     db, job, remediation_run, profile, hosts
                 )
+            # If any PRE_REMEDIATION_BACKUP errors, mark failed backup.
+            backup_err = db.execute(
+                select(RemediationResult.id).where(
+                    RemediationResult.remediation_run_id == remediation_run_id,
+                    RemediationResult.script_name.in_(["PRE_REMEDIATION_BACKUP", "NETWORK_CONFIG_SNAPSHOT"]),
+                    RemediationResult.status == CheckStatus.ERROR,
+                ).limit(1)
+            ).scalar_one_or_none()
+            run_fresh = db.get(RemediationRun, remediation_run_id)
+            if run_fresh and backup_err:
+                run_fresh.backup_status = "failed"
+                db.commit()
 
             if _is_run_cancelled(db, remediation_run_id):
                 transition_running_run(
@@ -825,3 +1008,64 @@ def _run_scheduled_remediation_jobs_locked() -> dict:
         db.commit()
 
     return {"triggered_runs": triggered, "count": len(triggered)}
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.run_remediation_rollback",
+    **TASK_RETRY_KWARGS,
+)
+def run_remediation_rollback(self, remediation_run_id: int, host_id: int | None = None, **_kwargs) -> dict:
+    """Run remediation_restore scripts for linux/windows hosts. Network is download-only."""
+    from app.remediation_backup_ops import restore_host_via_script
+
+    with SessionLocal() as db:
+        run = db.get(RemediationRun, remediation_run_id)
+        if not run:
+            return {"error": "not_found"}
+        if run.backup_status != "ok":
+            return {"error": "no_backup", "backup_status": run.backup_status}
+        job = db.get(RemediationJob, run.remediation_job_id)
+        if not job:
+            return {"error": "job_not_found"}
+        if job.scope == JobScope.NETWORK:
+            return {"error": "network_snapshot_only"}
+        profile = db.get(Profile, job.profile_id)
+        if not profile:
+            return {"error": "profile_not_found"}
+        package_dir = Path(profile.package_path) if profile.package_path else Path(settings.profiles_path)
+        hosts = _resolve_remediation_hosts(db, job)
+        if host_id is not None:
+            hosts = [host for host in hosts if host.id == host_id]
+        results: list[dict] = []
+        for host in hosts:
+            def _run_restore(restore_script: CheckScript, *, extra_env: dict[str, str] | None = None) -> str:
+                return _execute_remediation(
+                    host,
+                    package_dir,
+                    restore_script,
+                    job.execution_type,
+                    remediation_run_id,
+                    rule_tech_names=None,
+                    check_mode=False,
+                    extra_env=extra_env,
+                    log_label="restore",
+                )
+
+            results.extend(
+                restore_host_via_script(
+                    db,
+                    run=run,
+                    host=host,
+                    job=job,
+                    package_dir=package_dir,
+                    execute_script=_run_restore,
+                )
+            )
+            publish_remediation_log(
+                remediation_run_id,
+                f"[{host.name}] Rollback finished for host",
+            )
+        run.rollback_results_json = {"items": results}
+        db.commit()
+        return {"remediation_run_id": remediation_run_id, "results": results}

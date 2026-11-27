@@ -1,9 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from secaudit_core.celery_dispatch import revoke_task
+from secaudit_core.profile_packages import package_supports_check_mode
 from secaudit_core.run_cancel import set_run_cancel_flag
 from secaudit_core.notifications import enqueue_run_notification, events_for_terminal_status
 
@@ -23,13 +26,13 @@ from app.models import (
     Job,
     JobRun,
     JobStatus,
+    JobScope,
+    Profile,
+    RemediationBackupArtifact,
     RemediationJob,
     RemediationJobHost,
-    RemediationResult,
     RemediationRun,
     ScriptKind,
-    Profile,
-    JobScope,
     UserRole,
 )
 from app.pagination import paginate_scalars, pagination_params
@@ -42,9 +45,12 @@ from app.schemas import (
     RemediationJobUpdate,
     RemediationRunDetail,
     RemediationRunRead,
+    RemediationRunStartRequest,
     RemediationWorkflowRead,
     RemediationWorkflowReauditUpdate,
 )
+from app.services.remediation_gates import assert_remediation_allowed
+from secaudit_core.remediation_backup import load_backup_bytes
 from app.services.audit_log import log_audit_event
 from app.services.demo_exec_targets import assert_demo_exec_remediation_job
 from app.services.job_webhooks import apply_webhook_fields, webhook_read_fields
@@ -98,6 +104,29 @@ async def _validate_remediation_script(
     script = await db.get(CheckScript, remediation_script_id)
     if not script or script.profile_id != profile_id or script.script_kind != ScriptKind.REMEDIATION:
         raise HTTPException(status_code=400, detail="Invalid remediation script for profile")
+
+
+async def _assert_remediation_check_mode_allowed(
+    db: AsyncSession,
+    *,
+    profile_id: int,
+    execution_type,
+    check_mode: bool,
+) -> None:
+    if not check_mode:
+        return
+    profile = await db.get(Profile, profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    package_dir = Path(profile.package_path) if profile.package_path else Path(settings.profiles_path)
+    if not package_supports_check_mode(package_dir, execution_type):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "check_mode is not supported for this package/execution type; "
+                "set supports_check_mode in description.json (Ansible always allowed)"
+            ),
+        )
 
 
 @router.get("", response_model=list[RemediationJobRead])
@@ -202,6 +231,12 @@ async def create_remediation_from_run(
 
     script_id = data.remediation_script_id or suggestion["default_remediation_script_id"]
     await _validate_remediation_script(db, suggestion["profile_id"], script_id)
+    await _assert_remediation_check_mode_allowed(
+        db,
+        profile_id=suggestion["profile_id"],
+        execution_type=suggestion["default_execution_type"],
+        check_mode=bool(data.check_mode),
+    )
 
     baseline_run_id: int | None = None
     if data.set_baseline:
@@ -242,9 +277,11 @@ async def create_remediation_from_run(
 
     remediation_run_id: int | None = None
     if data.run_remediation:
+        await assert_remediation_allowed(db, job, change_ticket=data.change_ticket)
         remediation_run = RemediationRun(
             remediation_job_id=job.id,
             status=JobStatus.PENDING,
+            change_ticket=(data.change_ticket or "").strip() or None,
         )
         db.add(remediation_run)
         await db.flush()
@@ -483,6 +520,7 @@ async def run_remediation_job(
     request: Request,
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+    body: RemediationRunStartRequest | None = None,
 ) -> RemediationRunRead:
     result = await db.execute(select(RemediationJob).where(RemediationJob.id == job_id))
     job = result.scalar_one_or_none()
@@ -490,10 +528,19 @@ async def run_remediation_job(
         raise HTTPException(status_code=404, detail="Remediation job not found")
     assert_can_access(user, job.owner_sub, detail="Remediation job not found")
     await assert_demo_exec_remediation_job(db, job)
+    await _assert_remediation_check_mode_allowed(
+        db,
+        profile_id=job.profile_id,
+        execution_type=job.execution_type,
+        check_mode=bool(job.check_mode),
+    )
+    ticket = (body.change_ticket if body else None) or None
+    await assert_remediation_allowed(db, job, change_ticket=ticket)
 
     remediation_run = RemediationRun(
         remediation_job_id=job.id,
         status=JobStatus.PENDING,
+        change_ticket=(ticket or "").strip() or None,
     )
     db.add(remediation_run)
     await db.flush()
@@ -563,7 +610,10 @@ async def get_remediation_run(
 ) -> RemediationRunDetail:
     result = await db.execute(
         select(RemediationRun)
-        .options(selectinload(RemediationRun.results))
+        .options(
+            selectinload(RemediationRun.results),
+            selectinload(RemediationRun.backup_artifacts),
+        )
         .where(RemediationRun.id == run_id)
     )
     remediation_run = result.scalar_one_or_none()
@@ -572,6 +622,95 @@ async def get_remediation_run(
     job = await db.get(RemediationJob, remediation_run.remediation_job_id)
     assert_can_access(user, job.owner_sub if job else None, detail="Remediation run not found")
     return RemediationRunDetail.model_validate(remediation_run)
+
+
+@router.post("/runs/{run_id}/rollback", response_model=RemediationRunDetail)
+async def rollback_remediation_run(
+    run_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.ADMIN)),
+    host_id: int | None = Query(default=None),
+) -> RemediationRunDetail:
+    result = await db.execute(
+        select(RemediationRun)
+        .options(selectinload(RemediationRun.backup_artifacts))
+        .where(RemediationRun.id == run_id)
+    )
+    remediation_run = result.scalar_one_or_none()
+    if not remediation_run:
+        raise HTTPException(status_code=404, detail="Remediation run not found")
+    job = await db.get(RemediationJob, remediation_run.remediation_job_id)
+    assert_can_access(user, job.owner_sub if job else None, detail="Remediation run not found")
+    if job and job.scope == JobScope.NETWORK:
+        raise HTTPException(status_code=422, detail="Network snapshot download only; device rollback is not available")
+    if remediation_run.backup_status != "ok" or not remediation_run.backup_artifacts:
+        raise HTTPException(status_code=409, detail="No backup available for rollback")
+    if remediation_run.status not in (JobStatus.COMPLETED, JobStatus.FAILED):
+        raise HTTPException(status_code=409, detail="Rollback is only available after the run finishes")
+
+    outbox = await enqueue_run_dispatch(
+        db,
+        task_name="app.tasks.run_remediation_rollback",
+        args=[remediation_run.id, host_id],
+        queue="remediation",
+        callback_kind="remediation_rollback",
+        callback_ref_id=remediation_run.id,
+        correlation=correlation_from_request(
+            request, run_kind="remediation_rollback", run_id=remediation_run.id
+        ),
+    )
+    await commit_and_try_dispatch(db, outbox_id=outbox.id)
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="remediation.rollback",
+        resource_type="remediation_run",
+        resource_id=remediation_run.id,
+        metadata={"host_id": host_id},
+    )
+    await db.refresh(remediation_run)
+    detail = await db.execute(
+        select(RemediationRun)
+        .options(
+            selectinload(RemediationRun.results),
+            selectinload(RemediationRun.backup_artifacts),
+        )
+        .where(RemediationRun.id == run_id)
+    )
+    return RemediationRunDetail.model_validate(detail.scalar_one())
+
+
+@router.get("/runs/{run_id}/backups/{artifact_id}/download")
+async def download_backup_artifact(
+    run_id: int,
+    artifact_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_remediation),
+) -> Response:
+    artifact = await db.get(RemediationBackupArtifact, artifact_id)
+    if artifact is None or artifact.remediation_run_id != run_id:
+        raise HTTPException(status_code=404, detail="Backup artifact not found")
+    run = await db.get(RemediationRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Remediation run not found")
+    job = await db.get(RemediationJob, run.remediation_job_id)
+    assert_can_access(user, job.owner_sub if job else None, detail="Remediation run not found")
+    try:
+        payload = load_backup_bytes(
+            encrypted_blob=artifact.encrypted_blob,
+            storage_ref=artifact.storage_ref,
+            settings=settings,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Could not decrypt backup") from exc
+    filename = f"remediation-{run_id}-host-{artifact.host_id}-{artifact.kind}.txt"
+    return Response(
+        content=payload,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/runs/{run_id}/stop", response_model=RemediationRunRead)

@@ -25,6 +25,7 @@ from app.schemas import (
     CheckResultRead,
     CveRefRead,
     JobCreate,
+    JobPreflightStatus,
     JobRead,
     JobRunDetail,
     JobRunRead,
@@ -39,7 +40,9 @@ from app.services.job_run_subset import create_subset_run, load_source_run, prev
 from app.services.job_webhooks import apply_webhook_fields, webhook_read_fields
 from app.services.network_jobs import validate_job_scope
 from app.services.demo_exec_targets import assert_demo_exec_job
+from app.services.preflight import enqueue_job_preflight, read_job_preflight
 from app.services.object_rbac import (
+    apply_job_scope,
     apply_owner_scope,
     assert_can_access,
     assert_hosts_accessible,
@@ -96,7 +99,7 @@ async def list_jobs(
     stmt = select(Job).options(selectinload(Job.job_hosts)).order_by(Job.created_at.desc())
     if scope is not None:
         stmt = stmt.where(Job.scope == scope)
-    stmt = apply_owner_scope(stmt, Job.owner_sub, user)
+    stmt = apply_job_scope(apply_owner_scope(stmt, Job.owner_sub, user), user)
     result = await db.execute(stmt)
     return [_job_to_read(j) for j in result.scalars().all()]
 
@@ -239,7 +242,7 @@ async def list_job_runs(
 ) -> PaginatedResponse[JobRunRead]:
     offset, limit = page
     stmt = select(JobRun).join(Job, Job.id == JobRun.job_id)
-    stmt = apply_owner_scope(stmt, Job.owner_sub, user)
+    stmt = apply_job_scope(apply_owner_scope(stmt, Job.owner_sub, user), user)
     stmt = stmt.order_by(JobRun.created_at.desc())
     runs, total = await paginate_scalars(db, stmt, offset=offset, limit=limit)
     return PaginatedResponse(
@@ -248,6 +251,31 @@ async def list_job_runs(
         offset=offset,
         limit=limit,
     )
+
+
+@router.post("/{job_id}/preflight", response_model=JobPreflightStatus, status_code=202)
+async def preflight_job(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_jobs_run),
+) -> JobPreflightStatus:
+    """Queue a probe of every host on the job. Poll GET /jobs/preflight/{task_id}."""
+    result = await db.execute(select(Job).where(Job.id == job_id))
+    job = result.scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    assert_can_access(user, job.owner_sub, detail="Job not found")
+    await assert_demo_exec_job(db, job)
+    task_id = enqueue_job_preflight(job.id)
+    return JobPreflightStatus(task_id=task_id, status="pending")
+
+
+@router.get("/preflight/{task_id}", response_model=JobPreflightStatus)
+async def preflight_job_status(
+    task_id: str,
+    _user: AuthUser = Depends(require_jobs_run),
+) -> JobPreflightStatus:
+    return JobPreflightStatus(**read_job_preflight(task_id))
 
 
 @router.post("/{job_id}/run", response_model=JobRunRead, status_code=201)

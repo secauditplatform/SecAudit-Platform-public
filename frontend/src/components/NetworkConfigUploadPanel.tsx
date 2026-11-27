@@ -18,6 +18,11 @@ const VENDORS: NetworkVendor[] = [
   "fortinet",
   "palo_alto",
   "check_point",
+  "eltex",
+  "mikrotik",
+  "usergate",
+  "continent",
+  "qtech",
   "generic",
 ];
 

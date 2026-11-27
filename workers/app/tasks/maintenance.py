@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from secaudit_core.beat_lock import acquire_beat_lock, release_beat_lock
 from secaudit_core.celery_observability import evaluate_worker_heartbeat, touch_beat_heartbeat
-from secaudit_core.job_run_retention import purge_old_job_runs
+from secaudit_core.job_run_retention import archive_check_raw_output, purge_old_job_runs
 from secaudit_core.enums import JobStatus, NotificationEventType
 from secaudit_core.models import Job, JobRun, RemediationJob, RemediationRun
 from secaudit_core.notifications import deliver_notifications, enqueue_platform_notification
@@ -134,6 +134,27 @@ def purge_old_job_runs_task() -> dict:
                     settings.redis_url,
                     env_default=settings.job_run_retention_days,
                 ),
+            )
+    finally:
+        release_beat_lock(lock_client, lock_key, lock_token)
+
+
+@celery_app.task(name="app.tasks.maintenance.archive_check_raw_output")
+def archive_check_raw_output_task() -> dict:
+    lock_key = "beat:schedule_lock:archive_check_raw_output"
+    lock_client, lock_token = acquire_beat_lock(
+        settings.redis_url,
+        lock_key,
+        ttl_seconds=settings.beat_lock_ttl_seconds,
+    )
+    if lock_token is None:
+        return {"skipped": True, "reason": "lock_not_acquired"}
+    try:
+        touch_beat_heartbeat(settings.redis_url, ttl_seconds=max(180, settings.beat_lock_ttl_seconds * 3))
+        with SessionLocal() as db:
+            return archive_check_raw_output(
+                db,
+                retention_days=settings.check_result_raw_retention_days,
             )
     finally:
         release_beat_lock(lock_client, lock_key, lock_token)

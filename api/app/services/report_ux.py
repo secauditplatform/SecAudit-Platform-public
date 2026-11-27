@@ -7,8 +7,11 @@ import hashlib
 import io
 import json
 import zipfile
+from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime
+from html import escape as xml_escape
+from urllib.parse import quote
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -25,11 +28,13 @@ from app.schemas import (
 )
 from app.services.cve_feed import load_feed_entries, references_for_check
 from app.services.reports import build_report_summary, resolve_run_waived_map, waived_check_ids_for_runs
+from secaudit_core.report_pack import (
+    EVIDENCE_PACK_SCHEMA,
+    RUN_PACK_SCHEMA,
+    build_run_package_zip,
+)
 from secaudit_core.sensitive_data import redact_sensitive
-from secaudit_core.waivers import waiver_matches_check
-
-RUN_PACK_SCHEMA = "secaudit.run-pack.v1"
-EVIDENCE_PACK_SCHEMA = "secaudit.evidence-pack.v1"
+from secaudit_core.waivers import host_scope_view, waiver_matches_check
 
 
 def _normalize_severity(value: str | None) -> str | None:
@@ -61,6 +66,28 @@ async def _severity_by_tech_name(db: AsyncSession, profile_id: int | None) -> di
     return mapping
 
 
+def _check_matches_filters(
+    check: CheckResult,
+    severity_by_rule: dict[str, str],
+    *,
+    status_norm: str | None,
+    severity_norm: str | None,
+    host_id_filter: int | None,
+    rule_query: str | None,
+) -> bool:
+    status_value = check.status.value if isinstance(check.status, CheckStatus) else str(check.status)
+    severity = severity_by_rule.get(check.rule_tech_name)
+    if status_norm and status_value.lower() != status_norm:
+        return False
+    if severity_norm and (severity or "") != severity_norm:
+        return False
+    if host_id_filter is not None and check.host_id != host_id_filter:
+        return False
+    if rule_query and rule_query not in check.rule_tech_name.lower():
+        return False
+    return True
+
+
 def render_check_results_csv(
     *,
     run_id: int,
@@ -78,6 +105,18 @@ def render_check_results_csv(
     severity_norm = _normalize_severity(severity_filter)
     rule_query = rule_filter.strip().lower() if rule_filter else None
     waived_map = waived_by_check_id or {}
+    visible = [
+        check
+        for check in checks
+        if _check_matches_filters(
+            check,
+            severity_by_rule,
+            status_norm=status_norm,
+            severity_norm=severity_norm,
+            host_id_filter=host_id_filter,
+            rule_query=rule_query,
+        )
+    ]
 
     header = [
         "run_id",
@@ -95,18 +134,9 @@ def render_check_results_csv(
         header.append("cve_ids")
     rows: list[list[str]] = [header]
 
-    for check in sorted(checks, key=lambda c: (c.host_id, c.rule_tech_name, c.id)):
+    for check in sorted(visible, key=lambda c: (c.host_id, c.rule_tech_name, c.id)):
         status_value = check.status.value if isinstance(check.status, CheckStatus) else str(check.status)
         severity = severity_by_rule.get(check.rule_tech_name)
-        if status_norm and status_value.lower() != status_norm:
-            continue
-        if severity_norm and (severity or "") != severity_norm:
-            continue
-        if host_id_filter is not None and check.host_id != host_id_filter:
-            continue
-        if rule_query and rule_query not in check.rule_tech_name.lower():
-            continue
-
         host = hosts.get(check.host_id)
         waiver = waived_map.get(check.id)
         values: list[object] = [
@@ -131,6 +161,345 @@ def render_check_results_csv(
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerows(rows)
     return buffer.getvalue()
+
+
+def _visible_checks(
+    checks: list[CheckResult],
+    severity_by_rule: dict[str, str],
+    *,
+    status_filter: str | None,
+    severity_filter: str | None,
+    host_id_filter: int | None,
+    rule_filter: str | None,
+) -> list[CheckResult]:
+    status_norm = status_filter.strip().lower() if status_filter else None
+    severity_norm = _normalize_severity(severity_filter)
+    rule_query = rule_filter.strip().lower() if rule_filter else None
+    return [
+        check
+        for check in checks
+        if _check_matches_filters(
+            check,
+            severity_by_rule,
+            status_norm=status_norm,
+            severity_norm=severity_norm,
+            host_id_filter=host_id_filter,
+            rule_query=rule_query,
+        )
+    ]
+
+
+def _sarif_level(severity: str | None, status: str) -> str:
+    if status == "error" or (severity or "").lower() in {"critical", "crit", "high"}:
+        return "error"
+    if (severity or "").lower() in {"medium", "med", "warning"}:
+        return "warning"
+    return "note"
+
+
+def render_run_sarif(
+    *,
+    run_id: int,
+    checks: list[CheckResult],
+    hosts: dict[int, Host],
+    severity_by_rule: dict[str, str],
+    waived_by_check_id: dict[int, object] | None = None,
+    profile_name: str = "",
+    tool_version: str = "2.0.0",
+    status_filter: str | None = None,
+    severity_filter: str | None = None,
+    host_id_filter: int | None = None,
+    rule_filter: str | None = None,
+) -> str:
+    waived_map = waived_by_check_id or {}
+    visible = _visible_checks(
+        checks,
+        severity_by_rule,
+        status_filter=status_filter,
+        severity_filter=severity_filter,
+        host_id_filter=host_id_filter,
+        rule_filter=rule_filter,
+    )
+    rules: dict[str, dict] = {}
+    results: list[dict] = []
+    for check in sorted(visible, key=lambda c: (c.host_id, c.rule_tech_name, c.id)):
+        status_value = _status_value(check.status).lower()
+        if status_value not in {"fail", "error"}:
+            continue
+        severity = severity_by_rule.get(check.rule_tech_name) or ""
+        host = hosts.get(check.host_id)
+        host_label = ""
+        if host is not None:
+            host_label = (host.hostname or host.name or "").strip()
+        if not host_label:
+            host_label = str(check.host_id)
+        rule_id = check.rule_tech_name
+        if rule_id not in rules:
+            rules[rule_id] = {
+                "id": rule_id,
+                "shortDescription": {"text": rule_id},
+                "defaultConfiguration": {"level": _sarif_level(severity, status_value)},
+                "properties": {"severity": severity},
+            }
+        result: dict = {
+            "ruleId": rule_id,
+            "level": _sarif_level(severity, status_value),
+            "message": {"text": check.message or status_value},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": f"host://{quote(host_label, safe='')}"},
+                    }
+                }
+            ],
+            "properties": {
+                "host": host.name if host is not None else host_label,
+                "hostname": host.hostname if host is not None else host_label,
+                "status": status_value,
+                "severity": severity,
+            },
+        }
+        waiver = waived_map.get(check.id)
+        if waiver is not None:
+            result["suppressions"] = [
+                {
+                    "kind": "external",
+                    "status": "accepted",
+                    "justification": getattr(waiver, "reason", "") or "",
+                }
+            ]
+        results.append(result)
+    document = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "SecAudit",
+                        "version": tool_version,
+                        "informationUri": "https://github.com/secauditplatform/SecAudit-Platform",
+                        "rules": [rules[key] for key in sorted(rules)],
+                    }
+                },
+                "results": results,
+                "properties": {"job_run_id": run_id, "profile": profile_name},
+            }
+        ],
+    }
+    return json.dumps(document, ensure_ascii=False, indent=2) + "\n"
+
+
+def _xlsx_col(index: int) -> str:
+    name = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def _xlsx_text(value: object) -> str:
+    text = "" if value is None else str(value)
+    cleaned = "".join(ch for ch in text if ch in "\t\n\r" or ord(ch) >= 32)
+    return xml_escape(cleaned, quote=False)
+
+
+def _xlsx_sheet(rows: list[list[object]]) -> str:
+    body: list[str] = []
+    for row_index, row in enumerate(rows, start=1):
+        cells = []
+        for col_index, value in enumerate(row, start=1):
+            text = _xlsx_text(value)
+            ref = f"{_xlsx_col(col_index)}{row_index}"
+            cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>')
+        body.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(body)}</sheetData></worksheet>"
+    )
+
+
+def _xlsx_bytes(sheets: list[tuple[str, list[list[object]]]]) -> bytes:
+    content_types = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">',
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+        '<Default Extension="xml" ContentType="application/xml"/>',
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+    ]
+    workbook_sheets = []
+    rels = [
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    ]
+    for index, (name, _rows) in enumerate(sheets, start=1):
+        content_types.append(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        )
+        workbook_sheets.append(f'<sheet name="{xml_escape(name, quote=True)}" sheetId="{index}" r:id="rId{index}"/>')
+        rels.append(
+            f'<Relationship Id="rId{index}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{index}.xml"/>'
+        )
+    content_types.append("</Types>")
+    rels.append("</Relationships>")
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{''.join(workbook_sheets)}</sheets></workbook>"
+    )
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "".join(content_types))
+        archive.writestr("_rels/.rels", root_rels)
+        archive.writestr("xl/workbook.xml", workbook)
+        archive.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+        for index, (_name, rows) in enumerate(sheets, start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", _xlsx_sheet(rows))
+    return buffer.getvalue()
+
+
+def _host_compliance(passed: int, failed: int, errors: int, waived: int) -> str:
+    applicable = passed + failed + errors
+    if not applicable:
+        return "0"
+    return f"{((passed + waived) / applicable) * 100:.2f}"
+
+
+def render_run_xlsx(
+    *,
+    run_id: int,
+    job_name: str,
+    profile_name: str,
+    started_at: datetime | None,
+    finished_at: datetime | None,
+    checks: list[CheckResult],
+    hosts: dict[int, Host],
+    severity_by_rule: dict[str, str],
+    waived_by_check_id: dict[int, object] | None = None,
+    waivers: list[ComplianceWaiver] | None = None,
+    job_id: int | None = None,
+    status_filter: str | None = None,
+    severity_filter: str | None = None,
+    host_id_filter: int | None = None,
+    rule_filter: str | None = None,
+) -> bytes:
+    waived_map = waived_by_check_id or {}
+    visible = _visible_checks(
+        checks,
+        severity_by_rule,
+        status_filter=status_filter,
+        severity_filter=severity_filter,
+        host_id_filter=host_id_filter,
+        rule_filter=rule_filter,
+    )
+    summary = build_report_summary(
+        run_id,
+        visible,
+        waived_check_ids={check.id for check in visible if check.id in waived_map},
+    )
+    summary_rows: list[list[object]] = [
+        ["Metric", "Value"],
+        ["Run", run_id],
+        ["Job", job_name],
+        ["Profile", profile_name],
+        ["Started", _iso(started_at) or ""],
+        ["Finished", _iso(finished_at) or ""],
+        ["Pass", summary.passed],
+        ["Fail", summary.failed],
+        ["Error", summary.errors],
+        ["Skip", summary.skipped],
+        ["Waived", summary.waived],
+        ["Total", summary.total_checks],
+        ["Compliance %", summary.compliance_percent],
+    ]
+    by_host: dict[int, dict[str, int]] = defaultdict(lambda: {"pass": 0, "fail": 0, "error": 0, "skip": 0, "waived": 0})
+    failed_rows: list[list[object]] = [["Host", "Hostname", "Rule", "Severity", "Status", "Message", "Waived", "Waiver id"]]
+    for check in sorted(visible, key=lambda c: (c.host_id, c.rule_tech_name, c.id)):
+        status_value = _status_value(check.status).lower()
+        bucket = by_host[check.host_id]
+        if status_value in bucket:
+            bucket[status_value] += 1
+        waiver = waived_map.get(check.id)
+        if waiver is not None and status_value == "fail":
+            bucket["waived"] += 1
+        if status_value not in {"fail", "error"}:
+            continue
+        host = hosts.get(check.host_id)
+        failed_rows.append(
+            [
+                host.name if host is not None else check.host_id,
+                host.hostname if host is not None else "",
+                check.rule_tech_name,
+                severity_by_rule.get(check.rule_tech_name) or "",
+                status_value,
+                check.message or "",
+                "true" if waiver is not None else "false",
+                getattr(waiver, "id", "") if waiver is not None else "",
+            ]
+        )
+    host_rows: list[list[object]] = [["Host", "Hostname", "Pass", "Fail", "Error", "Skip", "Waived", "Compliance %"]]
+    for host_id, counts in sorted(by_host.items(), key=lambda item: (hosts.get(item[0]).name if hosts.get(item[0]) else "", item[0])):
+        host = hosts.get(host_id)
+        host_rows.append(
+            [
+                host.name if host is not None else host_id,
+                host.hostname if host is not None else "",
+                counts["pass"],
+                counts["fail"],
+                counts["error"],
+                counts["skip"],
+                counts["waived"],
+                _host_compliance(counts["pass"], counts["fail"], counts["error"], counts["waived"]),
+            ]
+        )
+    waiver_rows: list[list[object]] = [
+        ["Id", "Rule", "Host", "Site", "Environment", "Tag", "Reason", "Ticket", "Status", "Expires"]
+    ]
+    seen: set[int] = set()
+    visible_hosts = {check.host_id for check in visible}
+    for waiver in waivers or []:
+        if waiver.id in seen:
+            continue
+        if job_id is not None and waiver.job_id is not None and waiver.job_id != job_id:
+            continue
+        if waiver.host_id is not None and waiver.host_id not in visible_hosts:
+            continue
+        seen.add(waiver.id)
+        host = hosts.get(waiver.host_id) if waiver.host_id is not None else None
+        status_value = _status_value(waiver.status)
+        waiver_rows.append(
+            [
+                waiver.id,
+                waiver.rule_tech_name,
+                host.name if host is not None else (waiver.host_id or ""),
+                waiver.scope_site or "",
+                waiver.scope_environment or "",
+                waiver.scope_tag or "",
+                waiver.reason,
+                waiver.change_ticket or "",
+                status_value,
+                _iso(waiver.expires_at) or "",
+            ]
+        )
+    return _xlsx_bytes(
+        [
+            ("Summary", summary_rows),
+            ("By Host", host_rows),
+            ("Failed Rules", failed_rows),
+            ("Waivers", waiver_rows),
+        ]
+    )
 
 
 def render_multi_compare_csv(report: MultiRunCompareReport) -> str:
@@ -224,6 +593,101 @@ async def fetch_run_csv(
     return content, filename
 
 
+async def _load_run_for_export(db: AsyncSession, run_id: int):
+    result = await db.execute(
+        select(JobRun)
+        .options(selectinload(JobRun.check_results), selectinload(JobRun.job))
+        .where(JobRun.id == run_id)
+    )
+    job_run = result.scalar_one_or_none()
+    if not job_run:
+        raise HTTPException(status_code=404, detail="Job run not found")
+    host_ids = {check.host_id for check in job_run.check_results}
+    hosts: dict[int, Host] = {}
+    if host_ids:
+        hosts_result = await db.execute(select(Host).where(Host.id.in_(host_ids)))
+        hosts = {host.id: host for host in hosts_result.scalars().all()}
+    profile_id = job_run.job.profile_id if job_run.job else None
+    profile_name = ""
+    waivers: list[ComplianceWaiver] = []
+    if profile_id is not None:
+        profile = await db.get(Profile, profile_id)
+        profile_name = profile.profile_name if profile is not None else ""
+        waiver_rows = await db.execute(
+            select(ComplianceWaiver).where(ComplianceWaiver.profile_id == profile_id)
+        )
+        waivers = list(waiver_rows.scalars().all())
+    severity_by_rule = await _severity_by_tech_name(db, profile_id)
+    waived_by_check_id = await resolve_run_waived_map(
+        db,
+        checks=list(job_run.check_results),
+        profile_id=profile_id,
+        job_id=job_run.job_id,
+    )
+    return job_run, hosts, severity_by_rule, waived_by_check_id, profile_name, waivers
+
+
+async def fetch_run_sarif(
+    db: AsyncSession,
+    run_id: int,
+    *,
+    tool_version: str,
+    status: str | None = None,
+    severity: str | None = None,
+    host_id: int | None = None,
+    rule: str | None = None,
+) -> tuple[str, str]:
+    job_run, hosts, severity_by_rule, waived_by_check_id, profile_name, _waivers = await _load_run_for_export(
+        db, run_id
+    )
+    content = render_run_sarif(
+        run_id=run_id,
+        checks=list(job_run.check_results),
+        hosts=hosts,
+        severity_by_rule=severity_by_rule,
+        waived_by_check_id=waived_by_check_id,
+        profile_name=profile_name,
+        tool_version=tool_version,
+        status_filter=status,
+        severity_filter=severity,
+        host_id_filter=host_id,
+        rule_filter=rule,
+    )
+    return content, f"report-{run_id}.sarif"
+
+
+async def fetch_run_xlsx(
+    db: AsyncSession,
+    run_id: int,
+    *,
+    status: str | None = None,
+    severity: str | None = None,
+    host_id: int | None = None,
+    rule: str | None = None,
+) -> tuple[bytes, str]:
+    job_run, hosts, severity_by_rule, waived_by_check_id, profile_name, waivers = await _load_run_for_export(
+        db, run_id
+    )
+    content = render_run_xlsx(
+        run_id=run_id,
+        job_name=job_run.job.name if job_run.job else "",
+        profile_name=profile_name,
+        started_at=job_run.started_at,
+        finished_at=job_run.finished_at,
+        checks=list(job_run.check_results),
+        hosts=hosts,
+        severity_by_rule=severity_by_rule,
+        waived_by_check_id=waived_by_check_id,
+        waivers=waivers,
+        job_id=job_run.job_id,
+        status_filter=status,
+        severity_filter=severity,
+        host_id_filter=host_id,
+        rule_filter=rule,
+    )
+    return content, f"report-{run_id}.xlsx"
+
+
 def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -238,13 +702,6 @@ def _iso(value: datetime | None) -> str | None:
 
 def _json_bytes(payload: dict) -> bytes:
     return (json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-
-
-def _evidence_bytes(payload: dict) -> bytes:
-    raw = _json_bytes(payload).decode("utf-8")
-    cleaned = redact_sensitive(raw)
-    text = cleaned if isinstance(cleaned, str) else raw
-    return text.encode("utf-8")
 
 
 def _status_value(status: object) -> str:
@@ -264,10 +721,11 @@ def waivers_affecting_run(
     profile_id: int | None,
     job_id: int | None,
     at: datetime | None,
+    hosts: dict | None = None,
 ) -> list:
     """Waivers that covered a FAIL on this run at the time the run finished."""
     from secaudit_core.enums import CheckStatus, WaiverStatus
-    from secaudit_core.waivers import waiver_matches_check
+    from secaudit_core.waivers import host_scope_view, waiver_matches_check
 
     if profile_id is None or at is None:
         return []
@@ -286,12 +744,17 @@ def waivers_affecting_run(
                 continue
             if waiver.expires_at is not None and _as_utc(waiver.expires_at) <= moment:
                 continue
+            host = hosts.get(check.host_id) if hosts else None
+            host_site, host_environment, host_tags = host_scope_view(host) if host is not None else (None, None, set())
             if not waiver_matches_check(
                 waiver,
                 profile_id=profile_id,
                 rule_tech_name=check.rule_tech_name,
                 host_id=check.host_id,
                 job_id=job_id,
+                host_site=host_site,
+                host_environment=host_environment,
+                host_tags=host_tags,
             ):
                 continue
             candidates.append(waiver)
@@ -302,6 +765,9 @@ def waivers_affecting_run(
             key=lambda waiver: (
                 1 if waiver.host_id is not None else 0,
                 1 if waiver.job_id is not None else 0,
+                1 if waiver.scope_tag else 0,
+                1 if waiver.scope_site else 0,
+                1 if waiver.scope_environment else 0,
                 waiver.id,
             ),
             reverse=True,
@@ -372,6 +838,7 @@ def build_evidence_documents(
         profile_id=profile_id,
         job_id=job_run.job_id,
         at=moment,
+        hosts=hosts,
     )
     if profile_id is not None:
         totals["WAIVED"] = sum(
@@ -385,6 +852,9 @@ def build_evidence_documents(
                     rule_tech_name=check.rule_tech_name,
                     host_id=check.host_id,
                     job_id=job_run.job_id,
+                    host_site=host_scope_view(hosts.get(check.host_id))[0] if hosts.get(check.host_id) else None,
+                    host_environment=host_scope_view(hosts.get(check.host_id))[1] if hosts.get(check.host_id) else None,
+                    host_tags=host_scope_view(hosts.get(check.host_id))[2] if hosts.get(check.host_id) else None,
                 )
                 for waiver in affecting
             )
@@ -462,83 +932,6 @@ async def load_run_evidence(db: AsyncSession, job_run: JobRun, hosts: dict[int, 
         waivers=waivers,
         initiator=initiator,
     )
-
-
-def build_run_package_zip(
-    *,
-    run_id: int,
-    html: str | bytes,
-    pdf: bytes,
-    csv_text: str,
-    locale: str,
-    generated_at: datetime | None = None,
-    include_evidence: bool = False,
-    evidence_run: dict | None = None,
-    evidence_waivers: dict | None = None,
-    evidence_profile: dict | None = None,
-) -> bytes:
-    """Build a downloadable run pack ZIP (HTML + PDF + CSV + manifest).
-
-    When ``include_evidence`` is set, the archive also contains
-    ``evidence/run.json``, ``evidence/waivers.json`` and ``evidence/profile.json``.
-    ``manifest.sha256`` is the sha256 of ``manifest.json`` and is not listed inside
-    the manifest, so the hash is not part of the bytes it covers.
-    """
-    html_bytes = html.encode("utf-8") if isinstance(html, str) else html
-    csv_bytes = csv_text.encode("utf-8")
-    stamped = generated_at or datetime.now(UTC)
-    if stamped.tzinfo is None:
-        stamped = stamped.replace(tzinfo=UTC)
-
-    members: list[tuple[str, bytes]] = [
-        (f"report-{run_id}.html", html_bytes),
-        (f"report-{run_id}.pdf", pdf),
-        (f"report-{run_id}.csv", csv_bytes),
-    ]
-
-    evidence_meta: dict[str, object] = {
-        "included": False,
-        "schema": EVIDENCE_PACK_SCHEMA,
-    }
-    if include_evidence:
-        if evidence_run is None or evidence_waivers is None or evidence_profile is None:
-            raise ValueError("evidence documents are required when include_evidence is set")
-        evidence_members = [
-            ("evidence/run.json", _evidence_bytes(evidence_run)),
-            ("evidence/waivers.json", _evidence_bytes(evidence_waivers)),
-            ("evidence/profile.json", _evidence_bytes(evidence_profile)),
-        ]
-        members.extend(evidence_members)
-        evidence_meta = {
-            "included": True,
-            "schema": EVIDENCE_PACK_SCHEMA,
-            "manifest_sha256_file": "manifest.sha256",
-        }
-
-    manifest: dict[str, object] = {
-        "schema": RUN_PACK_SCHEMA,
-        "run_id": run_id,
-        "generated_at": stamped.isoformat().replace("+00:00", "Z"),
-        "locale": locale,
-        "files": [
-            {"name": name, "sha256": _sha256_hex(payload), "size": len(payload)}
-            for name, payload in members
-        ],
-        "evidence": evidence_meta,
-    }
-
-    manifest_bytes = _json_bytes(manifest)
-    members.append(("manifest.json", manifest_bytes))
-    if include_evidence:
-        members.append(("manifest.sha256", (_sha256_hex(manifest_bytes) + "\n").encode("ascii")))
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, payload in members:
-            archive.writestr(name, payload)
-        if not include_evidence:
-            archive.writestr("evidence/.keep", b"")
-    return buffer.getvalue()
 
 
 def build_multi_run_compare(

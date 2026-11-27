@@ -5,6 +5,8 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from secaudit_core.profile_variables import load_package_variables, resolve_profile_variables
+
 from app.core.config import settings
 from app.models import (
   Category,
@@ -19,7 +21,6 @@ from app.models import (
   JobTemplate,
   Playbook,
   RemediationJob,
-  RemediationResult,
   RemediationRun,
   Rule,
   ScheduledReport,
@@ -200,7 +201,7 @@ class ProfileService:
     for profile_id, kind, count in script_rows:
       if kind == ScriptKind.REMEDIATION:
         remediation[profile_id] = int(count)
-      else:
+      elif kind == ScriptKind.AUDIT:
         audit[profile_id] = int(count)
 
     interp_rows = (
@@ -393,11 +394,32 @@ class ProfileService:
       if not content or len(content) > MAX_SCRIPT_CONTENT_BYTES:
         raise ValueError(f"Script must be 1..{MAX_SCRIPT_CONTENT_BYTES} bytes: {name}")
       # Discovery decides script kind by the file-name marker, so enforce it here too.
-      if kind is ScriptKind.REMEDIATION and REMEDIATION_SCRIPT_MARKER not in name.lower():
-        raise ValueError(
-          f"Remediation script name must contain '{REMEDIATION_SCRIPT_MARKER}': {name}"
-        )
-      if kind is ScriptKind.AUDIT and REMEDIATION_SCRIPT_MARKER in name.lower():
+      from secaudit_core.profile_packages import (
+        REMEDIATION_BACKUP_MARKER,
+        REMEDIATION_RESTORE_MARKER,
+      )
+
+      lowered = name.lower()
+      if kind is ScriptKind.REMEDIATION_BACKUP:
+        if REMEDIATION_BACKUP_MARKER not in lowered:
+          raise ValueError(
+            f"Backup script name must contain '{REMEDIATION_BACKUP_MARKER}': {name}"
+          )
+      elif kind is ScriptKind.REMEDIATION_RESTORE:
+        if REMEDIATION_RESTORE_MARKER not in lowered:
+          raise ValueError(
+            f"Restore script name must contain '{REMEDIATION_RESTORE_MARKER}': {name}"
+          )
+      elif kind is ScriptKind.REMEDIATION:
+        if REMEDIATION_SCRIPT_MARKER not in lowered:
+          raise ValueError(
+            f"Remediation script name must contain '{REMEDIATION_SCRIPT_MARKER}': {name}"
+          )
+        if REMEDIATION_BACKUP_MARKER in lowered or REMEDIATION_RESTORE_MARKER in lowered:
+          raise ValueError(
+            f"Remediation script name must not use backup/restore markers: {name}"
+          )
+      elif kind is ScriptKind.AUDIT and REMEDIATION_SCRIPT_MARKER in lowered:
         raise ValueError(
           f"Audit script name must not contain '{REMEDIATION_SCRIPT_MARKER}': {name}"
         )
@@ -421,7 +443,12 @@ class ProfileService:
       package = load_profile_package(package_dir)
       items = {
         item["script_file"]: item
-        for item in (*package["scripts"], *package["remediation_scripts"])
+        for item in (
+          *package["scripts"],
+          *package["remediation_scripts"],
+          *package.get("remediation_backup_scripts", []),
+          *package.get("remediation_restore_scripts", []),
+        )
       }
       for path in written:
         item = items.get(path.name)
@@ -429,10 +456,14 @@ class ProfileService:
           bindings[path.name] = list(item.get("context", []))
 
       unresolved = [path.name for path in written if path.name not in items]
-      if unresolved and kind is ScriptKind.REMEDIATION:
+      if unresolved and kind in {
+        ScriptKind.REMEDIATION,
+        ScriptKind.REMEDIATION_BACKUP,
+        ScriptKind.REMEDIATION_RESTORE,
+      }:
         # Reserved/excluded names would never be discovered, so they must not be stored.
         raise ValueError(
-          "Remediation script is not discoverable in the package (reserved name): "
+          "Script is not discoverable in the package (reserved name): "
           + ", ".join(unresolved)
         )
       if unresolved:
@@ -694,6 +725,7 @@ class ProfileService:
       "is_active": version.is_active,
       "created_by": version.created_by,
       "created_at": version.created_at,
+      "variable_values": version.variable_values,
     }
 
   async def list_profile_versions(self, db: AsyncSession, profile_id: int) -> list[dict]:
@@ -724,6 +756,7 @@ class ProfileService:
     label: str | None,
     activate: bool,
     actor: str | None = None,
+    variable_values: dict | None = None,
   ) -> dict:
     profile = await self.get_profile(db, profile_id)
     if not profile:
@@ -754,6 +787,8 @@ class ProfileService:
       for item in existing.scalars().all():
         item.is_active = False
       await db.flush()
+    resolved = resolve_profile_variables(profile.variable_schema or [], variable_values)
+    frozen = {item["name"]: item["value"] for item in resolved} or None
     last_number = (
       await db.execute(
         select(func.max(ProfileVersion.number)).where(ProfileVersion.profile_id == profile_id)
@@ -764,6 +799,7 @@ class ProfileService:
       number=last_number + 1,
       label=label,
       requirement_ids=selected,
+      variable_values=frozen,
       is_active=activate,
       created_by=actor,
     )
@@ -906,6 +942,8 @@ class ProfileService:
     meta = package["profile"]
     scripts = package["scripts"]
     remediation_scripts = package.get("remediation_scripts", [])
+    remediation_backup_scripts = package.get("remediation_backup_scripts", [])
+    remediation_restore_scripts = package.get("remediation_restore_scripts", [])
     category_slug = meta.get("category_slug") or package.get("category_slug")
     category = await self._resolve_category(db, category_id, category_slug)
     resolved_format = meta.get("source_format") or source_format or "custom"
@@ -963,6 +1001,7 @@ class ProfileService:
         os_version=os_fields["os_version"],
         os_vendor=os_fields["os_vendor"],
         is_active=meta.get("is_active", True),
+        variable_schema=load_package_variables(package_dir),
       )
       db.add(profile)
       await db.flush()
@@ -981,6 +1020,7 @@ class ProfileService:
       profile.os_version = os_fields["os_version"]
       profile.os_vendor = os_fields["os_vendor"]
       profile.is_active = meta.get("is_active", True)
+      profile.variable_schema = load_package_variables(package_dir)
       job_script_files = await db.run_sync(
         lambda sync_session: capture_remediation_script_links(sync_session, profile.id)
       )
@@ -1016,6 +1056,8 @@ class ProfileService:
 
     chosen_audit = chosen_primary(scripts, ScriptKind.AUDIT)
     chosen_remediation = chosen_primary(remediation_scripts, ScriptKind.REMEDIATION)
+    chosen_backup = chosen_primary(remediation_backup_scripts, ScriptKind.REMEDIATION_BACKUP)
+    chosen_restore = chosen_primary(remediation_restore_scripts, ScriptKind.REMEDIATION_RESTORE)
 
     for item in scripts:
       execution_type = map_execution_type(item.get("type", "SSH"))
@@ -1064,6 +1106,30 @@ class ProfileService:
         == chosen_remediation,
       )
       db.add(script)
+
+    def _add_side_scripts(items: list[dict], kind: ScriptKind, chosen: tuple[str, str] | None) -> None:
+      for item in items:
+        script_path = package_dir / item["script_file"]
+        if not script_path.is_file():
+          raise FileNotFoundError(f"Script not found: {item['script_file']}")
+        db.add(
+          CheckScript(
+            profile_id=profile.id,
+            name=item["name"],
+            execution_type=map_execution_type(item.get("type", "SSH")),
+            script_file=item["script_file"],
+            script_kind=kind,
+            description=item.get("description"),
+            is_primary=(
+              map_execution_type(item.get("type", "SSH")).value,
+              item["script_file"],
+            )
+            == chosen,
+          )
+        )
+
+    _add_side_scripts(remediation_backup_scripts, ScriptKind.REMEDIATION_BACKUP, chosen_backup)
+    _add_side_scripts(remediation_restore_scripts, ScriptKind.REMEDIATION_RESTORE, chosen_restore)
 
     await db.flush()
     if job_script_files:

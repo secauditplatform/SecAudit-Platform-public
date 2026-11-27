@@ -7,6 +7,7 @@ import {
   RADAR_W,
   buildRadarClusters,
   isRadarAggregate,
+  radarGroupLabelPoint,
   radarNodePoint,
 } from "./auditMapRadarLayout";
 
@@ -32,6 +33,7 @@ type Props = {
   zoom: number;
   pan: { x: number; y: number };
   onPan: (pan: { x: number; y: number }) => void;
+  onZoomBy: (factor: number) => void;
   onSelect: (node: AuditMapNode, groupKey: string) => void;
   onFocusGroup: (key: string | null) => void;
   t: TFunction;
@@ -76,6 +78,7 @@ export function AuditMapRadar({
   zoom,
   pan,
   onPan,
+  onZoomBy,
   onSelect,
   onFocusGroup,
   t,
@@ -124,22 +127,18 @@ export function AuditMapRadar({
     return status === "unchecked" ? t("auditMap.radarUnchecked") : t(`auditMap.legend.${status}`);
   }
 
-  function groupLabelStyle(cluster: (typeof clusters)[number]): CSSProperties {
-    if (aggregate) {
-      return { left: pct(cluster.gx, RADAR_W), top: pct(cluster.gy - 56, RADAR_H), transform: "translate(-50%, -100%)" };
-    }
-    // A wide ring keeps the chip clear of the host labels; a small ring does not.
-    if (cluster.count >= 2) {
-      return {
-        left: pct(cluster.gx, RADAR_W),
-        top: pct(cluster.gy, RADAR_H),
-        transform: "translate(-50%, -50%)",
-      };
-    }
+  function groupLabelStyle(cluster: (typeof clusters)[number], index: number): CSSProperties {
+    const hosts = aggregate
+      ? [{ x: cluster.gx, y: cluster.gy }]
+      : (groups[index]?.nodes ?? []).map((_, nodeIndex) => radarNodePoint(cluster, nodeIndex));
+    const point = radarGroupLabelPoint(
+      aggregate ? { ...cluster, r: many ? 28 : 44, count: Math.max(hosts.length, 1) } : cluster,
+      hosts,
+    );
     return {
-      left: pct(cluster.gx, RADAR_W),
-      top: pct(cluster.gy - cluster.r - 20, RADAR_H),
-      transform: "translate(-50%, -100%)",
+      left: pct(point.x, RADAR_W),
+      top: pct(point.y, RADAR_H),
+      transform: "translate(-50%, -50%)",
     };
   }
 
@@ -152,6 +151,10 @@ export function AuditMapRadar({
         role="group"
         aria-label={t("auditMap.displayRadar")}
         onPointerDown={startPan}
+        onWheel={(event) => {
+          event.preventDefault();
+          onZoomBy(event.deltaY > 0 ? 1 / 1.12 : 1.12);
+        }}
       >
         <div
           className="pf-audit-map__radar-world"
@@ -219,7 +222,7 @@ export function AuditMapRadar({
               key={`label-${cluster.key ?? "other"}-${index}`}
               type="button"
               className="pf-audit-map__radar-group"
-              style={groupLabelStyle(cluster)}
+              style={groupLabelStyle(cluster, index)}
               aria-pressed={focused}
               aria-label={`${titleFor(cluster.key)} · ${cluster.count}`}
               onClick={() => onFocusGroup(cluster.key)}
@@ -269,7 +272,8 @@ export function AuditMapRadar({
                 const selected = isSelected(node, cluster.key ?? "");
                 const running = runningHostId === node.host_id;
                 const spacing = cluster.count > 1 ? (2 * Math.PI * cluster.r) / cluster.count : Infinity;
-                const showHostLabels = groups.length <= 8 || cluster.count === 1;
+                // With many subnets the chip already names the group; host text only clutters.
+                const showHostLabels = groups.length <= 8;
                 const radial = showHostLabels && cluster.count >= 2;
                 const tight = spacing < 46;
                 const size = Math.min(40, Math.max(22, spacing * 0.72));

@@ -29,6 +29,18 @@ def waiver_is_effective(
     return expires > current
 
 
+def host_scope_view(host: object) -> tuple[str | None, str | None, set[str]]:
+    tags: set[str] = set()
+    for link in getattr(host, "tags", ()) or ():
+        tag = getattr(link, "tag", None)
+        name = getattr(tag, "name", None) if tag is not None else None
+        if name:
+            tags.add(str(name))
+    site = getattr(host, "site", None)
+    environment = getattr(host, "environment", None)
+    return (str(site) if site else None, str(environment) if environment else None, tags)
+
+
 def waiver_matches_check(
     waiver: ComplianceWaiver,
     *,
@@ -36,6 +48,9 @@ def waiver_matches_check(
     rule_tech_name: str,
     host_id: int,
     job_id: int | None,
+    host_site: str | None = None,
+    host_environment: str | None = None,
+    host_tags: set[str] | None = None,
 ) -> bool:
     if waiver.profile_id != profile_id:
         return False
@@ -44,6 +59,16 @@ def waiver_matches_check(
     if waiver.host_id is not None and waiver.host_id != host_id:
         return False
     if waiver.job_id is not None and waiver.job_id != job_id:
+        return False
+    needs_host = bool(waiver.scope_site or waiver.scope_environment or waiver.scope_tag)
+    if needs_host and host_site is None and host_environment is None and not host_tags:
+        if waiver.scope_site or waiver.scope_environment or waiver.scope_tag:
+            return False
+    if waiver.scope_site and waiver.scope_site != (host_site or ""):
+        return False
+    if waiver.scope_environment and waiver.scope_environment != (host_environment or ""):
+        return False
+    if waiver.scope_tag and waiver.scope_tag not in (host_tags or set()):
         return False
     return True
 
@@ -56,13 +81,19 @@ def find_matching_waiver(
     host_id: int,
     job_id: int | None,
     now: datetime | None = None,
+    hosts: dict | None = None,
 ) -> ComplianceWaiver | None:
-    """Prefer more specific scope: host+job > host > job > global."""
+    """Prefer more specific scope: host+job, then tag, site, and environment."""
+    host = (hosts or {}).get(host_id)
+    host_site, host_environment, host_tags = host_scope_view(host) if host is not None else (None, None, set())
 
-    def specificity(waiver: ComplianceWaiver) -> tuple[int, int, int]:
+    def specificity(waiver: ComplianceWaiver) -> tuple[int, int, int, int, int, int]:
         return (
             1 if waiver.host_id is not None else 0,
             1 if waiver.job_id is not None else 0,
+            1 if waiver.scope_tag else 0,
+            1 if waiver.scope_site else 0,
+            1 if waiver.scope_environment else 0,
             waiver.id,
         )
 
@@ -76,6 +107,9 @@ def find_matching_waiver(
             rule_tech_name=rule_tech_name,
             host_id=host_id,
             job_id=job_id,
+            host_site=host_site,
+            host_environment=host_environment,
+            host_tags=host_tags,
         )
     ]
     if not matches:
@@ -146,6 +180,7 @@ def waived_fail_ids(
     profile_id: int | None,
     job_id: int | None,
     now: datetime | None = None,
+    hosts: dict | None = None,
 ) -> dict[int, ComplianceWaiver]:
     if profile_id is None:
         return {}
@@ -161,6 +196,7 @@ def waived_fail_ids(
             host_id=check.host_id,
             job_id=job_id,
             now=now,
+            hosts=hosts,
         )
         if match is not None:
             mapped[check.id] = match
@@ -174,6 +210,7 @@ def resolve_waived_fail_map(
     profile_id: int | None,
     job_id: int | None,
     now: datetime | None = None,
+    hosts: dict | None = None,
 ) -> dict[int, ComplianceWaiver]:
     """Map FAIL check ids covered by an active waiver for one run context."""
     return waived_fail_ids(
@@ -182,6 +219,7 @@ def resolve_waived_fail_map(
         profile_id=profile_id,
         job_id=job_id,
         now=now,
+        hosts=hosts,
     )
 
 
@@ -195,7 +233,10 @@ async def resolve_waived_fail_map_async(
     if profile_id is None:
         return {}
     waivers = await load_active_waivers(db, profile_id=profile_id, job_id=job_id)
-    return resolve_waived_fail_map(checks, waivers, profile_id=profile_id, job_id=job_id)
+    hosts = await load_waiver_hosts(db, checks)
+    return resolve_waived_fail_map(
+        checks, waivers, profile_id=profile_id, job_id=job_id, hosts=hosts
+    )
 
 
 def resolve_waived_fail_map_sync(
@@ -208,13 +249,54 @@ def resolve_waived_fail_map_sync(
     if profile_id is None:
         return {}
     waivers = load_active_waivers_sync(db, profile_id=profile_id, job_id=job_id)
-    return resolve_waived_fail_map(checks, waivers, profile_id=profile_id, job_id=job_id)
+    hosts = load_waiver_hosts_sync(db, checks)
+    return resolve_waived_fail_map(
+        checks, waivers, profile_id=profile_id, job_id=job_id, hosts=hosts
+    )
+
+
+def _waiver_host_ids(checks: Iterable) -> set[int]:
+    ids: set[int] = set()
+    for check in checks:
+        host_id = getattr(check, "host_id", None)
+        if host_id is not None:
+            ids.add(int(host_id))
+    return ids
+
+
+def _hosts_stmt(host_ids: set[int]):
+    from sqlalchemy.orm import selectinload
+
+    from secaudit_core.models import Host, HostTagLink
+
+    return (
+        select(Host)
+        .options(selectinload(Host.tags).selectinload(HostTagLink.tag))
+        .where(Host.id.in_(host_ids))
+    )
+
+
+async def load_waiver_hosts(db: AsyncSession, checks: Iterable) -> dict:
+    host_ids = _waiver_host_ids(checks)
+    if not host_ids:
+        return {}
+    result = await db.execute(_hosts_stmt(host_ids))
+    return {host.id: host for host in result.scalars().all()}
+
+
+def load_waiver_hosts_sync(db: Session, checks: Iterable) -> dict:
+    host_ids = _waiver_host_ids(checks)
+    if not host_ids:
+        return {}
+    result = db.execute(_hosts_stmt(host_ids))
+    return {host.id: host for host in result.scalars().all()}
 
 
 def waived_ids_by_run(
     runs: Iterable,
     checks_by_run: dict[int, list],
     waivers: Iterable[ComplianceWaiver],
+    hosts: dict | None = None,
 ) -> dict[int, set[int]]:
     """Batch-resolve waived FAIL check ids for runs that already have ``job`` loaded."""
     by_profile: dict[int, list[ComplianceWaiver]] = {}
@@ -233,6 +315,7 @@ def waived_ids_by_run(
             by_profile.get(profile_id, []),
             profile_id=profile_id,
             job_id=run.job_id,
+            hosts=hosts,
         )
         out[run.id] = set(mapped.keys())
     return out

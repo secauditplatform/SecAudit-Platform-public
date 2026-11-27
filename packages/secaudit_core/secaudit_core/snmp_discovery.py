@@ -49,24 +49,17 @@ def normalize_priv_protocol(value: str | None) -> str | None:
 def snmp_addresses(target: str, *, max_prefix_len: int | None = None) -> list[str]:
     """Expand a validated inventory target into probe addresses.
 
-    IPv4 CIDR uses the same prefix ceiling as nmap. An IPv6 prefix is rejected:
-    a /64 is not a /24. A hostname is resolved and each address is checked
+    IPv4 CIDR uses the same prefix ceiling as nmap. IPv6 CIDR is limited to
+    ``/120``–``/128``. A hostname is resolved and each address is checked
     against the same block list as a literal IP.
     """
     cleaned = validate_scan_target(target, max_prefix_len=max_prefix_len)
-    if "/" in cleaned:
-        try:
-            net = ipaddress.ip_network(cleaned, strict=False)
-        except ValueError as exc:
-            raise SnmpDiscoveryError("Invalid CIDR notation") from exc
-        if isinstance(net, ipaddress.IPv6Network):
-            raise SnmpDiscoveryError(
-                "IPv6 prefixes are not expanded for SNMP; probe one address"
-            )
     expanded = expand_scan_target(cleaned)
     if expanded is None:
         if "/" in cleaned:
-            raise SnmpDiscoveryError("SNMP scan accepts an IP, a hostname, or an IPv4 CIDR")
+            raise SnmpDiscoveryError(
+                "SNMP scan accepts an IP, a hostname, an IPv4 CIDR, or IPv6 /120–/128"
+            )
         expanded = _resolve_hostname(cleaned, max_prefix_len=max_prefix_len)
     if len(expanded) > MAX_SNMP_ADDRESSES:
         raise SnmpDiscoveryError("SNMP target expands past the inventory scan limit")

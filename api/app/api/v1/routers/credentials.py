@@ -22,6 +22,21 @@ from app.services.object_rbac import (
 router = APIRouter()
 
 
+_ALLOWED_BECOME = frozenset({"sudo", "doas", "su", "dzdo"})
+
+
+def _normalize_become_method(value: str | None) -> str | None:
+    method = (value or "").strip().lower() or None
+    if method is None:
+        return None
+    if method not in _ALLOWED_BECOME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported become_method (allowed: {', '.join(sorted(_ALLOWED_BECOME))})",
+        )
+    return method
+
+
 def _credential_to_read(credential: Credential) -> CredentialRead:
     return CredentialRead(
         id=credential.id,
@@ -29,9 +44,12 @@ def _credential_to_read(credential: Credential) -> CredentialRead:
         credential_type=credential.credential_type,
         username=credential.username,
         service_username=credential.service_username,
+        become_method=credential.become_method,
+        become_username=credential.become_username,
         snmp_priv_protocol=credential.snmp_priv_protocol,
         description=credential.description,
         has_service_secret=bool(credential.encrypted_service_secret),
+        has_become_password=bool(credential.encrypted_become_secret),
         created_at=credential.created_at,
     )
 
@@ -109,6 +127,11 @@ async def create_credential(
         encrypted_service_secret=(
             encrypt_secret(data.service_secret, settings) if data.service_secret else None
         ),
+        become_method=_normalize_become_method(data.become_method),
+        become_username=(data.become_username or "").strip() or None,
+        encrypted_become_secret=(
+            encrypt_secret(data.become_password, settings) if data.become_password else None
+        ),
         description=data.description,
         snmp_priv_protocol=data.snmp_priv_protocol,
     )
@@ -183,6 +206,15 @@ async def update_credential(
     if data.service_secret is not None:
         credential.encrypted_service_secret = (
             encrypt_secret(data.service_secret, settings) if data.service_secret else None
+        )
+    fields_set = data.model_fields_set
+    if "become_method" in fields_set:
+        credential.become_method = _normalize_become_method(data.become_method)
+    if "become_username" in fields_set:
+        credential.become_username = (data.become_username or "").strip() or None
+    if "become_password" in fields_set:
+        credential.encrypted_become_secret = (
+            encrypt_secret(data.become_password, settings) if data.become_password else None
         )
     if data.snmp_priv_protocol is not None:
         credential.snmp_priv_protocol = data.snmp_priv_protocol or None

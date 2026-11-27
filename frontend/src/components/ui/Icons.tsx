@@ -428,14 +428,6 @@ export function IconKeyRound({ className }: IconProps) {
   );
 }
 
-export function IconAnsible({ className }: IconProps) {
-  return (
-    <svg className={className} viewBox="0 0 512 512" fill="currentColor" aria-hidden>
-      <path d="M256 8C119 8 8 119 8 256s111 248 248 248 248-111 248-248S393 8 256 8zm121.6 313.1c4.7 4.7 4.7 12.3 0 17L338 377.6c-4.7 4.7-12.3 4.7-17 0L256 312l-65.1 65.6c-4.7 4.7-12.3 4.7-17 0L134.4 338c-4.7-4.7-4.7-12.3 0-17l65.6-65-65.6-65.1c-4.7-4.7-4.7-12.3 0-17l39.6-39.6c4.7-4.7 12.3-4.7 17 0l65 65.7 65.1-65.6c4.7-4.7 12.3-4.7 17 0l39.6 39.6c4.7 4.7 4.7 12.3 0 17L312 256l65.6 65.1z" />
-    </svg>
-  );
-}
-
 export function IconLinux({ className }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 32 32" aria-hidden>
@@ -486,23 +478,6 @@ export function IconNetwork({ className }: IconProps) {
       <rect x="15" y="14" width="6" height="5" rx="1" />
       <rect x="9" y="5" width="6" height="5" rx="1" />
       <path d="M6 14V11h3M15 11h3v3M12 10V8" />
-    </svg>
-  );
-}
-
-/** Network topology with shield — compliance checks on device configs. */
-export function IconNetworkCompliance({ className }: IconProps) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
-      <rect x="2" y="13" width="5" height="4" rx="0.75" />
-      <rect x="17" y="13" width="5" height="4" rx="0.75" />
-      <rect x="9.5" y="4" width="5" height="4" rx="0.75" />
-      <path d="M4.5 13V10.5h2M19.5 10.5V13M12 8.5V6.5" />
-      <path
-        d="M12 16.5c-2.2 0-4 .9-4 2v1.5h8V18.5c0-1.1-1.8-2-4-2z"
-        strokeLinejoin="round"
-      />
-      <path d="M12 15.5V17.5M10.2 19.2 12 21l1.8-1.8" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   );
 }
@@ -562,23 +537,5 @@ export function IconAagGenerate({ className }: IconProps) {
       <AiSpark cx={18.6} cy={5.8} r={2.05} />
       <AiSpark cx={18} cy={17.8} r={1.45} />
     </StrokeIcon>
-  );
-}
-
-/** Network topology with wrench — remediation config generation. */
-export function IconNetworkRemediation({ className }: IconProps) {
-  return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" aria-hidden>
-      <rect x="1.5" y="12" width="5" height="4" rx="0.75" />
-      <rect x="17.5" y="12" width="5" height="4" rx="0.75" />
-      <rect x="9" y="3" width="5" height="4" rx="0.75" />
-      <path d="M4 12V9.5h2M20 9.5V12M11.5 7V5" />
-      <path
-        d="M14.5 16.5 18 20l-1.2 1.2a1.1 1.1 0 0 1-1.6 0l-1.1-1.1a1.1 1.1 0 0 1 0-1.6L15.5 17"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path d="M13.5 17.5 11 20" strokeLinecap="round" />
-    </svg>
   );
 }

@@ -145,3 +145,113 @@ def platforms_compatible(host_os_type: str | None, profile_plat: str) -> bool:
     if host_plat == "unknown" or profile_plat == "unknown":
         return True  # shortcut: do not block when metadata is missing
     return host_plat == profile_plat
+
+
+FitVerdict = Literal["match", "version_mismatch", "distro_mismatch", "unknown_os"]
+_GENERIC_OS_NAMES = frozenset({"", "linux", "windows", "unix", "network", "*", "any"})
+
+
+def profile_fit(
+    *,
+    host_os_type: str | None,
+    host_os_family: str | None,
+    host_os_version: str | None,
+    profile_os_name: str | None,
+    profile_os_version: str | None,
+    profile_name: str | None,
+    profile_plat: str,
+    category_slug: str | None,
+    open_ports: list[int] | None = None,
+) -> FitVerdict:
+    """Family and version verdict. ``match`` is the only applicable result.
+
+    A generic profile (no distro and no version) stays applicable when the coarse
+    platform matches, including when the host OS is unknown. A named distro is
+    not applicable until the host has that family.
+    """
+    slug = (category_slug or "").strip().lower()
+    if slug == "services" and _known_service_profile(profile_name, profile_os_name):
+        return _service_fit(profile_name, profile_os_name, open_ports)
+    host_plat = host_platform(host_os_type)
+    if profile_plat not in {"unknown", host_plat} and host_plat != "unknown":
+        return "distro_mismatch"
+    if _generic_os_profile(profile_os_name, profile_os_version):
+        return "match"
+    from secaudit_core.audit_flow_match import detect_family
+
+    host_family = detect_family(
+        " ".join(part for part in (host_os_family, host_os_type, host_os_version) if part)
+    )
+    if not host_family:
+        return "unknown_os"
+    profile_family = detect_family(
+        " ".join(part for part in (profile_os_name, profile_os_version) if part)
+    )
+    if profile_family and host_family != profile_family:
+        return "distro_mismatch"
+    wanted = profile_os_version if _has_version(profile_os_version) else profile_os_name
+    have = host_os_version if _has_version(host_os_version) else f"{host_os_family or ''} {host_os_type or ''}"
+    return _version_fit(wanted, have)
+
+
+def _has_version(value: str | None) -> bool:
+    from secaudit_core.audit_flow_match import _version_tuple
+
+    return bool(_version_tuple(value))
+
+
+def _generic_os_profile(os_name: str | None, os_version: str | None) -> bool:
+    from secaudit_core.audit_flow_match import detect_family
+
+    if _has_version(os_version) or _has_version(os_name):
+        return False
+    name = (os_name or "").strip().lower()
+    if name in _GENERIC_OS_NAMES:
+        return True
+    return detect_family(os_name or "") is None
+
+
+def _version_fit(profile_version: str | None, host_version: str | None) -> FitVerdict:
+    from secaudit_core.audit_flow_match import _version_tuple
+
+    wanted = _version_tuple(profile_version)
+    if not wanted:
+        return "match"
+    have = _version_tuple(host_version)
+    if not have:
+        return "unknown_os"
+    width = min(len(wanted), len(have))
+    if wanted[:width] != have[:width]:
+        return "version_mismatch"
+    return "match"
+
+
+def _known_service_profile(profile_name: str | None, os_name: str | None) -> bool:
+    from secaudit_core.audit_flow_match import _APP_SIGNATURES
+
+    hay = f"{profile_name or ''} {os_name or ''}".lower()
+    return any(any(name in hay for name in names) for _needles, _ports, names in _APP_SIGNATURES)
+
+
+def _service_fit(
+    profile_name: str | None,
+    os_name: str | None,
+    open_ports: list[int] | None,
+) -> FitVerdict:
+    from secaudit_core.audit_flow_match import rank_application_profiles
+
+    if not open_ports:
+        return "unknown_os"
+    ranked = rank_application_profiles(
+        services=None,
+        open_ports=open_ports,
+        profiles=[
+            {
+                "id": 0,
+                "profile_name": profile_name or "",
+                "os_name": os_name,
+                "category_slug": "services",
+            }
+        ],
+    )
+    return "match" if ranked else "distro_mismatch"

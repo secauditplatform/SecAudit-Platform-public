@@ -52,7 +52,7 @@ from app.services.audit_flow import (
 from app.services.audit_log import log_audit_event
 from app.services.dispatch import commit_and_try_dispatch, enqueue_run_dispatch
 from app.services.task_outbox import try_dispatch_outbox_immediate
-from app.services.object_rbac import apply_owner_scope, assert_can_access, assign_owner
+from app.services.object_rbac import apply_audit_flow_scope, apply_owner_scope, assert_can_access, assign_owner
 from app.services.scan_limits import resolve_max_cidr_prefix_len
 from secaudit_core.audit_flow_scope import normalize_inventory_scope
 from secaudit_core.audit_flow_state import (
@@ -73,7 +73,7 @@ async def list_audit_flow_runs(
     user: AuthUser = Depends(require_operate),
 ) -> list[AuditFlowRunRead]:
     stmt = select(AuditFlowRun).order_by(AuditFlowRun.created_at.desc()).limit(50)
-    stmt = apply_owner_scope(stmt, AuditFlowRun.owner_sub, user)
+    stmt = apply_audit_flow_scope(apply_owner_scope(stmt, AuditFlowRun.owner_sub, user), user)
     result = await db.execute(stmt)
     runs = result.scalars().all()
     payload = []
@@ -139,6 +139,7 @@ async def start_audit_flow(
                     if item.get("service_secret")
                     else None
                 ),
+                skip_become=bool(item.get("skip_become")),
             )
         )
     await db.flush()
@@ -347,6 +348,7 @@ async def add_audit_flow_credential(
         encrypted_service_secret=(
             encrypt_flow_secret(item["service_secret"]) if item.get("service_secret") else None
         ),
+        skip_become=bool(item.get("skip_become")),
     )
     db.add(credential)
     await db.flush()
@@ -411,6 +413,7 @@ async def add_audit_flow_catalog_credential(
         encrypted_key_passphrase=cat.encrypted_key_passphrase,
         service_username=cat.service_username,
         encrypted_service_secret=cat.encrypted_service_secret,
+        skip_become=False,
     )
     db.add(credential)
     await db.flush()

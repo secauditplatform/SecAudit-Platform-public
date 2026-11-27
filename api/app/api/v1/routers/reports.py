@@ -1,7 +1,9 @@
 from datetime import date
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import AuthUser, require_roles
@@ -9,7 +11,7 @@ from app.core.roles import require_reports
 from app.core.blocking import run_blocking
 from app.core.config import settings
 from app.core.database import get_db
-from app.models import UserRole
+from app.models import ReportArtifact, UserRole
 from app.schemas import (
     ComplianceOpsOverview,
     ComplianceTimelinePoint,
@@ -20,9 +22,12 @@ from app.schemas import (
     JobBaselineSet,
     MultiRunCompareReport,
     RemediationSuggestion,
+    ReportArtifactRead,
     ReportSummary,
     ProfileCompliancePoint,
 )
+from secaudit_core.celery_dispatch import send_task
+from secaudit_core.reports import REPORT_PACK_ASYNC_THRESHOLD
 from app.services.drift import (
     clear_job_baseline,
     fetch_diff_report,
@@ -36,10 +41,13 @@ from app.services.report_ux import (
     build_run_package_zip,
     fetch_multi_run_compare,
     fetch_run_csv,
+    fetch_run_sarif,
+    fetch_run_xlsx,
     load_run_evidence,
     render_multi_compare_csv,
 )
 from app.services.reports import (
+    count_run_checks,
     fetch_run_report_context,
     fetch_run_summary,
     render_run_report_html,
@@ -268,6 +276,7 @@ async def get_run_report_pdf(
     run_id: int,
     request: Request,
     locale: str | None = Query(default=None, description="UI locale for report labels"),
+    mode: str = Query(default="executive", description="executive|full"),
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_reports),
 ) -> Response:
@@ -278,6 +287,7 @@ async def get_run_report_pdf(
     job_run, profile, hosts = context
     resolved_locale = _report_locale(locale, request)
     waived_ids = await waived_check_ids_for_job_run(db, job_run)
+    executive = (mode or "executive").strip().lower() != "full"
 
     try:
         pdf_bytes = await run_blocking(
@@ -287,14 +297,18 @@ async def get_run_report_pdf(
             hosts,
             locale=resolved_locale,
             waived_check_ids=waived_ids,
+            executive=executive,
             timeout=settings.blocking_io_timeout_seconds,
         )
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail="PDF rendering timed out") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    suffix = "executive" if executive else "full"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="report-{run_id}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="report-{run_id}-{suffix}.pdf"'},
     )
 
 
@@ -324,6 +338,73 @@ async def get_run_report_csv(
     )
 
 
+@router.get("/runs/{run_id}/report.sarif")
+async def get_run_report_sarif(
+    run_id: int,
+    status: str | None = None,
+    severity: str | None = None,
+    host_id: int | None = None,
+    rule: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+) -> Response:
+    await assert_job_run_access(db, user, run_id)
+    content, filename = await fetch_run_sarif(
+        db,
+        run_id,
+        tool_version=settings.app_version,
+        status=status,
+        severity=severity,
+        host_id=host_id,
+        rule=rule,
+    )
+    return Response(
+        content=content,
+        media_type="application/sarif+json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/runs/{run_id}/report.xlsx")
+async def get_run_report_xlsx(
+    run_id: int,
+    status: str | None = None,
+    severity: str | None = None,
+    host_id: int | None = None,
+    rule: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+) -> Response:
+    await assert_job_run_access(db, user, run_id)
+    content, filename = await fetch_run_xlsx(
+        db,
+        run_id,
+        status=status,
+        severity=severity,
+        host_id=host_id,
+        rule=rule,
+    )
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _artifact_read(row: ReportArtifact) -> ReportArtifactRead:
+    return ReportArtifactRead(
+        id=row.id,
+        job_run_id=row.job_run_id,
+        kind=row.kind,
+        mode=row.mode,
+        locale=row.locale,
+        status=row.status,
+        error_message=row.error_message,
+        created_at=row.created_at,
+        finished_at=row.finished_at,
+    )
+
+
 @router.get("/runs/{run_id}/report.pack.zip")
 async def get_run_report_pack(
     run_id: int,
@@ -332,21 +413,67 @@ async def get_run_report_pack(
     db: AsyncSession = Depends(get_db),
     user: AuthUser = Depends(require_reports),
 ) -> Response:
-    """Download HTML+PDF+CSV and the evidence documents as one ZIP."""
+    """Download HTML+executive PDF+CSV+evidence ZIP; large runs return 202 + artifact id."""
     await assert_job_run_access(db, user, run_id)
+    resolved_locale = _report_locale(locale, request)
+    threshold = getattr(settings, "report_pack_async_threshold", None) or REPORT_PACK_ASYNC_THRESHOLD
+    check_count = await count_run_checks(db, run_id)
+
+    if check_count >= threshold:
+        existing = (
+            await db.execute(
+                select(ReportArtifact)
+                .where(
+                    ReportArtifact.job_run_id == run_id,
+                    ReportArtifact.kind == "pack",
+                    ReportArtifact.locale == resolved_locale,
+                    ReportArtifact.status.in_(("pending", "running", "ready")),
+                )
+                .order_by(ReportArtifact.id.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None and existing.status == "ready" and existing.file_path:
+            path = Path(existing.file_path)
+            if path.is_file():
+                return Response(
+                    content=path.read_bytes(),
+                    media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="report-{run_id}-pack.zip"'},
+                )
+        if existing is not None and existing.status in ("pending", "running"):
+            return JSONResponse(status_code=202, content=_artifact_read(existing).model_dump(mode="json"))
+
+        artifact = ReportArtifact(
+            job_run_id=run_id,
+            kind="pack",
+            mode="executive",
+            locale=resolved_locale,
+            status="pending",
+        )
+        db.add(artifact)
+        await db.commit()
+        await db.refresh(artifact)
+        send_task(
+            "app.tasks.report_artifacts.build_report_pack",
+            [artifact.id],
+            broker_url=settings.celery_broker_url_effective,
+            queue="maintenance",
+        )
+        return JSONResponse(status_code=202, content=_artifact_read(artifact).model_dump(mode="json"))
+
     context = await fetch_run_report_context(db, run_id)
     if not context:
         raise HTTPException(status_code=404, detail="Job run not found")
     job_run, profile, hosts = context
-    resolved_locale = _report_locale(locale, request)
     waived_ids = await waived_check_ids_for_job_run(db, job_run)
-
     html = render_run_report_html(
         job_run,
         profile,
         hosts,
         locale=resolved_locale,
         waived_check_ids=waived_ids,
+        executive=False,
     )
     try:
         pdf_bytes = await run_blocking(
@@ -356,10 +483,13 @@ async def get_run_report_pack(
             hosts,
             locale=resolved_locale,
             waived_check_ids=waived_ids,
+            executive=True,
             timeout=settings.blocking_io_timeout_seconds,
         )
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail="PDF rendering timed out") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     csv_content, _filename = await fetch_run_csv(db, run_id)
     evidence_run, evidence_waivers, evidence_profile = await load_run_evidence(db, job_run, hosts)
@@ -378,4 +508,41 @@ async def get_run_report_pack(
         content=pack_bytes,
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="report-{run_id}-pack.zip"'},
+    )
+
+
+@router.get("/artifacts/{artifact_id}", response_model=ReportArtifactRead)
+async def get_report_artifact(
+    artifact_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+) -> ReportArtifactRead:
+    artifact = await db.get(ReportArtifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    await assert_job_run_access(db, user, artifact.job_run_id)
+    return _artifact_read(artifact)
+
+
+@router.get("/artifacts/{artifact_id}/download")
+async def download_report_artifact(
+    artifact_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_reports),
+) -> Response:
+    artifact = await db.get(ReportArtifact, artifact_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    await assert_job_run_access(db, user, artifact.job_run_id)
+    if artifact.status != "ready" or not artifact.file_path:
+        raise HTTPException(status_code=409, detail="Artifact not ready")
+    path = Path(artifact.file_path)
+    if not path.is_file():
+        raise HTTPException(status_code=410, detail="Artifact file missing")
+    return Response(
+        content=path.read_bytes(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="report-{artifact.job_run_id}-pack.zip"'
+        },
     )

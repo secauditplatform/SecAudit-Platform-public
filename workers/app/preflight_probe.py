@@ -16,9 +16,18 @@ def _check(name: str, status: str, detail: str | None = None) -> dict[str, Any]:
     return {"name": name, "status": status, "detail": detail}
 
 
-def _ssh_exec(client, command: str, timeout: int = 8) -> tuple[int, str]:
+def _ssh_exec(
+    client,
+    command: str,
+    timeout: int = 8,
+    *,
+    stdin_data: str | None = None,
+) -> tuple[int, str]:
     stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
     try:
+        if stdin_data is not None:
+            stdin.write(stdin_data)
+            stdin.flush()
         stdin.close()
     except Exception:
         pass
@@ -39,6 +48,8 @@ def _probe_ssh_stack(
     key_passphrase: str | None,
     known_hosts_entry: str | None,
     check_extras: bool,
+    become_method: str | None = None,
+    become_password: str | None = None,
 ) -> list[dict[str, Any]]:
     import paramiko
 
@@ -91,11 +102,20 @@ def _probe_ssh_stack(
         return checks
 
     try:
-        code, text = _ssh_exec(client, "sudo -n true")
-        if code == 0:
-            checks.append(_check("sudo", "ok", "passwordless_sudo"))
+        method = (become_method or "sudo").strip().lower() or "sudo"
+        if become_password and method in {"sudo", "dzdo"}:
+            cmd = f"{method} -S -p '' true"
+            code, text = _ssh_exec(client, cmd, stdin_data=f"{become_password}\n")
+            detail = f"{method}_with_password" if code == 0 else (text or f"{method}_auth_failed")
+        elif become_password and method == "su":
+            code, text = _ssh_exec(client, "su - root -c true", stdin_data=f"{become_password}\n")
+            detail = "su_with_password" if code == 0 else (text or "su_auth_failed")
         else:
-            checks.append(_check("sudo", "fail", (text or "sudo_requires_password")[:240]))
+            probe_bin = "doas" if method == "doas" else ("dzdo" if method == "dzdo" else "sudo")
+            flag = "-n"
+            code, text = _ssh_exec(client, f"{probe_bin} {flag} true")
+            detail = f"passwordless_{probe_bin}" if code == 0 else (text or f"{probe_bin}_requires_password")
+        checks.append(_check("sudo", "ok" if code == 0 else "fail", detail[:240]))
     except Exception as exc:
         checks.append(_check("sudo", "fail", str(exc)[:240]))
 
@@ -263,12 +283,21 @@ def run_preflight_probe(
         tcp_port = int(port or 161)
 
     is_snmp = ctype in (CredentialType.SNMP_V2C, CredentialType.SNMP_V3, "snmp_v2c", "snmp_v3")
+    is_ssh = ctype in (CredentialType.SSH_PASSWORD, CredentialType.SSH_KEY, "ssh_password", "ssh_key")
     # Remote VPN/SSH targets often drop the first SYN under Docker NAT; retry.
     ok_tcp, tcp_detail = tcp_reachable(host, tcp_port, timeout=8.0, attempts=2)
     if is_snmp:
         checks.append(_check("tcp", "skip" if not ok_tcp else "ok", "snmp_udp" if not ok_tcp else tcp_detail))
     else:
         checks.append(_check("tcp", "ok" if ok_tcp else "fail", tcp_detail))
+        if is_ssh:
+            pinned = bool((known_hosts_entry or "").strip())
+            if pinned:
+                checks.append(_check("known_hosts", "ok", "pinned"))
+            elif settings.ssh_strict_host_key_checking_effective:
+                checks.append(_check("known_hosts", "fail", "not_pinned"))
+            else:
+                checks.append(_check("known_hosts", "skip", "not_pinned"))
         if not ok_tcp:
             return {
                 "ok": False,
@@ -283,6 +312,9 @@ def run_preflight_probe(
     if ctype in (CredentialType.SSH_PASSWORD, CredentialType.SSH_KEY, "ssh_password", "ssh_key"):
         password, private_key, key_passphrase = ssh_auth_from_credential(credential, secret, settings)
         extras = platform in {"linux", "unix"}
+        become_password = None
+        if getattr(credential, "encrypted_become_secret", None):
+            become_password = decrypt_secret(credential.encrypted_become_secret, settings)
         checks.extend(
             _probe_ssh_stack(
                 hostname=host,
@@ -293,6 +325,8 @@ def run_preflight_probe(
                 key_passphrase=key_passphrase,
                 known_hosts_entry=known_hosts_entry,
                 check_extras=extras,
+                become_method=getattr(credential, "become_method", None),
+                become_password=become_password,
             )
         )
         if platform == "network" and checks and checks[-1].get("name") == "auth" and checks[-1].get("status") == "fail":
@@ -320,7 +354,7 @@ def run_preflight_probe(
         checks.append(_check("auth", "skip", f"unsupported_type:{ctype}"))
 
     auth_ok = any(c["name"] == "auth" and c["status"] == "ok" for c in checks)
-    hard_fail = any(c["name"] in {"tcp", "auth"} and c["status"] == "fail" for c in checks)
+    hard_fail = any(c["name"] in {"tcp", "auth", "known_hosts"} and c["status"] == "fail" for c in checks)
     return {
         "ok": auth_ok and not hard_fail,
         "target": f"{host}:{tcp_port}",

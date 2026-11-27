@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -49,7 +49,11 @@ async def waived_check_ids_for_runs(
         if getattr(run, "job", None) is not None and run.job.profile_id is not None
     }
     waivers = await load_active_waivers_for_profiles(db, profile_ids)
-    return waived_ids_by_run(runs, checks_by_run, waivers)
+    checks = [check for rows in checks_by_run.values() for check in rows]
+    from secaudit_core.waivers import load_waiver_hosts
+
+    hosts = await load_waiver_hosts(db, checks)
+    return waived_ids_by_run(runs, checks_by_run, waivers, hosts)
 
 
 async def fetch_run_summary(db: AsyncSession, run_id: int) -> ReportSummary:
@@ -66,6 +70,17 @@ async def fetch_run_summary(db: AsyncSession, run_id: int) -> ReportSummary:
         db, checks=checks, profile_id=profile_id, job_id=job_id
     )
     return build_report_summary(run_id, checks, waived_check_ids=set(waived_map.keys()))
+
+
+async def count_run_checks(db: AsyncSession, run_id: int) -> int:
+    """Stored counter when backfilled, otherwise COUNT(*). Does not load check rows."""
+    stored = await db.scalar(select(JobRun.check_count).where(JobRun.id == run_id))
+    if stored is not None:
+        return int(stored)
+    counted = await db.scalar(
+        select(func.count()).select_from(CheckResult).where(CheckResult.job_run_id == run_id)
+    )
+    return int(counted or 0)
 
 
 async def fetch_run_report_context(
@@ -103,6 +118,7 @@ async def waived_check_ids_for_job_run(db: AsyncSession, job_run: JobRun) -> set
 
 __all__ = [
     "build_report_summary",
+    "count_run_checks",
     "fetch_run_report_context",
     "fetch_run_report_context_sync",
     "fetch_run_summary",

@@ -29,6 +29,29 @@ from app.services.scap_remediation import (
 DESCRIPTION_FILE = "description.json"
 PROFILE_RULES_JSON = "profile_rules.json"
 
+# Embedded copy of profiles/_shared/secaudit_rule_allowlist.sh for materialized SCAP scripts.
+_SECAUDIT_RULE_HELPER_BASH = r'''
+secaudit_rule_enabled() {
+    local raw="${SECAUDIT_RULES:-${SECAUDIT_REMEDIATE_RULES:-}}" id="$1" token n want
+    [ -z "$raw" ] && return 0
+    n="${id#RULE}"; n="${n#rule}"; n="${n#Rule}"
+    case "$n" in (*[!0-9]*|"") want=$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]') ;;
+        *) want="RULE$((10#$n))" ;;
+    esac
+    local IFS=','
+    for token in $raw; do
+        token=$(printf '%s' "$token" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+        [ -z "$token" ] && continue
+        local tn="${token#RULE}"
+        case "$tn" in (*[!0-9]*|"") ;;
+            *) token="RULE$((10#$tn))" ;;
+        esac
+        [ "$token" = "$want" ] && return 0
+    done
+    return 1
+}
+'''.strip().splitlines()
+
 OVAL_MARKERS = (
     b"oval-definitions",
     b"oval_definitions",
@@ -139,15 +162,6 @@ def _extract_fixes(rule_el: Element) -> list[XccdfFix]:
         if text:
             fixes.append(XccdfFix(system=system, text=text))
     return fixes
-
-
-def _extract_shell_from_fix(rule_el: Element) -> str | None:
-    from app.services.scap_remediation import classify_fix_system
-
-    for fix in _extract_fixes(rule_el):
-        if classify_fix_system(fix.system) == "shell":
-            return fix.text
-    return None
 
 
 def _extract_shell_from_check(rule_el: Element) -> str | None:
@@ -458,7 +472,8 @@ def _category_slug_for_benchmark(benchmark: XccdfBenchmark) -> str:
 def _oscap_rule_check_lines(mnemonic: str, rule_id: str, title: str) -> list[str]:
     safe_title = title.replace('"', "'")
     return [
-        f"# OpenSCAP eval when oscap + scap_benchmark.xml are available on target",
+        f"# {mnemonic}: OpenSCAP eval when oscap + scap_benchmark.xml are available on target",
+        f'if secaudit_rule_enabled "{mnemonic}"; then',
         f'_OSCAP_RULE="{rule_id}"',
         'if command -v oscap >/dev/null 2>&1 && [ -f "scap_benchmark.xml" ]; then',
         '  _OSCAP_RES=$(mktemp)',
@@ -475,6 +490,7 @@ def _oscap_rule_check_lines(mnemonic: str, rule_id: str, title: str) -> list[str
         "else",
         f'  echo "{mnemonic}= SKIP: No executable check in XCCDF '
         f'(rule {rule_id}; install oscap on target or embed SCE/shell check)"',
+        "fi",
         "fi",
     ]
 
@@ -561,6 +577,8 @@ def materialize_xccdf_package(
         "export LC_ALL=C",
         'cd "$(dirname "$0")" 2>/dev/null || true',
         "",
+        *_SECAUDIT_RULE_HELPER_BASH,
+        "",
     ]
     rem_plans = []
     for index, rule in enumerate(benchmark.rules, start=1):
@@ -585,7 +603,8 @@ def materialize_xccdf_package(
 
         safe_title = title.replace('"', "'")
         if rule.check_shell:
-            audit_lines.append(f"# --- {rule.rule_id}: {rule.title} ---")
+            audit_lines.append(f"# {mnemonic}: --- {rule.rule_id}: {rule.title} ---")
+            audit_lines.append(f'if secaudit_rule_enabled "{mnemonic}"; then')
             # Run embedded check in a subshell; treat exit 0 as PASS.
             audit_lines.append("(")
             for line in rule.check_shell.splitlines():
@@ -595,6 +614,7 @@ def materialize_xccdf_package(
             audit_lines.append(f'  echo "{mnemonic}= PASS: {safe_title}"')
             audit_lines.append("else")
             audit_lines.append(f'  echo "{mnemonic}= FAIL: {safe_title}"')
+            audit_lines.append("fi")
             audit_lines.append("fi")
             audit_lines.append("")
         else:
@@ -749,6 +769,8 @@ def convert_xccdf_package_dir(package_dir: Path, *, scap_profile_id: str | None 
 def _oval_rule_check_lines(mnemonic: str, def_id: str, title: str) -> list[str]:
     safe_title = title.replace('"', "'")
     return [
+        f"# {mnemonic}:",
+        f'if secaudit_rule_enabled "{mnemonic}"; then',
         f'_OVAL_DEF="{def_id}"',
         'if command -v oscap >/dev/null 2>&1 && [ -f "scap_oval.xml" ]; then',
         "  _OVAL_RES=$(mktemp)",
@@ -764,6 +786,7 @@ def _oval_rule_check_lines(mnemonic: str, def_id: str, title: str) -> list[str]:
         '  rm -f "$_OVAL_RES"',
         "else",
         f'  echo "{mnemonic}= SKIP: install oscap on target to evaluate OVAL {def_id}"',
+        "fi",
         "fi",
     ]
 
@@ -814,6 +837,8 @@ def materialize_oval_package(
         "per-definition oscap below is a fallback for SSH-script jobs.",
         "export LC_ALL=C",
         'cd "$(dirname "$0")" 2>/dev/null || true',
+        "",
+        *_SECAUDIT_RULE_HELPER_BASH,
         "",
     ]
 
@@ -931,23 +956,3 @@ def preview_xccdf_profiles_from_uploads(uploads: list[tuple[str, bytes]]) -> lis
         except ValueError:
             continue
     return profiles
-
-
-def parse_xccdf_from_uploads_preview(filename: str, content: bytes) -> XccdfBenchmark:
-    """Helper for tests / diagnostics: parse raw upload bytes without full package IO."""
-    lowered = filename.lower()
-    if lowered.endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            for name in archive.namelist():
-                if name.lower().endswith((".xml", ".xccdf")):
-                    data = archive.read(name)
-                    if _looks_like_xccdf_bytes(data):
-                        return parse_xccdf_xml(data)
-        raise ValueError("ZIP archive does not contain an XCCDF Benchmark XML")
-    if lowered.endswith((".xml", ".xccdf")):
-        if _looks_like_oval_bytes(content) and not _looks_like_xccdf_bytes(content):
-            raise ValueError(
-                "This is an OVAL-only document; import it directly to use the OVAL evaluator."
-            )
-        return parse_xccdf_xml(content)
-    raise ValueError(f"Unsupported SCAP upload filename: {filename}")

@@ -3,7 +3,6 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import settings
-from secaudit_core.models import Base
 
 engine = create_async_engine(settings.database_url, echo=settings.api_debug)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

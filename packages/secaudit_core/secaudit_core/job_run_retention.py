@@ -8,8 +8,7 @@ from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from secaudit_core.enums import JobStatus
-from secaudit_core.models import AuditLog, CheckResult, Job, JobRun
-from secaudit_core.waivers import active_waivers_select
+from secaudit_core.models import AuditLog, CheckResult, Job, JobRun, RemediationJob
 
 TERMINAL_STATUSES = (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
 DEFAULT_BATCH_SIZE = 200
@@ -23,16 +22,12 @@ def _protected_run_ids(db: Session) -> set[int]:
         if run_id is not None:
             protected.add(int(run_id))
 
-    waiver_job_ids = [
-        int(w.job_id)
-        for w in db.execute(active_waivers_select()).scalars().all()
-        if w.job_id is not None
-    ]
-    if waiver_job_ids:
-        for (run_id,) in db.execute(
-            select(JobRun.id).where(JobRun.job_id.in_(waiver_job_ids))
-        ):
+    for col in (RemediationJob.source_run_id, RemediationJob.workflow_reaudit_run_id):
+        for (run_id,) in db.execute(select(col).where(col.is_not(None))):
             protected.add(int(run_id))
+
+    # shortcut: ComplianceWaiver has no citations_json (only AAG artifacts do), so waivers
+    # protect no extra runs; revisit if waivers gain run citations.
     return protected
 
 
@@ -42,7 +37,7 @@ def purge_old_job_runs(
     retention_days: int,
     limit: int = DEFAULT_BATCH_SIZE,
 ) -> dict:
-    """Delete whole JobRuns past retention, except baseline / active-waiver runs."""
+    """Delete whole JobRuns past retention, except baseline / remediation-linked runs."""
     days = int(retention_days)
     if days <= 0:
         return {"skipped": True, "reason": "retention_disabled", "deleted": [], "count": 0}
@@ -108,3 +103,50 @@ def purge_old_job_runs(
         "cutoff": cutoff.isoformat(),
         "protected_skipped": len(candidate_ids) - len(delete_ids),
     }
+
+
+def archive_check_raw_output(
+    db: Session,
+    *,
+    retention_days: int,
+    limit: int = 2000,
+) -> dict:
+    """Null raw_output on check rows older than retention_days.
+
+    shortcut: not a monthly partition of check_results. PostgreSQL requires the
+    partition key in every unique constraint, and uq_check_result_run_host_rule
+    omits created_at, so partitioning would break ON CONFLICT upserts. Upgrade
+    only if upserts no longer depend on that key.
+    """
+    days = int(retention_days)
+    if days <= 0:
+        return {"skipped": True, "reason": "retention_disabled", "cleared": 0}
+
+    cutoff = datetime.now(UTC) - timedelta(days=days)
+    ids = [
+        int(row_id)
+        for (row_id,) in db.execute(
+            select(CheckResult.id)
+            .where(CheckResult.raw_output.is_not(None), CheckResult.created_at < cutoff)
+            .order_by(CheckResult.id.asc())
+            .limit(max(1, int(limit)))
+        )
+    ]
+    if not ids:
+        return {"skipped": False, "cleared": 0, "cutoff": cutoff.isoformat()}
+
+    db.execute(update(CheckResult).where(CheckResult.id.in_(ids)).values(raw_output=None))
+    db.add(
+        AuditLog(
+            actor_username="system:maintenance",
+            actor_roles=["system"],
+            action="check_result.archive_raw_output",
+            resource_type="check_result",
+            resource_id=None,
+            resource_name=f"cleared raw_output on {len(ids)} check(s)",
+            outcome="success",
+            metadata_json={"retention_days": days, "cutoff": cutoff.isoformat(), "cleared": len(ids)},
+        )
+    )
+    db.commit()
+    return {"skipped": False, "cleared": len(ids), "cutoff": cutoff.isoformat()}

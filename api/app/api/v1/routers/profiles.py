@@ -86,6 +86,16 @@ def _profile_detail(profile) -> ProfileDetail:
         for script in profile.check_scripts
         if script.script_kind == ScriptKind.REMEDIATION
     ]
+    detail.remediation_backup_scripts = [
+        CheckScriptRead.model_validate(script)
+        for script in profile.check_scripts
+        if script.script_kind == ScriptKind.REMEDIATION_BACKUP
+    ]
+    detail.remediation_restore_scripts = [
+        CheckScriptRead.model_validate(script)
+        for script in profile.check_scripts
+        if script.script_kind == ScriptKind.REMEDIATION_RESTORE
+    ]
     return detail
 
 
@@ -434,6 +444,7 @@ async def create_profile_version(
             label=data.label,
             activate=data.activate,
             actor=user.username,
+            variable_values=data.variable_values,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

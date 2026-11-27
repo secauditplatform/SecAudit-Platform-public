@@ -43,6 +43,7 @@ from app.services.aag_tasks import (
     aag_usage,
     accept_generated_profile,
     contour_switch,
+    cancel_aag_artifact,
     delete_aag_artifact,
     list_aag_artifacts,
     list_explain_candidates,
@@ -641,6 +642,26 @@ async def delete_aag_task(
         },
     )
     return Response(status_code=204)
+
+
+@router.post("/tasks/{artifact_id}/cancel", response_model=AagArtifactRead)
+async def cancel_task(
+    artifact_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: AuthUser = Depends(require_roles(UserRole.OPERATOR)),
+) -> AagArtifactRead:
+    artifact = await cancel_aag_artifact(db, user, artifact_id)
+    await log_audit_event(
+        db,
+        request,
+        user,
+        action="aag.task.cancel",
+        resource_type="aag_artifact",
+        resource_id=artifact_id,
+        metadata={"kind": artifact.kind, "provider": artifact.provider},
+    )
+    return artifact_to_read(artifact)
 
 
 @router.post("/tasks/{artifact_id}/retry", response_model=AagArtifactRead)

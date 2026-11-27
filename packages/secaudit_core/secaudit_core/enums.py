@@ -11,6 +11,14 @@ class CategoryType(str, enum.Enum):
     OTHER = "other"
 
 
+class AssetIdentityKind(str, enum.Enum):
+    SSH_FINGERPRINT = "ssh_fingerprint"
+    WINRM_THUMBPRINT = "winrm_thumbprint"
+    SNMP_SERIAL = "snmp_serial"
+    MACHINE_ID = "machine_id"
+    MAC = "mac"
+
+
 class ExecutionType(str, enum.Enum):
     SSH = "ssh"
     WINRM = "winrm"
@@ -21,6 +29,8 @@ class ExecutionType(str, enum.Enum):
 class ScriptKind(str, enum.Enum):
     AUDIT = "audit"
     REMEDIATION = "remediation"
+    REMEDIATION_BACKUP = "remediation_backup"
+    REMEDIATION_RESTORE = "remediation_restore"
 
 
 class PlaybookKind(str, enum.Enum):
@@ -34,6 +44,9 @@ class CheckStatus(str, enum.Enum):
     SKIP = "skip"
     ERROR = "error"
     PENDING = "pending"
+    # Remediation JSONL outcomes (also stored on RemediationResult).
+    CHANGED = "changed"
+    UNCHANGED = "unchanged"
 
 
 class WaiverStatus(str, enum.Enum):
@@ -74,6 +87,11 @@ class NetworkVendor(str, enum.Enum):
     FORTINET = "fortinet"
     PALO_ALTO = "palo_alto"
     CHECK_POINT = "check_point"
+    ELTEX = "eltex"
+    MIKROTIK = "mikrotik"
+    USERGATE = "usergate"
+    CONTINENT = "continent"
+    QTECH = "qtech"
     GENERIC = "generic"
 
 
@@ -95,6 +113,7 @@ class UserRole(str, enum.Enum):
     ADMIN = "admin"
     OPERATOR = "operator"
     AUDITOR = "auditor"
+    SECURITY_APPROVER = "security_approver"
 
 
 class CredentialType(str, enum.Enum):
@@ -126,6 +145,9 @@ class NotificationEventType(str, enum.Enum):
     WAIVER_EXPIRING = "waiver_expiring"
     AUDIT_EVENT = "audit_event"
     AUDIT_FAILED = "audit_failed"
+    FINDING_FAILED = "finding_failed"
+    FINDING_REGRESSED = "finding_regressed"
+    FINDING_RESOLVED = "finding_resolved"
 
 
 class ScheduledReportFormat(str, enum.Enum):

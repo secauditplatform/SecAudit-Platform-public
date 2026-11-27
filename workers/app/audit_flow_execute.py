@@ -56,28 +56,19 @@ def _find_inventory_host(
     hostname: str | None,
     fingerprint: str | None,
 ) -> Host | None:
+    from secaudit_core.asset_identity import find_host_by_identities, retarget_host_address
+
+    by_identity = find_host_by_identities(
+        db, owner_sub=owner_sub, ssh_fingerprint=fingerprint
+    )
+    if by_identity is not None:
+        retarget_host_address(by_identity, ip or hostname)
+        return by_identity
+
     if owner_sub is None:
         owner_match = Host.owner_sub.is_(None)
     else:
         owner_match = or_(Host.owner_sub == owner_sub, Host.owner_sub.is_(None))
-
-    if fingerprint:
-        fp_candidates = list(
-            db.execute(
-                select(Host)
-                .where(
-                    Host.ssh_host_key_fingerprint == fingerprint,
-                    owner_match,
-                    Host.is_ephemeral.is_(False),
-                )
-                .limit(20)
-            )
-            .scalars()
-            .all()
-        )
-        if fp_candidates:
-            same_owner = [host for host in fp_candidates if host.owner_sub == owner_sub]
-            return same_owner[0] if same_owner else fp_candidates[0]
 
     keys = [value.strip().lower() for value in (ip, hostname) if value and value.strip()]
     if not keys:
@@ -111,6 +102,7 @@ def _make_ephemeral_credential(
         existing.encrypted_service_secret = flow_cred.encrypted_service_secret
         existing.username = flow_cred.username
         existing.credential_type = flow_cred.credential_type
+        existing.skip_become = bool(flow_cred.skip_become)
         existing.owner_sub = run.owner_sub
         row.ephemeral_credential_id = existing.id
         return existing
@@ -122,6 +114,7 @@ def _make_ephemeral_credential(
         encrypted_key_passphrase=flow_cred.encrypted_key_passphrase,
         service_username=flow_cred.service_username,
         encrypted_service_secret=flow_cred.encrypted_service_secret,
+        skip_become=bool(flow_cred.skip_become),
         description="AuditFlow ephemeral",
         is_ephemeral=True,
         owner_sub=run.owner_sub,
@@ -141,9 +134,11 @@ def _job_credential(
 ) -> Credential:
     if row.ephemeral_credential_id:
         cred = db.get(Credential, row.ephemeral_credential_id)
-        if cred:
+        if cred and (getattr(cred, "is_ephemeral", False) or not flow_cred.skip_become):
+            if getattr(cred, "is_ephemeral", False):
+                cred.skip_become = bool(flow_cred.skip_become)
             return cred
-    if host and host.credential_id:
+    if host and host.credential_id and not flow_cred.skip_become:
         inventory_cred = db.get(Credential, host.credential_id)
         if (
             inventory_cred
@@ -170,6 +165,16 @@ def _ensure_job_target(
             if row.ssh_known_hosts_entry and not host.ssh_known_hosts_entry:
                 host.ssh_known_hosts_entry = row.ssh_known_hosts_entry
                 host.ssh_host_key_fingerprint = row.ssh_host_key_fingerprint
+            if row.ssh_host_key_fingerprint:
+                from secaudit_core.asset_identity import upsert_asset_identity
+                from secaudit_core.enums import AssetIdentityKind
+
+                upsert_asset_identity(
+                    db,
+                    host_id=host.id,
+                    kind=AssetIdentityKind.SSH_FINGERPRINT,
+                    value=row.ssh_host_key_fingerprint,
+                )
             db.flush()
             return host, cred
 
@@ -216,6 +221,16 @@ def _ensure_job_target(
         if row.ssh_known_hosts_entry and not host.ssh_known_hosts_entry:
             host.ssh_known_hosts_entry = row.ssh_known_hosts_entry
             host.ssh_host_key_fingerprint = row.ssh_host_key_fingerprint
+        if row.ssh_host_key_fingerprint:
+            from secaudit_core.asset_identity import upsert_asset_identity
+            from secaudit_core.enums import AssetIdentityKind
+
+            upsert_asset_identity(
+                db,
+                host_id=host.id,
+                kind=AssetIdentityKind.SSH_FINGERPRINT,
+                value=row.ssh_host_key_fingerprint,
+            )
         if os_type and not host.os_type:
             host.os_type = os_type
         row.ephemeral_host_id = host.id
@@ -237,6 +252,16 @@ def _ensure_job_target(
     )
     db.add(host)
     db.flush()
+    if row.ssh_host_key_fingerprint:
+        from secaudit_core.asset_identity import upsert_asset_identity
+        from secaudit_core.enums import AssetIdentityKind
+
+        upsert_asset_identity(
+            db,
+            host_id=host.id,
+            kind=AssetIdentityKind.SSH_FINGERPRINT,
+            value=row.ssh_host_key_fingerprint,
+        )
     row.ephemeral_host_id = host.id
     return host, cred
 

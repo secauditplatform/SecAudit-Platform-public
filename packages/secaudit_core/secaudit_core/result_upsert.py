@@ -74,17 +74,20 @@ def upsert_remediation_result(
     script_name: str,
     status,
     message: str | None,
-    raw_output: str | None,
+    raw_output: str | None = None,
+    rule_tech_name: str = "",
 ) -> None:
+    rule = str(rule_tech_name or "").strip()
     values = {
         "remediation_run_id": remediation_run_id,
         "host_id": host_id,
         "script_name": script_name,
+        "rule_tech_name": rule,
         "status": status,
         "message": message,
         "raw_output": raw_output,
     }
-    key = ("remediation_run_id", "host_id", "script_name")
+    key = ("remediation_run_id", "host_id", "script_name", "rule_tech_name")
     updates = {
         "status": status,
         "message": message,
@@ -96,7 +99,7 @@ def upsert_remediation_result(
             pg_insert(RemediationResult)
             .values(**values)
             .on_conflict_do_update(
-                constraint="uq_remediation_result_run_host_script",
+                constraint="uq_remediation_result_run_host_script_rule",
                 set_=updates,
             )
         )
@@ -116,6 +119,7 @@ def upsert_remediation_result(
             RemediationResult.remediation_run_id == remediation_run_id,
             RemediationResult.host_id == host_id,
             RemediationResult.script_name == script_name,
+            RemediationResult.rule_tech_name == rule,
         )
     ).scalar_one_or_none()
     if existing is None:

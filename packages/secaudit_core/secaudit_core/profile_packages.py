@@ -18,6 +18,8 @@ SCRIPT_EXTENSIONS: dict[str, ExecutionType] = {
 
 EXCLUDED_SCRIPT_MARKERS = ("_dev", "_old", ".sig", "remote_access", "network_checks")
 REMEDIATION_SCRIPT_MARKER = "_remediation"
+REMEDIATION_BACKUP_MARKER = "_remediation_backup"
+REMEDIATION_RESTORE_MARKER = "_remediation_restore"
 
 DESCRIPTION_FILE = "description.json"
 PROFILE_RULES_JSON = "profile_rules.json"
@@ -67,6 +69,29 @@ def rule_identity_keys(*values: str) -> list[str]:
 def profile_name_from_meta(meta: dict) -> str:
     """Resolve profile_name from description.json (legacy tech_name accepted)."""
     return str(meta.get("profile_name") or meta.get("tech_name") or "").strip()
+
+
+def package_supports_check_mode(package_dir: Path, execution_type: ExecutionType | str) -> bool:
+    """Whether remediation dry-run is safe for this package + executor.
+
+    Ansible always supports native ``--check``. SSH/WinRM/Python require an explicit
+    ``supports_check_mode`` (or ``remediation_supports_check_mode``) flag in
+    ``description.json`` so scripts that ignore ``SECAUDIT_CHECK_MODE`` cannot be
+    launched in check mode by mistake.
+    """
+    kind = execution_type.value if hasattr(execution_type, "value") else str(execution_type or "")
+    if kind.upper() == "ANSIBLE" or kind.lower() == "ansible":
+        return True
+    description = package_dir / DESCRIPTION_FILE
+    if not description.is_file():
+        return False
+    try:
+        meta = json.loads(description.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(meta, dict):
+        return False
+    return bool(meta.get("supports_check_mode") or meta.get("remediation_supports_check_mode"))
 
 
 def normalize_description_meta(meta: dict) -> dict:
@@ -893,14 +918,10 @@ def _interpreter_rules_for_script(rules_path: Path, script_name: str) -> list[di
     return rules
 
 
-def _is_remediation_script(path: Path) -> bool:
-    lowered = path.name.lower()
-    return REMEDIATION_SCRIPT_MARKER in lowered and path.suffix.lower() in SCRIPT_EXTENSIONS
-
-
-def discover_remediation_scripts(package_dir: Path) -> list[dict]:
-    scripts: list[dict] = []
+def _script_candidates(package_dir: Path) -> list[Path]:
     candidates: list[Path] = []
+    if not package_dir.is_dir():
+        return candidates
     for path in sorted(package_dir.iterdir()):
         if path.is_file():
             candidates.append(path)
@@ -909,10 +930,31 @@ def discover_remediation_scripts(package_dir: Path) -> list[dict]:
         for path in sorted(scripts_dir.iterdir()):
             if path.is_file():
                 candidates.append(path)
+    return candidates
 
+
+def _is_remediation_backup_script(path: Path) -> bool:
+    lowered = path.name.lower()
+    return REMEDIATION_BACKUP_MARKER in lowered and path.suffix.lower() in SCRIPT_EXTENSIONS
+
+
+def _is_remediation_restore_script(path: Path) -> bool:
+    lowered = path.name.lower()
+    return REMEDIATION_RESTORE_MARKER in lowered and path.suffix.lower() in SCRIPT_EXTENSIONS
+
+
+def _is_remediation_script(path: Path) -> bool:
+    lowered = path.name.lower()
+    if _is_remediation_backup_script(path) or _is_remediation_restore_script(path):
+        return False
+    return REMEDIATION_SCRIPT_MARKER in lowered and path.suffix.lower() in SCRIPT_EXTENSIONS
+
+
+def _discover_marked_scripts(package_dir: Path, predicate) -> list[dict]:
+    scripts: list[dict] = []
     seen_names: set[str] = set()
-    for path in candidates:
-        if not _is_remediation_script(path):
+    for path in _script_candidates(package_dir):
+        if not predicate(path):
             continue
         stem = path.stem
         if stem in seen_names:
@@ -929,6 +971,18 @@ def discover_remediation_scripts(package_dir: Path) -> list[dict]:
             }
         )
     return scripts
+
+
+def discover_remediation_scripts(package_dir: Path) -> list[dict]:
+    return _discover_marked_scripts(package_dir, _is_remediation_script)
+
+
+def discover_remediation_backup_scripts(package_dir: Path) -> list[dict]:
+    return _discover_marked_scripts(package_dir, _is_remediation_backup_script)
+
+
+def discover_remediation_restore_scripts(package_dir: Path) -> list[dict]:
+    return _discover_marked_scripts(package_dir, _is_remediation_restore_script)
 
 
 def infer_category_from_package_dir(package_dir: Path) -> str:
@@ -980,10 +1034,6 @@ def package_encoding_hint(package_dir: Path) -> str | None:
     profile_meta = normalize_description_meta(_read_json(profile_file))
     encoding = profile_meta.get("encoding")
     return str(encoding).strip() if encoding else None
-
-
-# Backward-compatible alias
-package_charset_hint = package_encoding_hint
 
 
 def discover_check_scripts(package_dir: Path, profile_meta: dict) -> list[dict]:
@@ -1180,6 +1230,8 @@ def load_profile_package(package_dir: Path) -> dict:
         "profile": profile_meta,
         "scripts": scripts,
         "remediation_scripts": discover_remediation_scripts(package_dir),
+        "remediation_backup_scripts": discover_remediation_backup_scripts(package_dir),
+        "remediation_restore_scripts": discover_remediation_restore_scripts(package_dir),
         "category_slug": category_slug,
     }
 

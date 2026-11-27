@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && groupadd --system --gid 1000 secaudit \
     && useradd --system --uid 1000 --gid secaudit --home-dir /nonexistent --shell /usr/sbin/nologin secaudit \
     && install -d -o root -g root -m 0555 /var/empty/secaudit-console \
-    && install -d -o secaudit -g secaudit -m 0750 /data/profiles \
+    && install -d -o secaudit -g secaudit -m 0750 /data/profiles /data/profiles/reports \
     && rm -rf /var/lib/apt/lists/*
 
 COPY api/requirements.txt api/requirements-dev.txt ./

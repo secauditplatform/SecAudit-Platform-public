@@ -5,7 +5,12 @@ from __future__ import annotations
 from secaudit_core.enums import UserRole
 
 OPERATE_ROLES: tuple[UserRole, ...] = (UserRole.ADMIN, UserRole.OPERATOR)
-REPORTS_ROLES: tuple[UserRole, ...] = (UserRole.ADMIN, UserRole.OPERATOR, UserRole.AUDITOR)
+REPORTS_ROLES: tuple[UserRole, ...] = (
+    UserRole.ADMIN,
+    UserRole.OPERATOR,
+    UserRole.AUDITOR,
+    UserRole.SECURITY_APPROVER,
+)
 REMEDIATION_ROLES: tuple[UserRole, ...] = (UserRole.ADMIN,)
 SCRIPT_ROLES: tuple[UserRole, ...] = (UserRole.ADMIN,)
 ADMIN_ROLES: tuple[UserRole, ...] = (UserRole.ADMIN,)
@@ -23,10 +28,3 @@ def normalize_roles(roles: list[str]) -> list[str]:
             continue
         normalized.append(role)
     return normalized
-
-
-def is_auditor_only(roles: list[str]) -> bool:
-    role_set = set(roles)
-    if role_set.intersection({UserRole.ADMIN.value, UserRole.OPERATOR.value}):
-        return False
-    return UserRole.AUDITOR.value in role_set

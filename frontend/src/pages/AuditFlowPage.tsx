@@ -22,6 +22,22 @@ import { detectTargetType, findIpv6Prefix } from "./scanTargets";
 
 type CredType = "ssh_password" | "ssh_key" | "winrm";
 
+function credChoice(cred: { credential_type: CredType; skip_become: boolean }): string {
+  if (cred.credential_type === "winrm" || !cred.skip_become) {
+    return cred.credential_type === "winrm" ? "winrm" : `${cred.credential_type}_sudo`;
+  }
+  return cred.credential_type;
+}
+
+function credFromChoice(value: string): { credential_type: CredType; skip_become: boolean } {
+  if (value === "ssh_key" || value === "ssh_password") {
+    return { credential_type: value, skip_become: true };
+  }
+  if (value === "ssh_key_sudo") return { credential_type: "ssh_key", skip_become: false };
+  if (value === "ssh_password_sudo") return { credential_type: "ssh_password", skip_become: false };
+  return { credential_type: "winrm", skip_become: false };
+}
+
 type CredDraft = {
   label: string;
   credential_type: CredType;
@@ -30,6 +46,7 @@ type CredDraft = {
   key_passphrase: string;
   service_username: string;
   service_secret: string;
+  skip_become: boolean;
 };
 
 const ACTIVE = new Set(["pending", "scanning", "running"]);
@@ -41,6 +58,7 @@ const emptyCred = (): CredDraft => ({
   key_passphrase: "",
   service_username: "",
   service_secret: "",
+  skip_become: false,
 });
 
 function profilePlatform(
@@ -139,6 +157,28 @@ function hostProfileGroups(host: AuditFlowHost, profiles: Profile[]) {
     return Boolean(host.platform && platform && platform !== "services" && platform !== host.platform);
   });
   return { suggested, samePlatform, applications, otherOs };
+}
+
+const OS_SOURCE_KEYS: Record<string, string> = {
+  nmap: "auditFlow.osSourceNmap",
+  mac: "auditFlow.osSourceMac",
+  snmp: "auditFlow.osSourceSnmp",
+  banner: "auditFlow.osSourceBanner",
+  facts: "auditFlow.osSourceFacts",
+  ports: "auditFlow.osSourcePorts",
+};
+
+function osEvidenceText(host: AuditFlowHost, t: (key: string, params?: Record<string, string | number>) => string): string {
+  const hints = host.match_hints ?? [];
+  const source = hints.find((hint) => hint.code === "fingerprint_source")?.detail || "";
+  const accuracy = hints.find((hint) => hint.code === "os_accuracy")?.detail || "";
+  const unknown = hints.some((hint) => hint.code === "version_unknown");
+  const sourceLabel = OS_SOURCE_KEYS[source] ? t(OS_SOURCE_KEYS[source]) : source;
+  const parts = [
+    unknown ? t("auditFlow.osVersionUnknown") : "",
+    sourceLabel && accuracy ? `${sourceLabel} ${accuracy}%` : sourceLabel,
+  ].filter(Boolean);
+  return parts.join(" · ");
 }
 
 function platformTone(platform: string | null | undefined): string {
@@ -255,8 +295,11 @@ export function AuditFlowPage() {
     queryFn: () => api.getAuditFlowRun(activeId!),
     enabled: activeId != null,
     refetchInterval: (query) => {
-      const status = query.state.data?.status;
-      return status && ACTIVE.has(status) ? 1500 : false;
+      const data = query.state.data;
+      if (!data) return false;
+      if (ACTIVE.has(data.status)) return 1500;
+      if (data.hosts?.some((host) => host.skip_reason === "checking")) return 1500;
+      return false;
     },
   });
   const profilesQuery = useQuery({
@@ -351,6 +394,7 @@ export function AuditFlowPage() {
             ...(c.key_passphrase.trim() ? { key_passphrase: c.key_passphrase.trim() } : {}),
             ...(c.service_username.trim() ? { service_username: c.service_username.trim() } : {}),
             ...(c.service_secret.trim() ? { service_secret: c.service_secret.trim() } : {}),
+            skip_become: c.credential_type !== "winrm" && c.skip_become,
           })),
         save_to_inventory: saveToInventory,
       });
@@ -425,6 +469,7 @@ export function AuditFlowPage() {
         ...(draft.key_passphrase.trim() ? { key_passphrase: draft.key_passphrase.trim() } : {}),
         ...(draft.service_username.trim() ? { service_username: draft.service_username.trim() } : {}),
         ...(draft.service_secret.trim() ? { service_secret: draft.service_secret.trim() } : {}),
+        skip_become: draft.credential_type !== "winrm" && draft.skip_become,
         host_id: hostId,
       }),
     onSuccess: (updated) => {
@@ -1098,17 +1143,19 @@ export function AuditFlowPage() {
                           <select
                             id={`af-type-${index}`}
                             className="pf-select"
-                            value={cred.credential_type}
+                            value={credChoice(cred)}
                             onChange={(e) =>
                               setCreds((prev) =>
                                 prev.map((c, i) =>
-                                  i === index ? { ...c, credential_type: e.target.value as CredType } : c
+                                  i === index ? { ...c, ...credFromChoice(e.target.value) } : c
                                 )
                               )
                             }
                           >
                             <option value="ssh_password">{t("auditFlow.credTypeSshPassword")}</option>
+                            <option value="ssh_password_sudo">{t("auditFlow.credTypeSshPasswordSudo")}</option>
                             <option value="ssh_key">{t("auditFlow.credTypeSshKey")}</option>
+                            <option value="ssh_key_sudo">{t("auditFlow.credTypeSshKeySudo")}</option>
                             <option value="winrm">{t("auditFlow.credTypeWinrm")}</option>
                           </select>
                         </div>
@@ -1414,6 +1461,9 @@ export function AuditFlowPage() {
                                     <span className="pf-audit-flow-oscell__guess">
                                       {host.os_guess || t("common.dash")}
                                     </span>
+                                    {osEvidenceText(host, t) ? (
+                                      <span className="pf-audit-flow-oscell__meta">{osEvidenceText(host, t)}</span>
+                                    ) : null}
                                   </div>
                                 ) : (
                                   <span className="pf-audit-flow-oscell__empty">{t("common.dash")}</span>
@@ -1632,6 +1682,9 @@ export function AuditFlowPage() {
                                       </span>
                                     ) : null}
                                     <span className="pf-audit-flow-oscell__guess">{host.os_guess || "—"}</span>
+                                    {osEvidenceText(host, t) ? (
+                                      <span className="pf-audit-flow-oscell__meta">{osEvidenceText(host, t)}</span>
+                                    ) : null}
                                   </div>
                                 ) : (
                                   <span className="pf-audit-flow-oscell__empty">{t("common.dash")}</span>
@@ -1730,8 +1783,16 @@ export function AuditFlowPage() {
                                                 ? t("auditFlow.hintDetectedVersion", { version: hint.detail })
                                                 : hint.code === "detected_os"
                                                   ? t("auditFlow.hintDetectedOs", { os: hint.detail })
-                                                  : hint.code === "fingerprint_source"
-                                                    ? t("auditFlow.hintSource", { source: hint.detail })
+                                                    : hint.code === "fingerprint_source"
+                                                    ? t("auditFlow.hintSource", {
+                                                        source: OS_SOURCE_KEYS[hint.detail]
+                                                          ? t(OS_SOURCE_KEYS[hint.detail])
+                                                          : hint.detail,
+                                                      })
+                                                    : hint.code === "version_unknown"
+                                                      ? t("auditFlow.hintVersionUnknown")
+                                                      : hint.code === "nearest"
+                                                        ? t("auditFlow.hintNearest", { name: hint.detail })
                                                     : hint.code === "selected"
                                                       ? t("auditFlow.hintSelected", {
                                                           name: hint.detail,
@@ -1774,6 +1835,7 @@ export function AuditFlowPage() {
                                         {runCredentials.map((cred) => (
                                           <option key={cred.id} value={cred.id}>
                                             {cred.label ? `${cred.label} (${cred.username})` : cred.username}
+                                            {cred.skip_become ? ` · ${t("auditFlow.skipBecomeShort")}` : ""}
                                           </option>
                                         ))}
                                       </select>
@@ -1844,16 +1906,18 @@ export function AuditFlowPage() {
                                       <select
                                         id={`af-host-type-${host.id}`}
                                         className="pf-select"
-                                        value={hostCred.credential_type}
+                                        value={credChoice(hostCred)}
                                         onChange={(e) =>
                                           setHostCred((prev) => ({
                                             ...prev,
-                                            credential_type: e.target.value as CredType,
+                                            ...credFromChoice(e.target.value),
                                           }))
                                         }
                                       >
                                         <option value="ssh_password">{t("auditFlow.credTypeSshPassword")}</option>
+                                        <option value="ssh_password_sudo">{t("auditFlow.credTypeSshPasswordSudo")}</option>
                                         <option value="ssh_key">{t("auditFlow.credTypeSshKey")}</option>
+                                        <option value="ssh_key_sudo">{t("auditFlow.credTypeSshKeySudo")}</option>
                                         <option value="winrm">{t("auditFlow.credTypeWinrm")}</option>
                                       </select>
                                     </div>
@@ -1982,34 +2046,26 @@ export function AuditFlowPage() {
               </>
             )}
           </div>
-          {(step === "review" || step === "checks" || (step === "results" && hostsReadyToExecute)) && (
+          {(step === "review" || (step === "results" && hostsReadyToExecute)) && (
             <div className="pf-audit-flow-footer">
-              {step === "checks" ? (
-                <span className="pf-audit-flow-footer__note pf-audit-flow-footer__live">
-                  <span className="pf-audit-flow-live__dot" aria-hidden="true" />
-                  {t("auditFlow.running")}
-                </span>
-              ) : (
-                <>
-                  <span className="pf-audit-flow-footer__note">
-                    {t("auditFlow.reviewSelected", { count: reviewStats.selected })}
-                  </span>
-                  <div className="pf-audit-flow-footer__actions">
-                    {step === "review" ? (
-                      <Button type="button" variant="secondary" onClick={() => goToStep("setup")}>
-                        {t("auditFlow.changeSettings")}
-                      </Button>
-                    ) : null}
-                    <Button
-                      onClick={() => executeMutation.mutate()}
-                      disabled={executeMutation.isPending || !canDiscover || !hostsReadyToExecute}
-                      title={!canDiscover ? t("common.demoActionDisabled") : undefined}
-                    >
-                      {t("auditFlow.execute")}
-                    </Button>
-                  </div>
-                </>
-              )}
+              <span className="pf-audit-flow-footer__note">
+                {t("auditFlow.reviewSelected", { count: reviewStats.selected })}
+              </span>
+              <div className="pf-audit-flow-footer__actions">
+                {step === "review" ? (
+                  <Button type="button" variant="secondary" onClick={() => goToStep("setup")}>
+                    {t("auditFlow.changeSettings")}
+                  </Button>
+                ) : null}
+                <Button
+                  type="button"
+                  onClick={() => executeMutation.mutate()}
+                  disabled={executeMutation.isPending || !canDiscover || !hostsReadyToExecute}
+                  title={!canDiscover ? t("common.demoActionDisabled") : undefined}
+                >
+                  {t("auditFlow.execute")}
+                </Button>
+              </div>
             </div>
           )}
         </Panel>
@@ -2035,6 +2091,7 @@ export function AuditFlowPage() {
               ...(c.key_passphrase.trim() ? { key_passphrase: c.key_passphrase.trim() } : {}),
               ...(c.service_username.trim() ? { service_username: c.service_username.trim() } : {}),
               ...(c.service_secret.trim() ? { service_secret: c.service_secret.trim() } : {}),
+              skip_become: c.credential_type !== "winrm" && c.skip_become,
             }))}
           saveToInventory={saveToInventory}
           onRunStarted={(created) => {

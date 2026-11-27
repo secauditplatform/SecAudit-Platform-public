@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from secaudit_core.profile_packages import package_encoding_hint
+from secaudit_core.profile_variables import snapshot_variables
 from secaudit_core.rule_tech_names import excluded_by_version_entries
 
 
@@ -48,4 +49,7 @@ def profile_snapshot_from_profile(
                 "excluded_by_version": excluded,
             }
         )
+    variables = snapshot_variables(profile, version)
+    if variables:
+        snapshot["variables"] = variables
     return snapshot

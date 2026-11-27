@@ -275,7 +275,7 @@ def _channel_owner_matches(channel: NotificationChannel, payload: dict[str, Any]
     """Scope delivery: platform/audit → platform channels only; runs → owner or platform."""
     payload_type = payload.get("payload_type", "run")
     channel_owner = channel.owner_sub
-    if payload_type in {"audit", "platform"}:
+    if payload_type in {"audit", "platform", "compliance"}:
         return channel_owner is None
     run_owner = payload.get("owner_sub")
     if channel_owner is None:
@@ -298,7 +298,7 @@ def deliver_per_job_webhook(db: Session, payload: dict[str, Any], settings: SecA
     trigger_events = payload.get("trigger_events") or []
     job_id = payload.get("job_id")
     run_kind = payload.get("run_kind")
-    if not job_id or payload.get("payload_type") in {"audit", "platform"}:
+    if not job_id or payload.get("payload_type") in {"audit", "platform", "compliance"}:
         return {"sent": 0, "errors": []}
 
     if run_kind == "job":
@@ -584,21 +584,31 @@ def deliver_notifications(db: Session, payload: dict[str, Any], settings: SecAud
         if not _channel_owner_matches(channel, payload):
             skipped += 1
             continue
-        if payload_type == "audit" and channel.channel_type != NotificationChannelType.SIEM:
+        siem_native = payload_type in {"audit", "compliance"}
+        if (
+            payload_type == "compliance"
+            and channel.channel_type == NotificationChannelType.SIEM
+        ):
+            from secaudit_core.siem_export import channel_accepts_siem_mode
+
+            if not channel_accepts_siem_mode(channel, payload):
+                skipped += 1
+                continue
+        if siem_native and channel.channel_type != NotificationChannelType.SIEM:
             skipped += 1
             continue
         if payload_type == "platform" and channel.channel_type == NotificationChannelType.SIEM:
             if not payload.get("audit"):
                 skipped += 1
                 continue
-        elif payload_type != "audit" and channel.channel_type == NotificationChannelType.SIEM:
+        elif not siem_native and channel.channel_type == NotificationChannelType.SIEM:
             skipped += 1
             continue
         try:
             if channel.channel_type == NotificationChannelType.SIEM:
                 siem_payload = (
                     payload
-                    if payload_type == "audit"
+                    if siem_native
                     else {
                         "payload_type": "audit",
                         "trigger_events": trigger_events,
@@ -619,7 +629,7 @@ def deliver_notifications(db: Session, payload: dict[str, Any], settings: SecAud
             )
             errors.append(f"{channel.name}: {safe_error}")
 
-    if payload_type not in {"audit", "platform"}:
+    if payload_type not in {"audit", "platform", "compliance"}:
         job_webhook_result = deliver_per_job_webhook(db, payload, settings)
         sent += job_webhook_result["sent"]
         errors.extend(job_webhook_result["errors"])

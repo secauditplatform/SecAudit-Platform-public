@@ -63,6 +63,20 @@ jobs:
           pip install -e packages/secaudit_core
           pip install -r api/requirements.txt -r api/requirements-dev.txt
 
+      - name: Install dependency and security scanners
+        run: pip install pip-audit bandit
+
+      - name: Dependency audit (API)
+        # python-jose/ecdsa residuals are mitigated in app/core/auth.py (explicit algorithms).
+        run: pip-audit -r api/requirements.txt --vulnerability-service osv --ignore-vuln PYSEC-2026-4298 --ignore-vuln PYSEC-2026-1325
+
+      - name: Dependency audit (worker)
+        run: pip-audit -r workers/requirements.txt --vulnerability-service osv
+
+      - name: Static security scan
+        # B108: unique remote /tmp paths for Ansible/SSH/SCAP, not local temp files.
+        run: bandit -q -r api/app workers/app packages/secaudit_core -ll -s B108
+
       - name: Run Alembic migrations
         working-directory: api
         env:
@@ -93,6 +107,8 @@ jobs:
         run: |
           npm ci
           npm run lint
+          npm run typecheck
+          npm audit --omit=dev --audit-level=low
           npm run build
           npm test
 

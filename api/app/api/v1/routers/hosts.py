@@ -58,11 +58,12 @@ from app.services.host_credentials import (
     unlink_host_credential,
 )
 from app.services.object_rbac import (
+    apply_host_scope,
     apply_owner_scope,
-    assert_can_access,
     assert_credential_attachable,
-    assert_hosts_accessible,
+    assert_host_visible,
     assign_owner,
+    operator_scope,
 )
 from secaudit_core.host_csv_import import (
     CsvHostRecord,
@@ -156,7 +157,7 @@ async def _delete_host_if_allowed(host_id: int, db: AsyncSession, user: AuthUser
         return _HOST_NOT_FOUND
 
     try:
-        assert_can_access(user, host.owner_sub, detail=_HOST_NOT_FOUND)
+        await assert_host_visible(db, user, host, detail=_HOST_NOT_FOUND)
     except HTTPException:
         return _HOST_NOT_FOUND
 
@@ -206,6 +207,8 @@ def _host_to_read(host: Host) -> HostRead:
         site=host.site,
         environment=host.environment,
         criticality=host.criticality,
+        network_vendor=host.network_vendor,
+        os_family=host.os_family,
         credential_id=host.credential_id,
         credential_ids=credential_ids,
         linked_credentials=linked_credentials,
@@ -237,7 +240,7 @@ def _hosts_base_stmt(
     criticality: str | None = None,
 ):
     stmt = select(Host)
-    stmt = apply_owner_scope(stmt, Host.owner_sub, user)
+    stmt = apply_host_scope(apply_owner_scope(stmt, Host.owner_sub, user), user)
     stmt = stmt.where(Host.is_ephemeral.is_(False))
     if is_active is not None:
         stmt = stmt.where(Host.is_active.is_(is_active))
@@ -278,9 +281,12 @@ async def hosts_summary(
     total = int(
         (
             await db.execute(
-                apply_owner_scope(
-                    select(func.count()).select_from(Host).where(Host.is_ephemeral.is_(False)),
-                    Host.owner_sub,
+                apply_host_scope(
+                    apply_owner_scope(
+                        select(func.count()).select_from(Host).where(Host.is_ephemeral.is_(False)),
+                        Host.owner_sub,
+                        user,
+                    ),
                     user,
                 )
             )
@@ -289,11 +295,14 @@ async def hosts_summary(
     active = int(
         (
             await db.execute(
-                apply_owner_scope(
-                    select(func.count())
-                    .select_from(Host)
-                    .where(Host.is_ephemeral.is_(False), Host.is_active.is_(True)),
-                    Host.owner_sub,
+                apply_host_scope(
+                    apply_owner_scope(
+                        select(func.count())
+                        .select_from(Host)
+                        .where(Host.is_ephemeral.is_(False), Host.is_active.is_(True)),
+                        Host.owner_sub,
+                        user,
+                    ),
                     user,
                 )
             )
@@ -315,8 +324,13 @@ async def list_hosts(
     site: str | None = Query(default=None),
     environment: str | None = Query(default=None),
     criticality: str | None = Query(default=None),
+    ids: list[str] = Query(default=[]),  # repeated (?ids=1&ids=2) or comma-separated (?ids=1,2)
 ) -> PaginatedResponse[HostRead]:
     offset, limit = page
+    try:
+        id_list = [int(part) for raw in ids for part in raw.split(",") if part.strip()][:500]
+    except ValueError:
+        raise HTTPException(status_code=422, detail="ids must be integers") from None
     stmt = _hosts_base_stmt(
         user,
         tag=tag,
@@ -328,6 +342,10 @@ async def list_hosts(
         environment=environment,
         criticality=criticality,
     ).options(*_HOST_LOAD_OPTIONS)
+    if id_list:
+        # Owner scope stays in _hosts_base_stmt; ids only narrows. Page covers the whole set.
+        stmt = stmt.where(Host.id.in_(id_list))
+        offset, limit = 0, len(id_list)
     stmt = stmt.order_by(Host.name)
     hosts, total = await paginate_scalars(db, stmt, offset=offset, limit=limit)
     return PaginatedResponse(
@@ -343,14 +361,14 @@ _CSV_MAX_BYTES = 1_000_000
 
 async def _load_csv_inventory(db: AsyncSession, user: AuthUser) -> tuple[list[CsvHostRecord], dict[str, int]]:
     """Hosts this import may match: own rows and ownerless rows, plus nmap aliases."""
-    result = await db.execute(
-        select(Host)
-        .options(selectinload(Host.tags).selectinload(HostTagLink.tag))
-        .where(
-            Host.is_ephemeral.is_(False),
-            or_(Host.owner_sub == user.sub, Host.owner_sub.is_(None)),
-        )
+    csv_stmt = select(Host).options(selectinload(Host.tags).selectinload(HostTagLink.tag)).where(
+        Host.is_ephemeral.is_(False)
     )
+    if operator_scope(user) is None:
+        csv_stmt = csv_stmt.where(or_(Host.owner_sub == user.sub, Host.owner_sub.is_(None)))
+    else:
+        csv_stmt = apply_host_scope(csv_stmt, user)
+    result = await db.execute(csv_stmt)
     hosts = list(result.scalars().all())
     records = [
         CsvHostRecord(
@@ -593,7 +611,7 @@ async def bulk_classify_hosts(
             skipped.append(HostBulkClassifySkip(host_id=host_id, detail="Host not found"))
             continue
         try:
-            assert_can_access(user, host.owner_sub, detail="Host not found")
+            await assert_host_visible(db, user, host)
         except HTTPException as exc:
             skipped.append(HostBulkClassifySkip(host_id=host_id, detail=str(exc.detail)))
             continue
@@ -631,7 +649,7 @@ async def list_host_tags(
         .join(HostTagLink, HostTagLink.tag_id == HostTag.id)
         .join(Host, Host.id == HostTagLink.host_id)
     )
-    stmt = apply_owner_scope(stmt, Host.owner_sub, user)
+    stmt = apply_host_scope(apply_owner_scope(stmt, Host.owner_sub, user), user)
     stmt = stmt.distinct().order_by(HostTag.name)
     result = await db.execute(stmt)
     return [HostTagRead.model_validate(tag) for tag in result.scalars().all()]
@@ -646,7 +664,7 @@ async def get_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
     return _host_to_read(host)
 
 
@@ -661,7 +679,7 @@ async def update_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
 
     updates = data.model_dump(exclude_unset=True)
     clear_ssh = updates.pop("clear_ssh_host_key", False)
@@ -723,7 +741,7 @@ async def link_credential_to_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
     await link_host_credential(db, host, user, data.credential_id)
     await db.flush()
     host = await _load_host(db, host.id)
@@ -751,7 +769,7 @@ async def unlink_credential_from_host(
     host = await _load_host(db, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
     await unlink_host_credential(db, host, user, credential_id)
     await db.flush()
     host = await _load_host(db, host.id)
@@ -782,7 +800,7 @@ async def preflight_host(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
     if credential_id is not None:
         from app.models import Credential
 
@@ -817,7 +835,7 @@ async def scan_host_ssh_fingerprint(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
 
     os_type = (host.os_type or "linux").strip().lower()
     if os_type not in _SSH_FINGERPRINT_OS_TYPES:
@@ -840,6 +858,24 @@ async def scan_host_ssh_fingerprint(
 
     host.ssh_host_key_fingerprint = fingerprint
     host.ssh_known_hosts_entry = known_hosts_entry
+    from secaudit_core.asset_identity import normalize_identity_value
+    from secaudit_core.enums import AssetIdentityKind
+    from secaudit_core.models import AssetIdentity
+
+    kind = AssetIdentityKind.SSH_FINGERPRINT
+    identity_value = normalize_identity_value(kind, fingerprint)
+    existing_identity = (
+        await db.execute(
+            select(AssetIdentity).where(
+                AssetIdentity.kind == kind,
+                AssetIdentity.value == identity_value,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing_identity is None:
+        db.add(AssetIdentity(host_id=host.id, kind=kind, value=identity_value))
+    elif existing_identity.host_id != host.id:
+        existing_identity.host_id = host.id
     await db.flush()
 
     await log_audit_event(
@@ -865,7 +901,7 @@ async def delete_host(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail=_HOST_NOT_FOUND)
-    assert_can_access(user, host.owner_sub, detail=_HOST_NOT_FOUND)
+    await assert_host_visible(db, user, host, detail=_HOST_NOT_FOUND)
     try:
         error = await _delete_host_if_allowed(host_id, db, user)
     except IntegrityError as exc:
@@ -893,7 +929,7 @@ async def set_host_tags(
     host = await db.get(Host, host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
-    assert_can_access(user, host.owner_sub, detail="Host not found")
+    await assert_host_visible(db, user, host)
 
     names = sorted(set(name.strip() for name in data.tag_names if name.strip()))
     await db.execute(delete(HostTagLink).where(HostTagLink.host_id == host_id))

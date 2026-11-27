@@ -861,19 +861,15 @@ export function RemediationWorkflowPanel({
 
         <WorkflowStep index={4} title={t("workflow.stepDrift")} state={stepDriftState}>
           {reauditCompleted && reauditRunId != null ? (
-            <div className="pf-workflow-rail__summary">
+            <div className="pf-workflow-rail__summary pf-workflow-rail__summary--stack">
               {closedFailQuery.data?.summary.closed_fail_percent != null ? (
-                <p className="pf-workflow-rail__metric pf-workflow-rail__metric--closed">
+                <Badge variant="success">
                   {t("workflow.closedFailPercent", {
                     percent: closedFailQuery.data.summary.closed_fail_percent,
+                    closed: closedFailQuery.data.summary.closed_failed ?? 0,
+                    baseline: closedFailQuery.data.summary.baseline_failed ?? 0,
                   })}
-                  <span className="pf-workflow-rail__note">
-                    {t("workflow.closedFailDetail", {
-                      closed: closedFailQuery.data.summary.closed_failed ?? 0,
-                      baseline: closedFailQuery.data.summary.baseline_failed ?? 0,
-                    })}
-                  </span>
-                </p>
+                </Badge>
               ) : null}
               <p className="pf-workflow-rail__text">{t("workflow.driftReady")}</p>
               <Link to={`/reports?run=${reauditRunId}`} className="pf-link">

@@ -52,12 +52,6 @@ def kill_run_child_pids(redis_url: str, run_kind: str, run_id: int) -> None:
         client.close()
 
 
-def request_run_cancel(redis_url: str, run_kind: str, run_id: int) -> None:
-    """Set cancel flag and best-effort kill (only works in the worker PID ns)."""
-    set_run_cancel_flag(redis_url, run_kind, run_id)
-    kill_run_child_pids(redis_url, run_kind, run_id)
-
-
 def is_run_cancel_requested(redis_url: str, run_kind: str, run_id: int) -> bool:
     client = sync_redis(redis_url, decode_responses=True)
     try:

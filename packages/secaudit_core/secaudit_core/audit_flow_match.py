@@ -78,6 +78,7 @@ class Fingerprint(TypedDict, total=False):
     variant: str | None
     pretty: str | None
     source: str
+    accuracy: int
 
 
 class ProfileScore(TypedDict):
@@ -119,6 +120,8 @@ _LINUX_HINTS = (
     "opensuse",
     "astra",
     "alt linux",
+    "altlinux",
+    "basealt",
     "oracle linux",
     "azure linux",
     "redos",
@@ -178,6 +181,9 @@ _NETWORK_HINTS = (
     "xiaomi",
     "miwifi",
     "openwrt",
+    "asus",
+    "asustek",
+    "asuswrt",
 )
 
 # Longer / more specific aliases first.
@@ -188,13 +194,17 @@ _FAMILY_PATTERNS: tuple[tuple[str, str], ...] = (
     ("rocky linux", "rocky"),
     ("oracle linux", "oracle"),
     ("oraclelinux", "oracle"),
+    ("red os", "redos"),
     ("red hat enterprise", "rhel"),
     ("redhat", "rhel"),
     ("red hat", "rhel"),
     ("azure linux", "azure"),
     ("azurelinux", "azure"),
+    ("basealt", "alt"),
     ("alt linux", "alt"),
     ("altlinux", "alt"),
+    ("asuswrt", "asus"),
+    ("asustek", "asus"),
     ("open suse", "opensuse"),
     ("opensuse-tumbleweed", "opensuse"),
     ("opensuse-slowroll", "opensuse"),
@@ -317,6 +327,8 @@ _FAMILY_KEYWORDS: tuple[tuple[str, str], ...] = (
     ("aix", "aix"),
     ("hpux", "hpux"),
     ("macos", "macos"),
+    ("alt", "alt"),
+    ("asus", "asus"),
 )
 
 _VARIANT_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -375,6 +387,9 @@ def infer_platform(text: str, open_ports: list[int] | None = None) -> str | None
         return "network"
     if 22 in ports:
         return "linux"
+    web = ports & {80, 443, 8080, 8443}
+    if web and not ports & {22, 23, 445, 3389, 5985, 5986, 830} and (8443 in ports or 53 in ports):
+        return "network"
     return None
 
 
@@ -412,7 +427,12 @@ def detect_family(text: str, *, os_id: str | None = None) -> str | None:
             if needle.replace(" ", "") == like.replace(" ", ""):
                 return family
     for needle, family in _FAMILY_KEYWORDS:
-        if re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", blob):
+        # nmap names the alternate HTTPS port "https-alt"; that hyphen is not ALT Linux.
+        if needle == "alt":
+            pattern = r"(?<![a-z0-9-])alt(?![a-z0-9-])"
+        else:
+            pattern = rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])"
+        if re.search(pattern, blob):
             return family
     if "windows" in blob:
         return "windows_server" if "server" in blob else "windows"
@@ -657,7 +677,7 @@ def score_profile(fp: Fingerprint, profile: ProfileMatchInput) -> int:
     elif not pr_ver:
         score += 15
     elif not fp_ver:
-        score += 5
+        return 0
 
     fp_variant = fp.get("variant")
     pr_variant = detect_variant(
@@ -693,6 +713,7 @@ def build_match_hints(
     profile_name: str | None,
     confidence: int,
     alternatives: list[ProfileScore],
+    nearest: list[ProfileScore] | None = None,
 ) -> list[MatchHint]:
     """Human-readable reasons for the chosen CRE profile vs near alternatives."""
     hints: list[MatchHint] = []
@@ -707,7 +728,12 @@ def build_match_hints(
         hints.append({"code": "detected_family", "detail": str(family)})
     if version:
         hints.append({"code": "detected_version", "detail": str(version)})
+    elif family:
+        hints.append({"code": "version_unknown", "detail": str(family)})
     hints.append({"code": "fingerprint_source", "detail": str(source)})
+    accuracy = int(fp.get("accuracy") or 0)
+    if accuracy and source == "nmap":
+        hints.append({"code": "os_accuracy", "detail": str(accuracy)})
 
     if profile_id and profile_name:
         hints.append(
@@ -747,7 +773,37 @@ def build_match_hints(
                 "confidence": alt["confidence"],
             }
         )
+    for item in (nearest or [])[:3]:
+        hints.append(
+            {
+                "code": "nearest",
+                "detail": item["profile_name"],
+                "profile_id": item["profile_id"],
+            }
+        )
     return hints
+
+
+def _nearest_profiles(fp: Fingerprint, profiles: list[ProfileMatchInput], *, limit: int = 3) -> list[ProfileScore]:
+    """Same-family catalog rows to explain a missing version. Not a selection."""
+    family = fp.get("family")
+    if not family or _version_tuple(fp.get("os_version")):
+        return []
+    found: list[ProfileScore] = []
+    for profile in profiles:
+        if not is_os_profile(profile) or _profile_family(profile) != family:
+            continue
+        if not _version_tuple(_profile_release(profile, family)):
+            continue
+        found.append(
+            {
+                "profile_id": profile["id"],
+                "profile_name": profile["profile_name"],
+                "confidence": 0,
+            }
+        )
+    found.sort(key=lambda item: item["profile_name"])
+    return found[:limit]
 
 
 def decide_profile(
@@ -758,6 +814,8 @@ def decide_profile(
     limit: int = 5,
 ) -> MatchDecision:
     ranked = rank_profiles(fp, profiles, limit=limit)
+    nearest = _nearest_profiles(fp, profiles)
+    version_missing = bool(fp.get("family")) and not _version_tuple(fp.get("os_version"))
     if not ranked:
         return {
             "profile_id": None,
@@ -765,8 +823,8 @@ def decide_profile(
             "confidence": 0,
             "alternatives": [],
             "auto_select": False,
-            "skip_reason": "no_matching_profile",
-            "skip_detail": "No matching compliance profile",
+            "skip_reason": "version_unknown" if version_missing else "no_matching_profile",
+            "skip_detail": None if version_missing else "No matching compliance profile",
             "hints": build_match_hints(
                 fp,
                 profiles,
@@ -774,6 +832,7 @@ def decide_profile(
                 profile_name=None,
                 confidence=0,
                 alternatives=[],
+                nearest=nearest,
             ),
         }
 
@@ -832,6 +891,81 @@ def review_skip_without_auth(
     return "unreachable", "No SSH/WinRM management port responded"
 
 
+_CPE_RE = re.compile(r"cpe:/[oa]:([^:\s/]+):([^:\s/]+):([^:\s/]+)", re.IGNORECASE)
+_CPE_PRODUCT_FAMILY = {
+    "ubuntu_linux": "ubuntu",
+    "debian_linux": "debian",
+    "enterprise_linux": "rhel",
+    "almalinux": "alma",
+    "rocky": "rocky",
+    "centos": "centos",
+    "fedora": "fedora",
+    "altlinux": "alt",
+    "alt": "alt",
+    "asuswrt": "asus",
+}
+_FAMILY_RELEASE: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ubuntu", re.compile(r"(?<![a-z0-9])ubuntu(?:\s+linux)?\s+(\d{2}(?:\.\d{1,2})?)(?!\d)", re.IGNORECASE)),
+    ("debian", re.compile(r"(?<![a-z0-9])debian(?:\s+gnu/linux)?\s+(\d{1,2}(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("alt", re.compile(r"(?<![a-z0-9])alt(?:\s+linux)?(?:\s+(?:server|sp|workstation))?\s+(\d{1,2}(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("rhel", re.compile(r"(?<![a-z0-9])(?:red\s*hat(?:\s+enterprise\s+linux)?|rhel)\s+(\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("alma", re.compile(r"(?<![a-z0-9])alma(?:linux)?\s+(\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("rocky", re.compile(r"(?<![a-z0-9])rocky(?:\s+linux)?\s+(\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("centos", re.compile(r"(?<![a-z0-9])centos(?:\s+linux)?\s+(\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("fedora", re.compile(r"(?<![a-z0-9])fedora(?:\s+linux)?\s+(\d+)(?!\d)", re.IGNORECASE)),
+    ("opensuse", re.compile(r"(?<![a-z0-9])opensuse(?:\s+\S+){0,2}\s+(\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+    ("astra", re.compile(r"(?<![a-z0-9])astra(?:\s+linux)?(?:\s+\S+){0,3}\s+(\d+(?:\.\d+)?)(?!\d)", re.IGNORECASE)),
+)
+
+
+def _cpe_family_version(text: str) -> tuple[str | None, str | None]:
+    found: tuple[str | None, str | None] = (None, None)
+    for vendor, product, version in _CPE_RE.findall(text or ""):
+        vendor_l = vendor.lower()
+        product_l = product.lower()
+        if product_l in {"linux_kernel", "linux"} and vendor_l == "linux":
+            continue
+        family = _CPE_PRODUCT_FAMILY.get(product_l)
+        if family is None and vendor_l in {"asus", "asustek"}:
+            family = "asus"
+        if family is None and vendor_l in {"basealt", "altlinux"}:
+            family = "alt"
+        if not family:
+            continue
+        ver = version.strip()
+        if ver in {"*", "-", ""}:
+            found = (family, found[1])
+            continue
+        return family, ver.split("*", 1)[0]
+    return found
+
+
+_FAMILY_PRETTY = {
+    "ubuntu": "Ubuntu",
+    "debian": "Debian",
+    "alt": "ALT Linux",
+    "rhel": "Red Hat Enterprise Linux",
+    "alma": "AlmaLinux",
+    "rocky": "Rocky Linux",
+    "centos": "CentOS",
+    "fedora": "Fedora",
+    "opensuse": "openSUSE",
+    "astra": "Astra Linux",
+}
+
+
+def _release_for_family(family: str | None, text: str) -> str | None:
+    if not family or not text:
+        return None
+    for name, pattern in _FAMILY_RELEASE:
+        if name != family:
+            continue
+        match = pattern.search(text)
+        if match:
+            return match.group(1)
+    return None
+
+
 def fingerprint_from_facts(
     *,
     platform: str | None,
@@ -841,6 +975,8 @@ def fingerprint_from_facts(
     snmp_sysdescr: str | None = None,
     services: str | None = None,
     open_ports: list[int] | None = None,
+    os_source: str | None = None,
+    accuracy: int | None = None,
 ) -> Fingerprint:
     os_release = sanitize_probe_text(os_release) or None
     win_caption = sanitize_probe_text(win_caption) or None
@@ -858,6 +994,9 @@ def fingerprint_from_facts(
     family = detect_family(auth_blob, os_id=os_id) if auth_blob else None
     if not family:
         family = detect_family(raw, os_id=os_id)
+    cpe_family, cpe_version = _cpe_family_version(raw)
+    if not family and cpe_family:
+        family = cpe_family
 
     win_family, win_release = (None, None)
     win_text = win_caption or (raw if "windows" in raw.lower() else "")
@@ -883,6 +1022,7 @@ def fingerprint_from_facts(
         "arista",
         "paloalto",
         "xiaomi",
+        "asus",
     }:
         guessed = "network"
     elif family in _UNIX_FAMILIES:
@@ -898,6 +1038,8 @@ def fingerprint_from_facts(
     source = "ports"
     if auth_parts:
         source = "facts"
+    elif os_source:
+        source = os_source
     elif nmap_parts:
         source = "nmap"
     elif snmp_sysdescr:
@@ -913,9 +1055,9 @@ def fingerprint_from_facts(
     elif guessed in {"linux", "unix"}:
         os_version = fields.get("VERSION_ID") or None
         if not os_version:
-            ver_src = fields.get("PRETTY_NAME") or auth_blob or (banner or "")
-            ver = _VERSION_RE.search(ver_src)
-            os_version = ver.group(1) if ver else None
+            os_version = _release_for_family(family, raw)
+        if not os_version and cpe_version and (cpe_family is None or cpe_family == family):
+            os_version = cpe_version
         default_name = (
             _UNIX_DISPLAY_NAMES.get(family or "", "UNIX")
             if guessed == "unix"
@@ -928,6 +1070,11 @@ def fingerprint_from_facts(
             pretty = banner
         if not pretty:
             pretty = f"{os_name} {os_version}".strip() if os_version else os_name
+        if family in _FAMILY_PRETTY and (not pretty or pretty.lower() in {"linux", "linux or unix", "unix"}):
+            title = _FAMILY_PRETTY[family]
+            pretty = f"{title} {os_version}".strip() if os_version else title
+        elif os_version and pretty and not re.search(r"\d", pretty):
+            pretty = f"{pretty} {os_version}".strip()
         family = family or detect_family(pretty or raw, os_id=os_id)
     elif guessed == "network":
         family = family or detect_family(raw)
@@ -946,6 +1093,14 @@ def fingerprint_from_facts(
             pretty = f"{dist} {rel}".strip() if rel else dist
         if family == "eltex" and not variant:
             variant = detect_variant(raw)
+        if not family:
+            os_name = "Network device"
+            pretty = "Network device"
+        elif family == "asus":
+            low = (pretty or "").lower()
+            gateway = 8443 in set(open_ports or []) or "router" in low
+            if gateway or not low or low.startswith("asustek") or low in {"asus", "network", "network device"}:
+                pretty = "ASUS router"
 
     if family == "windows_server" or family == "windows":
         guessed = "windows"
@@ -960,6 +1115,7 @@ def fingerprint_from_facts(
         "variant": variant,
         "pretty": (pretty or "")[:256] or None,
         "source": source if guessed else "ports",
+        "accuracy": int(accuracy) if accuracy and source == "nmap" else 0,
     }
 
 

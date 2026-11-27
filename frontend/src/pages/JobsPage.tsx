@@ -6,6 +6,7 @@ import {
   type DynamicHostFilter,
   type Host,
   type Job,
+  type ProfileApplicabilityHost,
   type JobRun,
   type JobRunSubset,
   type JobTemplate,
@@ -115,6 +116,36 @@ function populateFormFromJob(
   if (setters.setNetworkCheckMode && job.network_check_mode) {
     setters.setNetworkCheckMode(job.network_check_mode);
   }
+}
+
+function applicabilityVerdictText(
+  hosts: ProfileApplicabilityHost[] | undefined,
+  t: (key: string, values?: Record<string, string | number>) => string,
+): string | null {
+  if (!hosts?.length) return null;
+  const counts = { match: 0, version_mismatch: 0, distro_mismatch: 0, unknown_os: 0 };
+  for (const host of hosts) {
+    const reason = host.reason;
+    if (
+      reason === "match" ||
+      reason === "version_mismatch" ||
+      reason === "distro_mismatch" ||
+      reason === "unknown_os"
+    ) {
+      counts[reason] += 1;
+    } else if (host.applicable) {
+      counts.match += 1;
+    } else {
+      counts.distro_mismatch += 1;
+    }
+  }
+  if (counts.version_mismatch + counts.distro_mismatch + counts.unknown_os === 0) return null;
+  return t("preflight.applicabilityVerdicts", {
+    match: counts.match,
+    version: counts.version_mismatch,
+    distro: counts.distro_mismatch,
+    unknown: counts.unknown_os,
+  });
 }
 
 export function JobsPage({
@@ -445,6 +476,21 @@ export function JobsPage({
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
 
+  const toastProbeResults = (results: { ok: boolean; target: string }[]) => {
+    const failed = results.filter((r) => !r.ok);
+    if (failed.length === 0) {
+      toast.success(t("preflight.hostsOk", { count: results.length }));
+    } else {
+      toast.error(
+        t("preflight.hostsFail", {
+          failed: failed.length,
+          total: results.length,
+          targets: failed.map((r) => r.target).join(", "),
+        })
+      );
+    }
+  };
+
   const preflightHostsMutation = useMutation({
     mutationFn: async (ids: number[]) => {
       const results = [];
@@ -453,17 +499,43 @@ export function JobsPage({
       }
       return results;
     },
-    onSuccess: (results) => {
-      const failed = results.filter((r) => !r.ok);
-      if (failed.length === 0) {
-        toast.success(t("preflight.hostsOk", { count: results.length }));
-      } else {
-        toast.error(
-          t("preflight.hostsFail", {
-            failed: failed.length,
-            total: results.length,
-            targets: failed.map((r) => r.target).join(", "),
-          })
+    onSuccess: toastProbeResults,
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const preflightJobMutation = useMutation({
+    mutationFn: async (jobId: number) => {
+      let status = await api.preflightJob(jobId);
+      const deadline = Date.now() + 10 * 60 * 1000;
+      while (status.status === "pending" && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        status = await api.preflightJobStatus(status.task_id);
+      }
+      if (status.status === "failed" || status.error) {
+        throw new Error(status.error || t("toast.genericError"));
+      }
+      if (status.status !== "ready") {
+        throw new Error(t("toast.genericError"));
+      }
+      return status;
+    },
+    onSuccess: (status) => {
+      toastProbeResults(status.probes);
+      const fit = status.applicability;
+      if (fit && fit.hosts_inapplicable > 0) {
+        const verdicts = applicabilityVerdictText(fit.hosts, t);
+        toast.toast(
+          [
+            t("preflight.applicabilityBanner", {
+              rules: fit.rules_count,
+              applicable: fit.hosts_applicable,
+              inapplicable: fit.hosts_inapplicable,
+            }),
+            verdicts,
+          ]
+            .filter(Boolean)
+            .join(" "),
+          "info"
         );
       }
     },
@@ -961,6 +1033,9 @@ export function JobsPage({
                 applicable: applicability.data.hosts_applicable,
                 inapplicable: applicability.data.hosts_inapplicable,
               })}
+              {applicabilityVerdictText(applicability.data.hosts, t) ? (
+                <div>{applicabilityVerdictText(applicability.data.hosts, t)}</div>
+              ) : null}
             </div>
           ) : null}
 
@@ -1236,18 +1311,12 @@ export function JobsPage({
                         <Button
                           variant="secondary"
                           className="pf-btn--sm"
-                          onClick={() => preflightHostsMutation.mutate(job.host_ids.slice(0, 5))}
-                          disabled={
-                            !canExecute ||
-                            preflightHostsMutation.isPending ||
-                            job.host_ids.length === 0
-                          }
+                          onClick={() => preflightJobMutation.mutate(job.id)}
+                          disabled={!canExecute || preflightJobMutation.isPending}
                           title={
-                            job.host_ids.length === 0
-                              ? t("preflight.needExplicitHosts")
-                              : !canExecute
-                                ? t("common.demoActionDisabled")
-                                : t("preflight.checkSelectedHostsHint")
+                            !canExecute
+                              ? t("common.demoActionDisabled")
+                              : t("preflight.checkJobHostsHint")
                           }
                         >
                           {t("preflight.checkAccess")}
@@ -1302,16 +1371,16 @@ export function JobsPage({
           <div className="pf-form__actions">
             {canOperate ? (
               <div className="pf-form__actions-buttons">
-                {(selectedJob.host_ids?.length ?? 0) > 0 ? (
-                  <Button
-                    variant="secondary"
-                    onClick={() => preflightHostsMutation.mutate((selectedJob.host_ids ?? []).slice(0, 5))}
-                    disabled={!canExecute || preflightHostsMutation.isPending}
-                    title={t("preflight.checkSelectedHostsHint")}
-                  >
-                    {t("preflight.checkAccess")}
-                  </Button>
-                ) : null}
+                <Button
+                  variant="secondary"
+                  onClick={() => preflightJobMutation.mutate(selectedJob.id)}
+                  disabled={!canExecute || preflightJobMutation.isPending}
+                  title={
+                    !canExecute ? t("common.demoActionDisabled") : t("preflight.checkJobHostsHint")
+                  }
+                >
+                  {t("preflight.checkAccess")}
+                </Button>
                 <Button
                   variant="secondary"
                   onClick={() => runMutation.mutate(selectedJob.id)}

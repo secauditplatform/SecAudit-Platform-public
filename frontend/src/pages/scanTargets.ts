@@ -1,5 +1,8 @@
 export type ScanTargetKind = "cidr" | "ip" | "range" | "hostname" | "ipv6prefix" | "invalid" | null;
 
+/** Tight IPv6 prefixes allowed for discovery (/120 ≈ 256 hosts … /128). */
+export const MIN_IPV6_PREFIX_LEN = 120;
+
 export function scanTargetTokens(values: string[]): string[] {
   return values
     .flatMap((item) => item.split(/[\s,;\r\n]+/))
@@ -23,10 +26,22 @@ function isIpv6Address(value: string): boolean {
   }
 }
 
+export function isAllowedIpv6Prefix(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed.includes(":") || !trimmed.includes("/")) return false;
+  const slash = trimmed.lastIndexOf("/");
+  const prefixText = trimmed.slice(slash + 1);
+  if (!/^\d+$/.test(prefixText)) return false;
+  const prefix = Number(prefixText);
+  return prefix >= MIN_IPV6_PREFIX_LEN && prefix <= 128;
+}
+
 export function detectTargetType(raw: string): ScanTargetKind {
   const v = raw.trim();
   if (!v) return null;
-  if (v.includes(":") && v.includes("/")) return "ipv6prefix";
+  if (v.includes(":") && v.includes("/")) {
+    return isAllowedIpv6Prefix(v) ? "cidr" : "ipv6prefix";
+  }
   if (isIpv6Address(v)) return "ip";
   if (v.includes("/")) {
     const parts = v.split("/");

@@ -41,8 +41,6 @@ const LOCALE_META: LocaleMeta[] = [
 /** UI languages: RU/EN first, then top-10 by speakers (excl. RU/EN), A–Z by English name. */
 export const LOCALES: LocaleMeta[] = LOCALE_META;
 
-export const LOCALE_CODES = LOCALES.map((l) => l.code);
-
 const byCode = Object.fromEntries(LOCALES.map((l) => [l.code, l])) as Record<Locale, LocaleMeta>;
 
 export function getLocaleMeta(code: string): LocaleMeta | undefined {

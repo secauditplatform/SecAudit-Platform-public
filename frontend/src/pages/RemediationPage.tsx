@@ -83,6 +83,7 @@ export function RemediationPage({
   const [editedContent, setEditedContent] = useState("");
   const [isDirty, setIsDirty] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"success" | "error" | null>(null);
+  const [changeTicket, setChangeTicket] = useState("");
   const jobFormPanelRef = useRef<HTMLElement>(null);
   const selectedJobPanelRef = useRef<HTMLElement>(null);
   const pendingScrollToJobIdRef = useRef<number | null>(null);
@@ -386,12 +387,59 @@ export function RemediationPage({
   });
 
   const runMutation = useMutation({
-    mutationFn: api.runRemediation,
+    mutationFn: (jobId: number) =>
+      api.runRemediation(jobId, { change_ticket: changeTicket.trim() || null }),
     onSuccess: (run) => {
       setLastRunId(run.id);
       setSelectedJobId(run.remediation_job_id);
       queryClient.invalidateQueries({ queryKey: ["remediation-runs"] });
+      queryClient.invalidateQueries({ queryKey: ["remediation-run"] });
       toast.success(t("toast.remediationRunStarted"));
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const rollbackMutation = useMutation({
+    mutationFn: (runId: number) => api.rollbackRemediationRun(runId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["remediation-run"] });
+      toast.success(t("remediation.rollbackQueued"));
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+
+  const windowsQuery = useQuery({
+    queryKey: ["maintenance-windows"],
+    queryFn: () => api.maintenanceWindows(),
+    enabled: isAdmin,
+  });
+  const [mwSite, setMwSite] = useState("");
+  const [mwEnv, setMwEnv] = useState("prod");
+  const [mwDays, setMwDays] = useState("0,1,2,3,4");
+  const [mwStart, setMwStart] = useState("22:00");
+  const [mwEnd, setMwEnd] = useState("06:00");
+  const createWindowMutation = useMutation({
+    mutationFn: () =>
+      api.createMaintenanceWindow({
+        site: mwSite.trim() || null,
+        environment: mwEnv.trim() || null,
+        days_of_week: mwDays.trim() || "0,1,2,3,4",
+        start_time: mwStart.trim() || "00:00",
+        end_time: mwEnd.trim() || "23:59",
+        tz: "UTC",
+        enabled: true,
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["maintenance-windows"] });
+      toast.success(t("remediation.mwSaved"));
+    },
+    onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
+  });
+  const deleteWindowMutation = useMutation({
+    mutationFn: api.deleteMaintenanceWindow,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["maintenance-windows"] });
+      toast.success(t("remediation.mwDeleted"));
     },
     onError: (err) => toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
@@ -537,6 +585,23 @@ export function RemediationPage({
     }
   };
 
+  const changeTicketField = canExecute ? (
+    <div className="pf-remediation-ticket">
+      <div className="pf-form__group">
+        <label htmlFor="remediation-change-ticket">{t("remediation.changeTicket")}</label>
+        <input
+          id="remediation-change-ticket"
+          className="pf-input"
+          value={changeTicket}
+          onChange={(event) => setChangeTicket(event.target.value)}
+          placeholder={t("remediation.changeTicketPlaceholder")}
+          autoComplete="off"
+        />
+        <p className="pf-form__hint">{t("remediation.changeTicketHint")}</p>
+      </div>
+    </div>
+  ) : null;
+
   const handleDeleteJob = async (job: RemediationJob) => {
     const ok = await confirm({
       title: t("common.delete"),
@@ -655,6 +720,8 @@ export function RemediationPage({
               onClearAll={() => setHostIds([])}
             />
           )}
+
+          {changeTicketField}
 
           <JobSchedulePicker
             enabled={isScheduled}
@@ -1077,6 +1144,14 @@ export function RemediationPage({
                     <td className="pf-table__mono">{run.remediation_job_id}</td>
                     <td>
                       <Badge variant={runStatusVariant(run.status)}>{runStatusLabel(t, run.status)}</Badge>
+                      {run.backup_status && run.backup_status !== "none" ? (
+                        <>
+                          {" "}
+                          <Badge variant={run.backup_status === "ok" ? "success" : run.backup_status === "failed" ? "danger" : "neutral"}>
+                            {t("remediation.backupStatus")}: {run.backup_status}
+                          </Badge>
+                        </>
+                      ) : null}
                     </td>
                     <td>
                       {run.started_at ? new Date(run.started_at).toLocaleString(dateLocale) : t("common.dash")}
@@ -1127,6 +1202,209 @@ export function RemediationPage({
         )}
       </Panel>
 
+      {isAdmin ? (
+        <Panel title={t("remediation.mwTitle")} description={t("remediation.mwLead")}>
+          <div className="pf-form pf-form--wide pf-mw-form">
+            <div className="pf-form__row pf-mw-form__row">
+              <div className="pf-form__group">
+                <label htmlFor="mw-site">{t("hosts.site")}</label>
+                <input
+                  id="mw-site"
+                  className="pf-input"
+                  value={mwSite}
+                  onChange={(e) => setMwSite(e.target.value)}
+                  placeholder="*"
+                  autoComplete="off"
+                />
+              </div>
+              <div className="pf-form__group">
+                <label htmlFor="mw-env">{t("hosts.environment")}</label>
+                <input
+                  id="mw-env"
+                  className="pf-input"
+                  value={mwEnv}
+                  onChange={(e) => setMwEnv(e.target.value)}
+                  autoComplete="off"
+                />
+              </div>
+              <div className="pf-form__group pf-mw-form__days">
+                <label htmlFor="mw-days">{t("remediation.mwDays")}</label>
+                <input
+                  id="mw-days"
+                  className="pf-input"
+                  value={mwDays}
+                  onChange={(e) => setMwDays(e.target.value)}
+                  autoComplete="off"
+                />
+              </div>
+              <div className="pf-form__group">
+                <label htmlFor="mw-start">{t("remediation.mwStart")}</label>
+                <input
+                  id="mw-start"
+                  className="pf-input"
+                  type="time"
+                  value={mwStart}
+                  onChange={(e) => setMwStart(e.target.value)}
+                />
+              </div>
+              <div className="pf-form__group">
+                <label htmlFor="mw-end">{t("remediation.mwEnd")}</label>
+                <input
+                  id="mw-end"
+                  className="pf-input"
+                  type="time"
+                  value={mwEnd}
+                  onChange={(e) => setMwEnd(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="pf-form__actions">
+              <Button
+                onClick={() => createWindowMutation.mutate()}
+                disabled={createWindowMutation.isPending}
+                loading={createWindowMutation.isPending}
+              >
+                {t("remediation.mwAdd")}
+              </Button>
+            </div>
+            {(windowsQuery.data ?? []).length > 0 ? (
+              <div className="pf-table-wrap pf-mw-form__list">
+                <table className="pf-table">
+                  <thead>
+                    <tr>
+                      <th>{t("hosts.site")}</th>
+                      <th>{t("hosts.environment")}</th>
+                      <th>{t("remediation.mwDays")}</th>
+                      <th>{t("remediation.mwStart")}</th>
+                      <th>{t("remediation.mwEnd")}</th>
+                      <th className="pf-table__col-actions">{t("common.actions")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(windowsQuery.data ?? []).map((w) => (
+                      <tr key={w.id}>
+                        <td>{w.site || "*"}</td>
+                        <td>{w.environment || "*"}</td>
+                        <td className="pf-table__mono">{w.days_of_week}</td>
+                        <td className="pf-table__mono">{w.start_time}</td>
+                        <td className="pf-table__mono">
+                          {w.end_time}
+                          <span className="pf-table__muted"> {w.tz}</span>
+                        </td>
+                        <td className="pf-ops-table__actions">
+                          <Button
+                            variant="danger-secondary"
+                            className="pf-btn--sm"
+                            onClick={() => deleteWindowMutation.mutate(w.id)}
+                            disabled={deleteWindowMutation.isPending}
+                          >
+                            {t("common.delete")}
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        </Panel>
+      ) : null}
+
+      {selectedRunId != null && runDetail.data ? (
+        <Panel title={t("remediation.backupTitle")}>
+          <div className="pf-backup-panel">
+            <div className="pf-backup-panel__meta">
+              <div className="pf-backup-panel__status">
+                <span className="pf-backup-panel__label">{t("remediation.backupStatus")}</span>
+                <Badge
+                  variant={
+                    runDetail.data.backup_status === "ok"
+                      ? "success"
+                      : runDetail.data.backup_status === "failed"
+                        ? "danger"
+                        : runDetail.data.backup_status === "skipped"
+                          ? "warning"
+                          : "neutral"
+                  }
+                >
+                  {runDetail.data.backup_status || "none"}
+                </Badge>
+              </div>
+              {runDetail.data.change_ticket ? (
+                <div className="pf-backup-panel__ticket">
+                  <span className="pf-backup-panel__label">{t("remediation.changeTicket")}</span>
+                  <span className="pf-table__mono">{runDetail.data.change_ticket}</span>
+                </div>
+              ) : null}
+              {runDetail.data.backup_status === "skipped" ? (
+                <p className="pf-form__hint pf-backup-panel__skip-hint">
+                  {t("remediation.backupSkippedHint")}
+                </p>
+              ) : null}
+              {!isNetwork &&
+              runDetail.data.backup_status === "ok" &&
+              (runDetail.data.status === "completed" || runDetail.data.status === "failed") ? (
+                <div className="pf-backup-panel__actions">
+                  <Button
+                    variant="secondary"
+                    className="pf-btn--sm"
+                    loading={rollbackMutation.isPending}
+                    onClick={() => rollbackMutation.mutate(selectedRunId)}
+                  >
+                    {t("remediation.rollback")}
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+            {(runDetail.data.backup_artifacts ?? []).length > 0 ? (
+              <div className="pf-table-wrap">
+                <table className="pf-table">
+                  <thead>
+                    <tr>
+                      <th>{t("profiles.ruleLocation")}</th>
+                      <th className="pf-table__col-actions">{t("common.actions")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(runDetail.data.backup_artifacts ?? []).map((art) => (
+                      <tr key={art.id}>
+                        <td>
+                          <div className="pf-backup-panel__artifact">
+                            <span className="pf-backup-panel__artifact-meta">
+                              {art.platform} · {art.kind}
+                            </span>
+                            <span className="pf-table__mono">{art.path_or_key}</span>
+                          </div>
+                        </td>
+                        <td className="pf-ops-table__actions">
+                          <Button
+                            variant="secondary"
+                            className="pf-btn--sm"
+                            onClick={() => {
+                              void api
+                                .downloadRemediationBackup(selectedRunId, art.id)
+                                .catch((err) =>
+                                  toast.error(
+                                    err instanceof Error ? err.message : t("toast.genericError"),
+                                  ),
+                                );
+                            }}
+                          >
+                            {t("remediation.downloadSnapshot")}
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
+        </Panel>
+      ) : null}
+
+
       <RemediationRunLogs key={selectedRunId ?? "none"} runId={selectedRunId} />
       {selectedRunId != null && (
         <Panel title={t("remediation.resultsTitle")} noPadding>
@@ -1147,6 +1425,7 @@ export function RemediationPage({
                   <tr>
                     <th>{t("remediation.host")}</th>
                     <th>{t("remediation.script")}</th>
+                    <th>{t("remediation.rule")}</th>
                     <th>{t("remediation.status")}</th>
                     <th>{t("remediation.message")}</th>
                   </tr>
@@ -1156,6 +1435,9 @@ export function RemediationPage({
                     <tr key={result.id}>
                       <td>{hostNameById.get(result.host_id) ?? result.host_id}</td>
                       <td className="pf-table__mono">{result.script_name}</td>
+                      <td className="pf-table__mono">
+                        {result.rule_tech_name?.trim() ? result.rule_tech_name : t("common.dash")}
+                      </td>
                       <td>
                         <Badge variant={checkStatusVariant(result.status)}>
                           {runStatusLabel(t, result.status)}

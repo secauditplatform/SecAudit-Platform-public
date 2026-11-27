@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +40,6 @@ from app.models import (
 from app.services.dispatch import enqueue_run_dispatch
 from app.services.object_rbac import assign_host_target_scope, assign_owner
 from secaudit_core.audit_flow_present import (
-    host_to_read,
     job_run_ids_for_host,
     reprobe_target_ids,
     run_to_read,
@@ -56,7 +55,6 @@ from secaudit_core.reports import build_report_summary_dict
 from secaudit_core.script_selection import select_active_scripts
 from secaudit_core.waivers import load_active_waivers_for_profiles, waived_ids_by_run
 
-TTL = timedelta(hours=24)
 _ALLOWED_CRED_TYPES = {CredentialType.SSH_PASSWORD, CredentialType.SSH_KEY, CredentialType.WINRM}
 _AF_EPHEMERAL_DESCRIPTIONS = frozenset({"AuditFlow ephemeral", "AuditFlow inventory"})
 _TERMINAL_JOB = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
@@ -119,6 +117,7 @@ def validate_credentials(items: list[dict]) -> list[dict]:
                 "key_passphrase": key_passphrase,
                 "service_username": service_username[:128] if service_username else None,
                 "service_secret": service_secret,
+                "skip_become": bool(item.get("skip_become")) and cred_type != CredentialType.WINRM,
             }
         )
     return cleaned
@@ -197,7 +196,9 @@ async def collect_run_summaries(db: AsyncSession, run: AuditFlowRun) -> dict[int
         if job_run.job is not None and job_run.job.profile_id is not None
     }
     waivers = await load_active_waivers_for_profiles(db, profile_ids)
-    waived_by_run = waived_ids_by_run(runs, by_run, waivers)
+    from secaudit_core.waivers import load_waiver_hosts
+
+    waived_by_run = waived_ids_by_run(runs, by_run, waivers, await load_waiver_hosts(db, checks))
     payload: dict[int, dict] = {}
     for job_run in runs:
         summary = build_report_summary_dict(
@@ -239,7 +240,7 @@ async def enqueue_reprobe(
     targets = reprobe_target_ids(run, host_ids=host_ids)
     if not targets:
         return None
-    run.status = AuditFlowStatus.SCANNING
+    # Login probe stays on Review. Compliance starts only from Run selected checks.
     for row in run.hosts:
         if row.id in targets:
             row.skip_reason = "checking"
@@ -254,17 +255,6 @@ async def enqueue_reprobe(
         correlation={"audit_flow_run_id": run.id, "reprobe": True},
     )
     return outbox.id
-
-
-async def cleanup_expired(db: AsyncSession) -> None:
-    cutoff = datetime.now(UTC) - TTL
-    result = await db.execute(
-        select(AuditFlowRun).where(AuditFlowRun.created_at < cutoff).limit(20)
-    )
-    for run in result.scalars().all():
-        await delete_run_artifacts(db, run)
-        await db.delete(run)
-    await sweep_orphaned_ephemeral_credentials(db)
 
 
 async def delete_run_artifacts(db: AsyncSession, run: AuditFlowRun) -> None:
@@ -599,6 +589,7 @@ async def _make_ephemeral_credential(
         existing.encrypted_service_secret = flow_cred.encrypted_service_secret
         existing.username = flow_cred.username
         existing.credential_type = flow_cred.credential_type
+        existing.skip_become = bool(flow_cred.skip_become)
         row.ephemeral_credential_id = existing.id
         return existing
     cred = Credential(
@@ -609,6 +600,7 @@ async def _make_ephemeral_credential(
         encrypted_key_passphrase=flow_cred.encrypted_key_passphrase,
         service_username=flow_cred.service_username,
         encrypted_service_secret=flow_cred.encrypted_service_secret,
+        skip_become=bool(flow_cred.skip_become),
         description="AuditFlow ephemeral",
         is_ephemeral=True,
     )
@@ -629,9 +621,11 @@ async def _job_credential(
 ) -> Credential:
     if row.ephemeral_credential_id:
         cred = await db.get(Credential, row.ephemeral_credential_id)
-        if cred:
+        if cred and (getattr(cred, "is_ephemeral", False) or not flow_cred.skip_become):
+            if getattr(cred, "is_ephemeral", False):
+                cred.skip_become = bool(flow_cred.skip_become)
             return cred
-    if host and host.credential_id:
+    if host and host.credential_id and not flow_cred.skip_become:
         inventory_cred = await db.get(Credential, host.credential_id)
         if (
             inventory_cred
@@ -840,6 +834,7 @@ def snapshot_credentials(items: list[dict]) -> list[dict]:
                     if item.get("service_secret")
                     else None
                 ),
+                "skip_become": bool(item.get("skip_become")),
             }
         )
     return snapshots
@@ -863,6 +858,7 @@ def attach_snapshot_credentials(run_id: int, snapshots: list[dict]) -> list[Audi
                     str(item["service_username"])[:128] if item.get("service_username") else None
                 ),
                 encrypted_service_secret=item.get("encrypted_service_secret"),
+                skip_become=bool(item.get("skip_become")),
             )
         )
     return rows
@@ -885,6 +881,7 @@ def template_credentials_public(snapshots: list[dict]) -> list[dict]:
                 "service_username": item.get("service_username"),
                 "has_secret": bool(item.get("encrypted_secret")),
                 "has_service_secret": bool(item.get("encrypted_service_secret")),
+                "skip_become": bool(item.get("skip_become")),
             }
         )
     return public

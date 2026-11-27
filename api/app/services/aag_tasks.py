@@ -39,6 +39,7 @@ from app.services.profiles import ProfileService
 from secaudit_core.aag_client import (
     MAX_FINDINGS,
     build_explain_fragment,
+    group_explain_findings,
     citation_payload,
     generated_package_files,
     input_hash,
@@ -207,8 +208,8 @@ async def retry_aag_task(
     artifact = await db.get(AagArtifact, artifact_id)
     if artifact is None or not await _artifact_visible(db, user, artifact):
         raise HTTPException(status_code=404, detail="Result not found")
-    if artifact.kind not in ("explain", "generate") or artifact.status != "failed":
-        raise HTTPException(status_code=409, detail="Only a failed task can be run again")
+    if artifact.kind not in ("explain", "generate") or artifact.status not in ("failed", "cancelled"):
+        raise HTTPException(status_code=409, detail="Only a failed or cancelled task can be run again")
     model_name = (row.model_name or "").strip()
     if not model_name:
         raise HTTPException(status_code=422, detail="Model name is required")
@@ -277,6 +278,21 @@ async def delete_aag_artifact(db: AsyncSession, user: AuthUser, artifact_id: int
     await db.delete(artifact)
     await db.flush()
     return kept
+
+
+async def cancel_aag_artifact(db: AsyncSession, user: AuthUser, artifact_id: int) -> AagArtifact:
+    """Cooperative cancel: the worker aborts its SSE read on the next chunk."""
+    artifact = await db.get(AagArtifact, artifact_id)
+    if artifact is None or not await _artifact_visible(db, user, artifact):
+        raise HTTPException(status_code=404, detail="Result not found")
+    if artifact.status not in ("pending", "running"):
+        raise HTTPException(status_code=409, detail="Task is not running")
+    artifact.status = "cancelled"
+    artifact.error_message = "Task cancelled"
+    artifact.finished_at = datetime.now(UTC)
+    await db.commit()
+    await db.refresh(artifact)
+    return artifact
 
 
 async def _artifact_visible(db: AsyncSession, user: AuthUser, artifact: AagArtifact) -> bool:
@@ -691,12 +707,20 @@ async def compose_screen_input(
         if data.run_id is None or not data.check_ids:
             raise HTTPException(status_code=422, detail="Select findings from a completed run")
         findings = await _run_findings(db, user, data.run_id, limit=None)
-        chosen = [item for item in findings if item["id"] in set(data.check_ids)][:MAX_FINDINGS]
-        if not chosen:
+        chosen = [item for item in findings if item["id"] in set(data.check_ids)]
+        grouped = group_explain_findings(chosen)[:MAX_FINDINGS]
+        if not grouped:
             raise HTTPException(status_code=422, detail="Select findings from a completed run")
-        rules = [item["rule_tech_name"] for item in chosen]
+        rules = [item["rule_tech_name"] for item in grouped]
+        kept_ids: list[int] = []
+        for item in grouped:
+            members = item.get("member_ids")
+            if isinstance(members, list):
+                kept_ids.extend(int(member) for member in members)
+            elif item.get("id") is not None:
+                kept_ids.append(int(item["id"]))
         meta = {
-            "check_ids": [item["id"] for item in chosen],
+            "check_ids": kept_ids,
             "rules": rules,
             "checks": [
                 {
@@ -705,11 +729,11 @@ async def compose_screen_input(
                     "status": item["status"],
                     "title": item["rule_title"] or "",
                 }
-                for item in chosen
+                for item in grouped
             ],
         }
         citation = citation_payload(run_id=data.run_id, rule_tech_name=",".join(rules))
-        return build_explain_fragment(chosen, run_id=data.run_id), citation, meta
+        return build_explain_fragment(grouped, run_id=data.run_id), citation, meta
     if data.kind == "generate":
         phrase = redact_fragment(data.prompt or "")
         profile_name = redact_fragment(data.profile_name or "").strip()[:128]

@@ -43,25 +43,6 @@ def default_network_check_mode() -> NetworkCheckMode:
 
 
 def infer_vendor_from_filename(filename: str) -> NetworkVendor:
-    lowered = filename.lower()
-    if "junos" in lowered or "juniper" in lowered:
-        return NetworkVendor.JUNIPER_JUNOS
-    if "nxos" in lowered or "nexus" in lowered:
-        return NetworkVendor.CISCO_NXOS
-    if "asa" in lowered:
-        return NetworkVendor.CISCO_ASA
-    if "eos" in lowered or "arista" in lowered:
-        return NetworkVendor.ARISTA_EOS
-    if "forti" in lowered:
-        return NetworkVendor.FORTINET
-    if "palo" in lowered:
-        return NetworkVendor.PALO_ALTO
-    if "checkpoint" in lowered or "check_point" in lowered:
-        return NetworkVendor.CHECK_POINT
-    if "huawei" in lowered:
-        return NetworkVendor.HUAWEI
-    if "h3c" in lowered:
-        return NetworkVendor.H3C
-    if "cisco" in lowered or lowered.endswith(".cfg"):
-        return NetworkVendor.CISCO_IOS
-    return NetworkVendor.GENERIC
+    from secaudit_core.network_vendor_registry import infer_vendor_from_filename as _infer
+
+    return _infer(filename)

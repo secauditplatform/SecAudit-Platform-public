@@ -82,11 +82,12 @@ def _fail(
     row: AagProviderConfig | None = None,
     error_code: str,
     duration_ms: int | None = None,
+    status: str = "failed",
 ) -> None:
-    artifact.status = "failed"
+    artifact.status = status
     artifact.error_message = message[:500]
     artifact.finished_at = datetime.now(UTC)
-    _journal(db, artifact, row, outcome="failed", error_code=error_code, duration_ms=duration_ms)
+    _journal(db, artifact, row, outcome=status if status == "cancelled" else "failed", error_code=error_code, duration_ms=duration_ms)
     db.commit()
 
 
@@ -97,12 +98,20 @@ def _scrub(message: str, api_key: str | None) -> str:
     return text[:500]
 
 
+def _is_cancelled(db: Session, artifact_id: int) -> bool:
+    db.expire_all()
+    status = db.execute(select(AagArtifact.status).where(AagArtifact.id == artifact_id)).scalar_one_or_none()
+    return status == "cancelled"
+
+
 def run_aag_artifact(artifact_id: int, *, database_url: str, settings: SecAuditSettings) -> None:
     engine = create_engine(database_url)
     session_local = sessionmaker(bind=engine)
     with session_local() as db:
         artifact = db.get(AagArtifact, artifact_id)
-        if artifact is None or artifact.status != "pending":
+        if artifact is None or artifact.status not in ("pending", "running"):
+            return
+        if artifact.status == "cancelled":
             return
         row = db.execute(
             select(AagProviderConfig).where(AagProviderConfig.selected.is_(True)).limit(1)
@@ -130,6 +139,35 @@ def run_aag_artifact(artifact_id: int, *, database_url: str, settings: SecAuditS
             except Exception:
                 _fail(db, artifact, "Stored API key could not be read", row=row, error_code="key_unreadable")
                 return
+        artifact.status = "running"
+        meta = dict(artifact.meta_json or {})
+        meta["stream_chars"] = 0
+        artifact.meta_json = meta
+        db.commit()
+
+        stream_chars = 0
+        last_progress = 0.0
+
+        def should_cancel() -> bool:
+            return _is_cancelled(db, artifact_id)
+
+        def on_delta(piece: str) -> None:
+            nonlocal stream_chars, last_progress
+            stream_chars += len(piece)
+            now = time.monotonic()
+            if now - last_progress < 2.0:
+                return
+            last_progress = now
+            if _is_cancelled(db, artifact_id):
+                return
+            current = db.get(AagArtifact, artifact_id)
+            if current is None or current.status == "cancelled":
+                return
+            progress = dict(current.meta_json or {})
+            progress["stream_chars"] = stream_chars
+            current.meta_json = progress
+            db.commit()
+
         started = time.perf_counter()
         try:
             result = complete_chat(
@@ -140,16 +178,37 @@ def run_aag_artifact(artifact_id: int, *, database_url: str, settings: SecAuditS
                 kind=artifact.kind,
                 api_key=api_key,
                 timeout_seconds=row.timeout_seconds or settings.ai_timeout_seconds,
+                idle_read_timeout_seconds=getattr(
+                    settings, "ai_idle_read_timeout_seconds", 90
+                ),
                 max_tokens=token_limit(artifact.kind, row.max_tokens or settings.ai_max_tokens),
                 retry_on_network_error=settings.ai_retry_on_network_error,
                 allow_private=settings.outbound_webhooks_allow_private,
                 citation=artifact.citations_json,
+                should_cancel=should_cancel,
+                on_delta=on_delta,
             )
         except AagClientError as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
+            if exc.error_code == "cancelled" or _is_cancelled(db, artifact_id):
+                current = db.get(AagArtifact, artifact_id)
+                if current is not None:
+                    _fail(
+                        db,
+                        current,
+                        "Task cancelled",
+                        row=row,
+                        error_code="cancelled",
+                        duration_ms=elapsed,
+                        status="cancelled",
+                    )
+                return
+            current = db.get(AagArtifact, artifact_id)
+            if current is None or current.status == "cancelled":
+                return
             _fail(
                 db,
-                artifact,
+                current,
                 _scrub(str(exc), api_key),
                 row=row,
                 error_code=exc.error_code or "request",
@@ -158,21 +217,54 @@ def run_aag_artifact(artifact_id: int, *, database_url: str, settings: SecAuditS
             return
         except Exception as exc:
             elapsed = int((time.perf_counter() - started) * 1000)
+            if _is_cancelled(db, artifact_id):
+                current = db.get(AagArtifact, artifact_id)
+                if current is not None:
+                    _fail(
+                        db,
+                        current,
+                        "Task cancelled",
+                        row=row,
+                        error_code="cancelled",
+                        duration_ms=elapsed,
+                        status="cancelled",
+                    )
+                return
+            current = db.get(AagArtifact, artifact_id)
+            if current is None or current.status == "cancelled":
+                return
             _fail(
                 db,
-                artifact,
+                current,
                 _scrub(str(exc), api_key),
                 row=row,
                 error_code="request",
                 duration_ms=elapsed,
             )
             return
+        if _is_cancelled(db, artifact_id):
+            current = db.get(AagArtifact, artifact_id)
+            if current is not None:
+                _fail(
+                    db,
+                    current,
+                    "Task cancelled",
+                    row=row,
+                    error_code="cancelled",
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    status="cancelled",
+                )
+            return
         elapsed = int((time.perf_counter() - started) * 1000)
+        artifact = db.get(AagArtifact, artifact_id)
+        if artifact is None:
+            return
         text = result.text
         artifact.status = "completed"
         artifact.response_text = text
         artifact.finished_at = datetime.now(UTC)
         meta = dict(artifact.meta_json or {})
+        meta.pop("stream_chars", None)
         if artifact.kind == "generate":
             files = generated_package_files(text, profile_name=str(meta.get("profile_name") or ""))
             profile = meta.get("profile")

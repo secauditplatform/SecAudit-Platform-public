@@ -80,14 +80,24 @@ function destinationHost(url: string | null | undefined): string | null {
 function taskStatusLabel(status: string, t: (key: string) => string): string {
   if (status === "completed") return t("aag.taskStatusCompleted");
   if (status === "failed") return t("aag.taskStatusFailed");
+  if (status === "cancelled") return t("aag.taskStatusCancelled");
+  if (status === "running") return t("aag.taskStatusRunning");
   return t("aag.taskStatusPending");
 }
 
-function aagErrorText(message: string, t: (key: string) => string): string {
+function aagErrorText(message: string, t: (key: string, vars?: Record<string, string | number>) => string): string {
+  if (message.includes("; ")) {
+    return message
+      .split("; ")
+      .map((part) => aagErrorText(part.trim(), t))
+      .join("; ");
+  }
   if (/CIS|STIG|FSTEK|ФСТЭК/i.test(message)) return t("aag.officialPackage");
   if (/profile name is required/i.test(message)) return t("aag.profileNameRequired");
   if (/os or software name/i.test(message)) return t("aag.targetNameRequired");
   if (/did not describe any checks/i.test(message)) return t("aag.generateInvalid");
+  const contract = message.match(/^(\S+) does not print PASS or FAIL$/i);
+  if (contract) return t("aag.scriptContract", { rule: contract[1] });
   return message;
 }
 
@@ -131,10 +141,15 @@ function callDurationLabel(ms: number | null | undefined, t: (key: string) => st
   return `${text} ${t("common.secondsShort")}`;
 }
 
-function taskStatusVariant(status: string): "success" | "danger" | "warning" {
+function taskStatusVariant(status: string): "success" | "danger" | "warning" | "neutral" {
   if (status === "completed") return "success";
   if (status === "failed") return "danger";
+  if (status === "cancelled") return "neutral";
   return "warning";
+}
+
+function taskIsActive(status: string): boolean {
+  return status === "pending" || status === "running";
 }
 
 function packageFromArtifact(item: AagArtifact): {
@@ -437,6 +452,8 @@ function AagResultCard({
   deletingId,
   onRetry,
   retryingId,
+  onCancel,
+  cancellingId,
 }: {
   item: AagArtifact;
   startCollapsed: boolean;
@@ -444,6 +461,8 @@ function AagResultCard({
   deletingId?: number;
   onRetry?: (item: AagArtifact) => void;
   retryingId?: number;
+  onCancel?: (item: AagArtifact) => void;
+  cancellingId?: number;
 }) {
   const { t } = useTranslation();
   const signature =
@@ -509,7 +528,19 @@ function AagResultCard({
           <Badge variant={taskStatusVariant(item.status)} literal>
             {taskStatusLabel(item.status, t)}
           </Badge>
-          {onRetry && (item.kind === "explain" || item.kind === "generate") && item.status === "failed" ? (
+          {onCancel && taskIsActive(item.status) ? (
+            <Button
+              variant="secondary"
+              className="pf-btn--sm"
+              loading={cancellingId === item.id}
+              onClick={() => onCancel(item)}
+            >
+              {t("aag.cancelTask")}
+            </Button>
+          ) : null}
+          {onRetry &&
+          (item.kind === "explain" || item.kind === "generate") &&
+          (item.status === "failed" || item.status === "cancelled") ? (
             <Button
               variant="secondary"
               className="pf-btn--sm"
@@ -519,7 +550,7 @@ function AagResultCard({
               {t("aag.retryTask")}
             </Button>
           ) : null}
-          {onDelete ? (
+          {onDelete && !taskIsActive(item.status) ? (
             <Button
               variant="danger-secondary"
               className="pf-btn--sm"
@@ -586,12 +617,16 @@ function AagArtifactList({
   deletingId,
   onRetry,
   retryingId,
+  onCancel,
+  cancellingId,
 }: {
   items: AagArtifact[];
   onDelete?: (item: AagArtifact) => void;
   deletingId?: number;
   onRetry?: (item: AagArtifact) => void;
   retryingId?: number;
+  onCancel?: (item: AagArtifact) => void;
+  cancellingId?: number;
 }) {
   let seenCompleted = false;
   return (
@@ -608,6 +643,8 @@ function AagArtifactList({
             deletingId={deletingId}
             onRetry={onRetry}
             retryingId={retryingId}
+            onCancel={onCancel}
+            cancellingId={cancellingId}
           />
         );
       })}
@@ -617,6 +654,70 @@ function AagArtifactList({
 
 const EXPLAIN_LIMIT = 25;
 const AAG_PAGE_SIZE = 25;
+
+type ExplainGroup = {
+  key: string;
+  ids: number[];
+  rule_tech_name: string;
+  rule_title?: string | null;
+  status: string;
+  message?: string | null;
+  has_remediation: boolean;
+  hosts: string[];
+};
+
+function explainGroups(rows: AagExplainCandidate[]): ExplainGroup[] {
+  const groups: ExplainGroup[] = [];
+  const index = new Map<string, ExplainGroup>();
+  for (const row of rows) {
+    const host = row.host_name || String(row.host_id);
+    const fail = row.status.toLowerCase() === "fail";
+    const key = fail ? `fail:${row.rule_tech_name}:${row.message ?? ""}` : `row:${row.id}`;
+    const existing = fail ? index.get(key) : undefined;
+    if (existing) {
+      existing.ids.push(row.id);
+      if (host && !existing.hosts.includes(host)) existing.hosts.push(host);
+      existing.has_remediation = existing.has_remediation || row.has_remediation;
+      continue;
+    }
+    const group: ExplainGroup = {
+      key,
+      ids: [row.id],
+      rule_tech_name: row.rule_tech_name,
+      rule_title: row.rule_title,
+      status: row.status,
+      message: row.message,
+      has_remediation: row.has_remediation,
+      hosts: host ? [host] : [],
+    };
+    groups.push(group);
+    if (fail) index.set(key, group);
+  }
+  return groups;
+}
+
+function groupIsSelected(group: ExplainGroup, selected: number[]): boolean {
+  return group.ids.every((id) => selected.includes(id));
+}
+
+function selectExplainGroups(current: number[], add: ExplainGroup[], universe: ExplainGroup[]): number[] {
+  const drop = new Set(add.flatMap((group) => group.ids));
+  const kept = current.filter((id) => !drop.has(id));
+  let count = universe.filter((group) => groupIsSelected(group, kept)).length;
+  const next = [...kept];
+  const have = new Set(kept);
+  for (const group of add) {
+    if (count >= EXPLAIN_LIMIT) break;
+    for (const id of group.ids) {
+      if (!have.has(id)) {
+        have.add(id);
+        next.push(id);
+      }
+    }
+    count += 1;
+  }
+  return next;
+}
 
 function explainLoadError(message: string, t: (key: string) => string): string {
   if (/not completed/i.test(message)) return t("aag.explainRunNotCompleted");
@@ -714,25 +815,26 @@ function ExplainRequest({
     }
     return [...names].sort((left, right) => left.localeCompare(right));
   }, [candidates]);
+  const grouped = useMemo(() => explainGroups(candidates), [candidates]);
+  const selectedGroupCount = grouped.filter((group) => groupIsSelected(group, selectedChecks)).length;
   const visible = useMemo(() => {
     const query = checkQuery.trim().toLowerCase();
-    return candidates.filter((row) => {
-      if (checkStatus !== "all" && row.status.toLowerCase() !== checkStatus) return false;
-      const hostName = row.host_name || String(row.host_id);
-      if (hostFilter && hostName !== hostFilter) return false;
+    return grouped.filter((group) => {
+      if (checkStatus !== "all" && group.status.toLowerCase() !== checkStatus) return false;
+      if (hostFilter && !group.hosts.includes(hostFilter)) return false;
       if (!query) return true;
-      return [row.rule_tech_name, row.rule_title, row.host_name, row.message].some((value) =>
+      return [group.rule_tech_name, group.rule_title, group.message, ...group.hosts].some((value) =>
         (value ?? "").toLowerCase().includes(query),
       );
     });
-  }, [candidates, checkQuery, checkStatus, hostFilter]);
+  }, [grouped, checkQuery, checkStatus, hostFilter]);
   const findingsPageCount = Math.max(1, Math.ceil(visible.length / AAG_PAGE_SIZE));
   const safeFindingsPage = Math.min(findingsPage, findingsPageCount);
   const pagedFindings = visible.slice((safeFindingsPage - 1) * AAG_PAGE_SIZE, safeFindingsPage * AAG_PAGE_SIZE);
-  const pageIds = pagedFindings.map((row) => row.id);
-  const pickedPage = pagedFindings.filter((row) => selectedChecks.includes(row.id)).length;
-  const visibleIds = visible.map((row) => row.id);
-  const pickedVisible = visible.filter((row) => selectedChecks.includes(row.id)).length;
+  const pageIds = pagedFindings.flatMap((group) => group.ids);
+  const pickedPage = pagedFindings.filter((group) => groupIsSelected(group, selectedChecks)).length;
+  const visibleIds = visible.flatMap((group) => group.ids);
+  const pickedVisible = visible.filter((group) => groupIsSelected(group, selectedChecks)).length;
 
   function chooseRun(run: JobRun) {
     if (String(run.id) !== runInput.trim()) onSelectedChecks([]);
@@ -872,10 +974,10 @@ function ExplainRequest({
         <div className="pf-aag-findings__toolbar">
           <span className="pf-aag-findings__heading">{t("aag.selectFindings")}</span>
           <span className="pf-aag-findings__count">
-            {selectedChecks.length > 0 ? (
+            {selectedGroupCount > 0 ? (
               <span className="pf-form__hint">
-                {t("hostSelection.selected", { count: selectedChecks.length })}
-                {selectedChecks.length >= EXPLAIN_LIMIT
+                {t("hostSelection.selected", { count: selectedGroupCount })}
+                {selectedGroupCount >= EXPLAIN_LIMIT
                   ? ` · ${t("aag.explainSelectionLimit", { count: EXPLAIN_LIMIT })}`
                   : ""}
               </span>
@@ -886,13 +988,7 @@ function ExplainRequest({
                   variant="link"
                   className="pf-btn--sm"
                   type="button"
-                  onClick={() =>
-                    onSelectedChecks((current) => {
-                      const kept = current.filter((id) => !visibleIds.includes(id));
-                      const room = EXPLAIN_LIMIT - kept.length;
-                      return [...kept, ...visibleIds.filter((id) => !kept.includes(id)).slice(0, Math.max(0, room))];
-                    })
-                  }
+                  onClick={() => onSelectedChecks((current) => selectExplainGroups(current, visible, grouped))}
                 >
                   {t("hostSelection.selectAll")}
                 </Button>
@@ -971,11 +1067,7 @@ function ExplainRequest({
                 }}
                 onChange={(event) => {
                   if (event.target.checked) {
-                    onSelectedChecks((current) => {
-                      const kept = current.filter((id) => !pageIds.includes(id));
-                      const room = EXPLAIN_LIMIT - kept.length;
-                      return [...kept, ...pageIds.filter((id) => !kept.includes(id)).slice(0, Math.max(0, room))];
-                    });
+                    onSelectedChecks((current) => selectExplainGroups(current, pagedFindings, grouped));
                     return;
                   }
                   onSelectedChecks((current) => current.filter((id) => !pageIds.includes(id)));
@@ -986,12 +1078,16 @@ function ExplainRequest({
               </span>
               <span className="pf-aag-findings__head-status">{t("common.status")}</span>
             </div>
-            {pagedFindings.map((row) => {
-              const selected = selectedChecks.includes(row.id);
-              const blocked = !selected && selectedChecks.length >= EXPLAIN_LIMIT;
+            {pagedFindings.map((group) => {
+              const selected = groupIsSelected(group, selectedChecks);
+              const blocked = !selected && selectedGroupCount >= EXPLAIN_LIMIT;
+              const hostLabel =
+                group.hosts.length > 1
+                  ? t("aag.explainHosts", { count: group.hosts.length })
+                  : (group.hosts[0] ?? "");
               return (
                 <label
-                  key={row.id}
+                  key={group.key}
                   className={`pf-aag-findings__row${selected ? " pf-aag-findings__row--selected" : ""}`}
                 >
                   <input
@@ -1001,27 +1097,36 @@ function ExplainRequest({
                     disabled={blocked}
                     onChange={(event) =>
                       onSelectedChecks((current) => {
-                        if (!event.target.checked) return current.filter((id) => id !== row.id);
-                        if (current.includes(row.id) || current.length >= EXPLAIN_LIMIT) return current;
-                        return [...current, row.id];
+                        if (!event.target.checked) return current.filter((id) => !group.ids.includes(id));
+                        if (groupIsSelected(group, current)) return current;
+                        const already = grouped.filter((item) => groupIsSelected(item, current)).length;
+                        if (already >= EXPLAIN_LIMIT) return current;
+                        const have = new Set(current);
+                        const next = [...current];
+                        for (const id of group.ids) {
+                          if (!have.has(id)) next.push(id);
+                        }
+                        return next;
                       })
                     }
                   />
                   <span className="pf-aag-findings__main">
-                    <span className="pf-aag-findings__rule">{row.rule_tech_name}</span>
-                    {row.rule_title ? (
-                      <span className="pf-aag-findings__name" title={row.rule_title}>
-                        {row.rule_title}
+                    <span className="pf-aag-findings__rule">{group.rule_tech_name}</span>
+                    {group.rule_title ? (
+                      <span className="pf-aag-findings__name" title={group.rule_title}>
+                        {group.rule_title}
                       </span>
                     ) : null}
-                    <span className="pf-aag-findings__host">{row.host_name ?? row.host_id}</span>
-                    {row.has_remediation ? (
+                    <span className="pf-aag-findings__host" title={group.hosts.join(", ")}>
+                      {hostLabel}
+                    </span>
+                    {group.has_remediation ? (
                       <span className="pf-aag-findings__note">{t("aag.hasRemediation")}</span>
                     ) : null}
                   </span>
                   <span className="pf-aag-findings__status">
-                    <Badge variant={checkStatusVariant(row.status)} literal>
-                      {row.status}
+                    <Badge variant={checkStatusVariant(group.status)} literal>
+                      {group.status}
                     </Badge>
                   </span>
                 </label>
@@ -1085,7 +1190,7 @@ function AagTaskPage({
     enabled: Boolean(statusData?.enabled),
     retry: false,
     refetchInterval: (query) =>
-      query.state.data?.items.some((item) => item.status === "pending") ? 2000 : false,
+      query.state.data?.items.some((item) => taskIsActive(item.status)) ? 2000 : false,
   });
   const candidatesQuery = useQuery({
     queryKey: ["aagCandidates", runId],
@@ -1132,6 +1237,16 @@ function AagTaskPage({
     mutationFn: api.retryAagTask,
     onSuccess: async () => {
       toast.success(t("aag.taskRetried"));
+      await queryClient.invalidateQueries({ queryKey: ["aagTasks", kind] });
+    },
+    onError: (error: unknown) => {
+      toast.error(error instanceof Error ? error.message : t("aag.taskFailed"));
+    },
+  });
+  const cancelResult = useMutation({
+    mutationFn: api.cancelAagTask,
+    onSuccess: async () => {
+      toast.success(t("aag.taskCancelled"));
       await queryClient.invalidateQueries({ queryKey: ["aagTasks", kind] });
     },
     onError: (error: unknown) => {
@@ -1293,7 +1408,9 @@ function AagTaskPage({
                   onPageChange={setPage}
                   deletingId={deleteResult.isPending ? deleteResult.variables : undefined}
                   retryingId={retryResult.isPending ? retryResult.variables : undefined}
+                  cancellingId={cancelResult.isPending ? cancelResult.variables : undefined}
                   onRetry={canOperate ? (item) => retryResult.mutate(item.id) : undefined}
+                  onCancel={canOperate ? (item) => cancelResult.mutate(item.id) : undefined}
                   onDelete={
                     canOperate
                       ? (item) => {
@@ -1327,7 +1444,9 @@ function AagTaskPage({
                       items={tasksQuery.data?.items ?? []}
                       deletingId={deleteResult.isPending ? deleteResult.variables : undefined}
                       retryingId={retryResult.isPending ? retryResult.variables : undefined}
+                      cancellingId={cancelResult.isPending ? cancelResult.variables : undefined}
                       onRetry={canOperate ? (item) => retryResult.mutate(item.id) : undefined}
+                      onCancel={canOperate ? (item) => cancelResult.mutate(item.id) : undefined}
                       onDelete={
                         canOperate
                           ? (item) => {
@@ -1421,8 +1540,10 @@ function AagPackageLibrary({
   onPageChange,
   onDelete,
   onRetry,
+  onCancel,
   deletingId,
   retryingId,
+  cancellingId,
 }: {
   items: AagArtifact[];
   pending: boolean;
@@ -1434,8 +1555,10 @@ function AagPackageLibrary({
   onPageChange: (page: number) => void;
   onDelete?: (item: AagArtifact) => void;
   onRetry?: (item: AagArtifact) => void;
+  onCancel?: (item: AagArtifact) => void;
   deletingId?: number;
   retryingId?: number;
+  cancellingId?: number;
 }) {
   const { t } = useTranslation();
   const signature = items.map((item) => item.id).join(",");
@@ -1473,8 +1596,10 @@ function AagPackageLibrary({
                   item={item}
                   onDelete={onDelete}
                   onRetry={onRetry}
+                  onCancel={onCancel}
                   deletingId={deletingId}
                   retryingId={retryingId}
+                  cancellingId={cancellingId}
                 />
               ),
             )}
@@ -1490,14 +1615,18 @@ function AagGenerateActions({
   item,
   onDelete,
   onRetry,
+  onCancel,
   deletingId,
   retryingId,
+  cancellingId,
 }: {
   item: AagArtifact;
   onDelete?: (item: AagArtifact) => void;
   onRetry?: (item: AagArtifact) => void;
+  onCancel?: (item: AagArtifact) => void;
   deletingId?: number;
   retryingId?: number;
+  cancellingId?: number;
 }) {
   const { t } = useTranslation();
   return (
@@ -1505,7 +1634,17 @@ function AagGenerateActions({
       <Badge variant={taskStatusVariant(item.status)} literal>
         {taskStatusLabel(item.status, t)}
       </Badge>
-      {onRetry && item.status === "failed" ? (
+      {onCancel && taskIsActive(item.status) ? (
+        <Button
+          variant="secondary"
+          className="pf-btn--sm"
+          loading={cancellingId === item.id}
+          onClick={() => onCancel(item)}
+        >
+          {t("aag.cancelTask")}
+        </Button>
+      ) : null}
+      {onRetry && (item.status === "failed" || item.status === "cancelled") ? (
         <Button
           variant="secondary"
           className="pf-btn--sm"
@@ -1515,7 +1654,7 @@ function AagGenerateActions({
           {t("aag.retryTask")}
         </Button>
       ) : null}
-      {onDelete ? (
+      {onDelete && !taskIsActive(item.status) ? (
         <Button
           variant="danger-secondary"
           className="pf-btn--sm"
@@ -1533,14 +1672,18 @@ function AagGenerateStatusCard({
   item,
   onDelete,
   onRetry,
+  onCancel,
   deletingId,
   retryingId,
+  cancellingId,
 }: {
   item: AagArtifact;
   onDelete?: (item: AagArtifact) => void;
   onRetry?: (item: AagArtifact) => void;
+  onCancel?: (item: AagArtifact) => void;
   deletingId?: number;
   retryingId?: number;
+  cancellingId?: number;
 }) {
   const { t } = useTranslation();
   const signature =
@@ -1548,6 +1691,7 @@ function AagGenerateStatusCard({
       ? [t("aag.providerInternal"), item.model_name].filter(Boolean).join(" · ")
       : [t("aag.providerExternal"), item.target_host, item.model_name].filter(Boolean).join(" · ");
   const title = String(item.meta_json?.profile_name || signature || t("common.dash"));
+  const streamChars = typeof item.meta_json?.stream_chars === "number" ? item.meta_json.stream_chars : 0;
   return (
     <article className={`pf-aag-result${item.status === "failed" ? " pf-aag-result--failed" : ""}`}>
       <header className="pf-aag-result__head">
@@ -1555,6 +1699,9 @@ function AagGenerateStatusCard({
           <p className="pf-aag-result__title">{title}</p>
           <p className="pf-aag-result__aside">
             {item.in_perimeter ? t("aag.perimeter") : t("aag.outsidePerimeter")}
+            {taskIsActive(item.status) && streamChars > 0
+              ? ` · ${t("aag.streamProgress", { chars: streamChars })}`
+              : ""}
           </p>
         </div>
         <div className="pf-aag-result__tools">
@@ -1562,8 +1709,10 @@ function AagGenerateStatusCard({
             item={item}
             onDelete={onDelete}
             onRetry={onRetry}
+            onCancel={onCancel}
             deletingId={deletingId}
             retryingId={retryingId}
+            cancellingId={cancellingId}
           />
         </div>
       </header>

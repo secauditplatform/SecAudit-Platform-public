@@ -10,6 +10,7 @@ import {
   type ProfileRule,
   type ProfileRuleChangelogEntry,
   type ProfileRuleUpdate,
+  type ProfileVariable,
   type ProfileVersion,
 } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
@@ -63,6 +64,31 @@ function profileRuleKey(rule: ProfileRule, index: number): string {
   return `${rule.num ?? index + 1}:${rule.requirement_id}`;
 }
 
+function ruleIdentityKeys(requirementId: string): string[] {
+  const raw = requirementId.trim().toUpperCase();
+  const keys = [raw];
+  const numbered = raw.match(/^RULE0*(\d+)$/);
+  if (numbered) keys.push(`RULE${Number(numbered[1])}`);
+  else if (/^\d+$/.test(raw)) keys.push(`RULE${Number(raw)}`);
+  return keys;
+}
+
+function variablesForRule(
+  byRule: Map<string, ProfileVariable[]>,
+  requirementId: string
+): ProfileVariable[] {
+  const seen = new Set<string>();
+  const matched: ProfileVariable[] = [];
+  for (const key of ruleIdentityKeys(requirementId)) {
+    for (const item of byRule.get(key) ?? []) {
+      if (seen.has(item.name)) continue;
+      seen.add(item.name);
+      matched.push(item);
+    }
+  }
+  return matched;
+}
+
 function ruleEditDraft(rule: ProfileRule): ProfileRuleUpdate {
   return {
     title: rule.title ?? "",
@@ -104,6 +130,17 @@ function groupChangelogByVersion(entries: ProfileRuleChangelogEntry[]): Changelo
   return Array.from(groups.values());
 }
 
+const COMPLIANCE_PLAYBOOK_NAME = /_compliance\.(ya?ml)$/i;
+
+function splitCompliancePlaybook(files: File[]): { files: File[]; playbook: File | null } {
+  const index = files.findIndex((file) => COMPLIANCE_PLAYBOOK_NAME.test(file.name));
+  if (index < 0 || files.length === 1) return { files, playbook: null };
+  return {
+    files: files.filter((_, fileIndex) => fileIndex !== index),
+    playbook: files[index],
+  };
+}
+
 export function ProfilesPage() {
   const { t } = useTranslation();
   const { confirm, confirmChoices } = useConfirm();
@@ -116,7 +153,6 @@ export function ProfilesPage() {
   const [showImport, setShowImport] = useState(false);
   const [showCatalog, setShowCatalog] = useState(false);
   const [importFiles, setImportFiles] = useState<File[]>([]);
-  const [compliancePlaybookFile, setCompliancePlaybookFile] = useState<File | null>(null);
   const [scapProfiles, setScapProfiles] = useState<
     Array<{ profile_id: string; title: string; profile_family: string; benchmark_title: string }>
   >([]);
@@ -140,9 +176,12 @@ export function ProfilesPage() {
   const [baseRequirementIds, setBaseRequirementIds] = useState<Set<string>>(new Set());
   const [selectionMode, setSelectionMode] = useState(false);
   const [versionLabelDraft, setVersionLabelDraft] = useState("");
+  const [variableDraft, setVariableDraft] = useState<Record<string, string>>({});
   const [versionActivateDraft, setVersionActivateDraft] = useState(true);
   const [deletingVersionId, setDeletingVersionId] = useState<number | null>(null);
-  const [scriptUploadKind, setScriptUploadKind] = useState<"audit" | "remediation" | null>(null);
+  const [scriptUploadKind, setScriptUploadKind] = useState<
+    "audit" | "remediation" | "remediation_restore" | null
+  >(null);
   const [scriptUploadFiles, setScriptUploadFiles] = useState<File[]>([]);
   const [scriptRulesFrom, setScriptRulesFrom] = useState("");
 
@@ -447,6 +486,20 @@ export function ProfilesPage() {
     enabled: activeProfileId !== null,
   });
 
+  const variablesByRule = useMemo(() => {
+    const map = new Map<string, ProfileVariable[]>();
+    for (const item of detail.data?.variable_schema ?? []) {
+      for (const requirementId of item.requirement_ids ?? []) {
+        for (const key of ruleIdentityKeys(requirementId)) {
+          const list = map.get(key) ?? [];
+          if (!list.some((entry) => entry.name === item.name)) list.push(item);
+          map.set(key, list);
+        }
+      }
+    }
+    return map;
+  }, [detail.data?.variable_schema]);
+
   const activeVersion = useMemo(
     () => (profileVersions.data ?? []).find((version) => version.is_active) ?? null,
     [profileVersions.data]
@@ -546,7 +599,11 @@ export function ProfilesPage() {
   });
 
   const uploadScriptsMutation = useMutation({
-    mutationFn: (payload: { kind: "audit" | "remediation"; files: File[]; rulesFrom: string }) =>
+    mutationFn: (payload: {
+      kind: "audit" | "remediation" | "remediation_restore";
+      files: File[];
+      rulesFrom: string;
+    }) =>
       api.uploadCheckScripts(
         activeProfileId!,
         payload.kind,
@@ -618,10 +675,19 @@ export function ProfilesPage() {
       if (!canOperate || activeProfileId == null) {
         return Promise.reject(new Error("Forbidden"));
       }
+      const schema = detail.data?.variable_schema ?? [];
+      const variableValues: Record<string, string | number | boolean> = {};
+      for (const item of schema) {
+        const raw = variableDraft[item.name] ?? "";
+        if (item.type === "int") variableValues[item.name] = Number(raw);
+        else if (item.type === "bool") variableValues[item.name] = raw === "true";
+        else variableValues[item.name] = raw;
+      }
       return api.createProfileVersion(activeProfileId, {
         label: versionLabelDraft.trim() || null,
         requirement_ids: Array.from(selectedRequirementIds),
         activate: versionActivateDraft,
+        variable_values: schema.length ? variableValues : null,
       });
     },
     onSuccess: () => {
@@ -750,6 +816,13 @@ export function ProfilesPage() {
     setBaseRequirementIds(ids);
     setVersionLabelDraft("");
     setVersionActivateDraft(true);
+    const schema = detail.data?.variable_schema ?? [];
+    const nextDraft: Record<string, string> = {};
+    for (const item of schema) {
+      nextDraft[item.name] =
+        item.type === "bool" ? (item.default ? "true" : "false") : String(item.default ?? "");
+    }
+    setVariableDraft(nextDraft);
     setSelectionMode(true);
   };
 
@@ -780,23 +853,20 @@ export function ProfilesPage() {
   };
 
   const importMutation = useMutation({
-    mutationFn: (payload: {
-      files: File[];
-      scapProfileId?: string;
-      compliancePlaybook?: File | null;
-    }) =>
-      api.importProfilePackage(
-        payload.files,
+    mutationFn: (payload: { files: File[]; scapProfileId?: string }) => {
+      const split = splitCompliancePlaybook(payload.files);
+      return api.importProfilePackage(
+        split.files,
         undefined,
         payload.scapProfileId,
-        payload.compliancePlaybook
-      ),
+        split.playbook
+      );
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["profiles"] });
       queryClient.invalidateQueries({ queryKey: ["profiles-catalog"] });
       queryClient.invalidateQueries({ queryKey: ["playbooks"] });
       setImportFiles([]);
-      setCompliancePlaybookFile(null);
       setScapProfiles([]);
       setSelectedScapProfileId("");
       setShowImport(false);
@@ -911,10 +981,12 @@ export function ProfilesPage() {
       toast.error(err instanceof Error ? err.message : t("toast.genericError")),
   });
 
-  const renderScriptRows = (scripts: CheckScript[], kind: "audit" | "remediation") => {
+  const renderScriptRows = (
+    scripts: CheckScript[],
+    kind: "audit" | "remediation" | "remediation_restore"
+  ) => {
     const isAudit = kind === "audit";
-    const total =
-      (isAudit ? detail.data?.check_scripts : detail.data?.remediation_scripts)?.length ?? 0;
+    const total = scripts.length;
     return scripts.map((script) => (
       <tr key={script.id}>
         <td className="pf-table__mono">{script.id}</td>
@@ -971,7 +1043,9 @@ export function ProfilesPage() {
       <p className="pf-form__hint">
         {scriptUploadKind === "remediation"
           ? t("profiles.uploadRemediationScriptsHint")
-          : t("profiles.uploadAuditScriptsHint")}
+          : scriptUploadKind === "remediation_restore"
+            ? t("profiles.uploadRemediationRestoreScriptsHint")
+            : t("profiles.uploadAuditScriptsHint")}
       </p>
       {scriptUploadKind === "audit" && (
         <div className="pf-form__group">
@@ -1058,11 +1132,12 @@ export function ProfilesPage() {
               <FileUploadZone
                 id="import-files"
                 label={t("profiles.uploadPackage")}
-                accept=".zip,.tar,.tar.gz,.tgz,.xml,.xccdf,.json,.sh,.py,.ps1"
+                accept=".zip,.tar,.tar.gz,.tgz,.xml,.xccdf,.json,.sh,.py,.ps1,.yml,.yaml"
                 formatLabels={[
                   t("profiles.uploadFormatArchive"),
                   t("profiles.uploadFormatScap"),
                   t("profiles.uploadFormatPackage"),
+                  t("profiles.uploadFormatPlaybook"),
                 ]}
                 files={importFiles}
                 onFilesChange={handleImportFilesChange}
@@ -1108,33 +1183,26 @@ export function ProfilesPage() {
                     >
                       *_compliance.yml
                     </span>
+                    <span
+                      className="pf-import-panel__chip pf-import-panel__chip--muted"
+                      title={t("profiles.packageFileVariables")}
+                    >
+                      variables.json
+                    </span>
                   </div>
                 </div>
               </div>
             </section>
 
-            <section className="pf-import-panel__section" aria-labelledby="import-options-heading">
-              <div className="pf-import-panel__section-head">
-                <h3 id="import-options-heading" className="pf-import-panel__section-title">
-                  {t("profiles.importOptionsSection")}
-                </h3>
-              </div>
+            {scapProfiles.length > 0 && (
+              <section className="pf-import-panel__section" aria-labelledby="import-options-heading">
+                <div className="pf-import-panel__section-head">
+                  <h3 id="import-options-heading" className="pf-import-panel__section-title">
+                    {t("profiles.importOptionsSection")}
+                  </h3>
+                </div>
 
-              <div className="pf-import-panel__fields">
-                <FileUploadZone
-                  id="compliance-playbook-upload"
-                  label={t("profiles.compliancePlaybookUpload")}
-                  accept=".yml,.yaml"
-                  formatLabels={[".yml", ".yaml"]}
-                  multiple={false}
-                  files={compliancePlaybookFile ? [compliancePlaybookFile] : []}
-                  onFilesChange={(files) => setCompliancePlaybookFile(files[0] ?? null)}
-                  disabled={importMutation.isPending}
-                  variant="compact"
-                  hint={t("profiles.compliancePlaybookUploadHint")}
-                />
-
-                {scapProfiles.length > 0 && (
+                <div className="pf-import-panel__fields">
                   <div className="pf-form__group">
                     <label htmlFor="scap-profile-select">{t("profiles.scapProfileSelect")}</label>
                     <select
@@ -1153,9 +1221,9 @@ export function ProfilesPage() {
                     </select>
                     <p className="pf-form__hint">{t("profiles.scapProfileHint")}</p>
                   </div>
-                )}
-              </div>
-            </section>
+                </div>
+              </section>
+            )}
 
             <div className="pf-import-panel__footer">
               <div className="pf-form__actions pf-import-panel__actions">
@@ -1164,7 +1232,6 @@ export function ProfilesPage() {
                     importMutation.mutate({
                       files: importFiles,
                       scapProfileId: selectedScapProfileId || undefined,
-                      compliancePlaybook: compliancePlaybookFile,
                     })
                   }
                   disabled={!canImport || importMutation.isPending}
@@ -1713,6 +1780,9 @@ export function ProfilesPage() {
                 const canExpand = hasDetails || canOperate;
                 const displayName = profileRuleDisplayName(rule);
                 const selected = selectedRequirementIds.has(rule.requirement_id);
+                const rowVariables = selectionMode
+                  ? variablesForRule(variablesByRule, rule.requirement_id)
+                  : [];
 
                 return (
                   <div
@@ -1737,7 +1807,7 @@ export function ProfilesPage() {
                       ) : null}
                       <button
                         type="button"
-                        className="pf-profile-rule__toggle"
+                        className="pf-profile-rule__toggle pf-profile-rule__toggle--lead"
                         onClick={() => {
                           if (editing) return;
                           setExpandedRuleKey(expanded ? null : ruleKey);
@@ -1748,6 +1818,67 @@ export function ProfilesPage() {
                       <span className="pf-profile-rule__chevron" aria-hidden />
                       <span className="pf-profile-rule__number">{displayNumber}</span>
                       <span className="pf-profile-rule__title">{displayName}</span>
+                      </button>
+                      {rowVariables.length > 0 ? (
+                        <span className="pf-profile-rule__vars">
+                          {rowVariables.map((item) => (
+                            <label key={item.name} className="pf-profile-rule__var">
+                              <span>{item.name}</span>
+                              {item.type === "bool" ? (
+                                <input
+                                  type="checkbox"
+                                  className="pf-checkbox-control"
+                                  checked={variableDraft[item.name] === "true"}
+                                  title={item.description || item.name}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onChange={(event) =>
+                                    setVariableDraft((current) => ({
+                                      ...current,
+                                      [item.name]: event.target.checked ? "true" : "false",
+                                    }))
+                                  }
+                                />
+                              ) : item.type === "enum" ? (
+                                <select
+                                  className="pf-select"
+                                  value={variableDraft[item.name] ?? ""}
+                                  title={item.description || item.name}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onChange={(event) =>
+                                    setVariableDraft((current) => ({
+                                      ...current,
+                                      [item.name]: event.target.value,
+                                    }))
+                                  }
+                                >
+                                  {(item.enum ?? []).map((choice) => (
+                                    <option key={choice} value={choice}>
+                                      {choice}
+                                    </option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <input
+                                  className="pf-input"
+                                  type={item.type === "int" ? "number" : "text"}
+                                  min={item.min ?? undefined}
+                                  max={item.max ?? undefined}
+                                  value={variableDraft[item.name] ?? ""}
+                                  title={item.description || item.name}
+                                  aria-label={item.name}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onChange={(event) =>
+                                    setVariableDraft((current) => ({
+                                      ...current,
+                                      [item.name]: event.target.value,
+                                    }))
+                                  }
+                                />
+                              )}
+                            </label>
+                          ))}
+                        </span>
+                      ) : null}
                       {(rule.requirement_id && rule.requirement_id !== displayName) ||
                       rule.criticality?.trim() ? (
                         <span className="pf-profile-rule__tags">
@@ -1759,7 +1890,6 @@ export function ProfilesPage() {
                           <ProfileRuleSeverityChip rule={rule} />
                         </span>
                       ) : null}
-                      </button>
                     </div>
                     {expanded && canExpand && (
                       <div className="pf-profile-rule__body">
@@ -1861,6 +1991,7 @@ export function ProfilesPage() {
                                       )
                                     }
                                   />
+                                  <p className="pf-form__hint">{t("profiles.ruleLocationBackupHint")}</p>
                                 </div>
                               </div>
                             </div>
@@ -2207,6 +2338,74 @@ export function ProfilesPage() {
                   </tr>
                 </thead>
                 <tbody>{renderScriptRows(detail.data.remediation_scripts ?? [], "remediation")}</tbody>
+              </table>
+            </div>
+          )}
+          {(detail.data.remediation_backup_scripts?.length ?? 0) > 0 ? (
+            <div className="pf-table-wrap" style={{ marginTop: "1rem" }}>
+              <p className="pf-form__hint" style={{ padding: "0.75rem 1rem 0" }}>
+                {t("remediation.backupScriptsTitle")}
+              </p>
+              <table className="pf-table">
+                <thead>
+                  <tr>
+                    <th>{t("common.id")}</th>
+                    <th>{t("common.name")}</th>
+                    <th>{t("common.status")}</th>
+                    <th>{t("profiles.executionType")}</th>
+                    <th>{t("profiles.scriptFile")}</th>
+                    <th className="pf-table__col-actions">{t("common.actions")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {renderScriptRows(detail.data.remediation_backup_scripts ?? [], "remediation")}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+        </Panel>
+      )}
+
+      {isAdmin && activeProfileId && detail.data && (
+        <Panel
+          title={t("remediation.restoreScriptsTitle")}
+          toolbar={
+            <Button
+              variant="secondary"
+              className="pf-btn--sm"
+              onClick={() => {
+                setScriptUploadKind(
+                  scriptUploadKind === "remediation_restore" ? null : "remediation_restore"
+                );
+                setScriptUploadFiles([]);
+              }}
+            >
+              {t("profiles.uploadScripts")}
+            </Button>
+          }
+          noPadding
+        >
+          {scriptUploadKind === "remediation_restore" && scriptUploadForm}
+          {(detail.data.remediation_restore_scripts?.length ?? 0) === 0 ? (
+            <p className="pf-table__muted" style={{ padding: "1rem" }}>
+              {t("profiles.noRemediationRestoreScripts")}
+            </p>
+          ) : (
+            <div className="pf-table-wrap">
+              <table className="pf-table">
+                <thead>
+                  <tr>
+                    <th>{t("common.id")}</th>
+                    <th>{t("common.name")}</th>
+                    <th>{t("common.status")}</th>
+                    <th>{t("profiles.executionType")}</th>
+                    <th>{t("profiles.scriptFile")}</th>
+                    <th className="pf-table__col-actions">{t("common.actions")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {renderScriptRows(detail.data.remediation_restore_scripts ?? [], "remediation_restore")}
+                </tbody>
               </table>
             </div>
           )}

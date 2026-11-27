@@ -19,6 +19,8 @@ from app.cancel_context import get_cancel_event, raise_if_cancelled
 
 _settings = SecAuditSettings()
 _thread_local = threading.local()
+_package_archive_cache: dict[tuple[str, str], Path] = {}
+_package_archive_lock = threading.Lock()
 
 
 def _checked_output(
@@ -54,6 +56,50 @@ def unique_remote_script_path(stem: str, suffix: str = ".sh") -> str:
     token = secrets.token_hex(8)
     safe_stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in stem)[:64] or "script"
     return f"/tmp/secaudit_{safe_stem}_{token}{suffix}"
+
+
+_BECOME_METHODS = frozenset({"sudo", "doas", "su", "dzdo"})
+
+
+def wrap_command_with_become(
+    command: str,
+    *,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+) -> tuple[str, str | None]:
+    """Wrap a remote shell command with privilege escalation.
+
+    Returns ``(remote_command, stdin_payload_or_None)``. Password is only sent via stdin.
+    """
+    method = (become_method or "").strip().lower()
+    if not method:
+        return command, None
+    if method not in _BECOME_METHODS:
+        raise ValueError(f"Unsupported become_method: {become_method}")
+
+    target = (become_username or "root").strip() or "root"
+    q_target = shlex.quote(target)
+    q_cmd = shlex.quote(command)
+    has_password = bool(become_password)
+
+    if method == "sudo":
+        if has_password:
+            return f"sudo -S -p '' -u {q_target} -- /bin/sh -c {q_cmd}", f"{become_password}\n"
+        return f"sudo -n -u {q_target} -- /bin/sh -c {q_cmd}", None
+    if method == "dzdo":
+        if has_password:
+            return f"dzdo -S -p '' -u {q_target} -- /bin/sh -c {q_cmd}", f"{become_password}\n"
+        return f"dzdo -n -u {q_target} -- /bin/sh -c {q_cmd}", None
+    if method == "doas":
+        if has_password:
+            # doas reads password from tty; -n is non-interactive. With password, use -S if present.
+            return f"doas -u {q_target} /bin/sh -c {q_cmd}", f"{become_password}\n"
+        return f"doas -n -u {q_target} /bin/sh -c {q_cmd}", None
+    # su
+    if has_password:
+        return f"su - {q_target} -c {q_cmd}", f"{become_password}\n"
+    return f"su - {q_target} -c {q_cmd}", None
 
 
 def _ssh_connect_kwargs(
@@ -104,6 +150,9 @@ async def _run_script_async(
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
     extra_env: dict[str, str] | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
 ) -> str:
     raise_if_cancelled()
     connect_kwargs = _ssh_connect_kwargs(
@@ -112,6 +161,17 @@ async def _run_script_async(
     )
     env_prefix = shell_export_prefix(extra_env)
     cli_suffix = service_script_cli_suffix(extra_env)
+    inner_cmd = (
+        f"trap 'rm -f {remote_path}' EXIT; "
+        f"{env_prefix}"
+        f"chmod +x {remote_path} && bash {remote_path}{cli_suffix}; EXIT_CODE=$?; exit $EXIT_CODE"
+    )
+    remote_cmd, stdin_data = wrap_command_with_become(
+        inner_cmd,
+        become_method=become_method,
+        become_username=become_username,
+        become_password=become_password,
+    )
 
     async with asyncssh.connect(**connect_kwargs) as conn:
         watcher = asyncio.create_task(_watch_cancel(conn, cancel_event))
@@ -122,13 +182,10 @@ async def _run_script_async(
                     await remote_file.write(script_content)
 
             raise_if_cancelled()
-            # trap guarantees cleanup even if the remote process is interrupted.
             result = await conn.run(
-                f"trap 'rm -f {remote_path}' EXIT; "
-                f"{env_prefix}"
-                f"chmod +x {remote_path} && bash {remote_path}{cli_suffix}; EXIT_CODE=$?; exit $EXIT_CODE",
+                remote_cmd,
                 timeout=timeout,
-                stdin=asyncssh.DEVNULL,
+                stdin=stdin_data if stdin_data is not None else asyncssh.DEVNULL,
             )
             raise_if_cancelled()
             return _checked_output(result, operation="Remote script")
@@ -156,6 +213,9 @@ def run_script_over_ssh(
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
     extra_env: dict[str, str] | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
 ) -> str:
     if not script_path.exists():
         raise FileNotFoundError(f"Script not found: {script_path}")
@@ -188,8 +248,26 @@ def run_script_over_ssh(
                 cancel_event=cancel_event,
                 key_passphrase=key_passphrase,
                 extra_env=extra_env,
+                become_method=become_method,
+                become_username=become_username,
+                become_password=become_password,
             )
         )
+
+
+def _package_tree_fingerprint(package_dir: Path) -> str:
+    """Cheap tree fingerprint (relative path / mtime_ns / size) for archive cache keys."""
+    parts: list[str] = []
+    for path in sorted(package_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        rel = path.relative_to(package_dir).as_posix()
+        parts.append(f"{rel}:{st.st_mtime_ns}:{st.st_size}")
+    return "|".join(parts)
 
 
 def _build_package_archive(package_dir: Path) -> Path:
@@ -218,6 +296,24 @@ def _build_package_archive(package_dir: Path) -> Path:
     return archive_path
 
 
+def _get_cached_package_archive(package_dir: Path) -> Path:
+    """Build package .tar.gz once per (dir, tree fingerprint); reuse across host threads."""
+    resolved = package_dir.resolve()
+    key = (str(resolved), _package_tree_fingerprint(resolved))
+    with _package_archive_lock:
+        cached = _package_archive_cache.get(key)
+        if cached is not None and cached.is_file():
+            return cached
+        archive_path = _build_package_archive(resolved)
+        _package_archive_cache[key] = archive_path
+        # Drop stale fingerprints for the same package dir.
+        for old_key in [k for k in _package_archive_cache if k[0] == key[0] and k != key]:
+            old_path = _package_archive_cache.pop(old_key, None)
+            if old_path is not None and old_path != archive_path:
+                old_path.unlink(missing_ok=True)
+        return archive_path
+
+
 async def _run_package_script_async(
     hostname: str,
     port: int,
@@ -231,62 +327,88 @@ async def _run_package_script_async(
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
     extra_env: dict[str, str] | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+    script_content_override: str | None = None,
 ) -> str:
     raise_if_cancelled()
     resolved_script = resolve_script_under_package(package_dir, script_file)
     script_path = resolved_script.relative_to(package_dir.resolve()).as_posix()
-    archive_path = _build_package_archive(package_dir)
+    archive_path = _get_cached_package_archive(package_dir)
     remote_archive = f"/tmp/secaudit_pkg_{uuid.uuid4().hex}.tar.gz"
     remote_dir = f"/tmp/secaudit_pkg_{uuid.uuid4().hex}"
+    remote_override = f"/tmp/secaudit_script_{uuid.uuid4().hex}"
     q_remote_dir = shlex.quote(remote_dir)
     q_remote_archive = shlex.quote(remote_archive)
     q_script_path = shlex.quote(script_path)
     q_bash_script = shlex.quote(f"./{script_path}")
+    q_remote_override = shlex.quote(remote_override)
     env_prefix = shell_export_prefix(extra_env)
     cli_suffix = service_script_cli_suffix(extra_env)
-
-    try:
-        connect_kwargs = _ssh_connect_kwargs(
-            hostname, port, username, password, private_key, known_hosts_entry=known_hosts_entry,
-            key_passphrase=key_passphrase,
+    override_step = ""
+    if script_content_override is not None:
+        override_step = (
+            f"cp {q_remote_override} {q_remote_dir}/{q_script_path} && "
+            f"rm -f {q_remote_override} && "
         )
-    except ValueError:
-        archive_path.unlink(missing_ok=True)
-        raise
+    inner_cmd = (
+        f"trap 'rm -rf {q_remote_dir} {q_remote_archive} {q_remote_override}' EXIT; "
+        f"mkdir -p {q_remote_dir} && "
+        f"tar -xzf {q_remote_archive} -C {q_remote_dir} && "
+        f"{override_step}"
+        f"chmod +x {q_remote_dir}/{q_script_path} && "
+        f"cd {q_remote_dir} && {env_prefix}bash {q_bash_script}{cli_suffix}; "
+        f"EXIT_CODE=$?; exit $EXIT_CODE"
+    )
+    remote_cmd, stdin_data = wrap_command_with_become(
+        inner_cmd,
+        become_method=become_method,
+        become_username=become_username,
+        become_password=become_password,
+    )
 
-    try:
-        async with asyncssh.connect(**connect_kwargs) as conn:
-            watcher = asyncio.create_task(_watch_cancel(conn, cancel_event))
+    connect_kwargs = _ssh_connect_kwargs(
+        hostname, port, username, password, private_key, known_hosts_entry=known_hosts_entry,
+        key_passphrase=key_passphrase,
+    )
+
+    async with asyncssh.connect(**connect_kwargs) as conn:
+        watcher = asyncio.create_task(_watch_cancel(conn, cancel_event))
+        try:
+            raise_if_cancelled()
+            override_local: Path | None = None
             try:
-                raise_if_cancelled()
                 async with conn.start_sftp_client() as sftp:
                     await sftp.put(str(archive_path), remote_archive)
-
-                raise_if_cancelled()
-                result = await conn.run(
-                    f"trap 'rm -rf {q_remote_dir} {q_remote_archive}' EXIT; "
-                    f"mkdir -p {q_remote_dir} && "
-                    f"tar -xzf {q_remote_archive} -C {q_remote_dir} && "
-                    f"chmod +x {q_remote_dir}/{q_script_path} && "
-                    f"cd {q_remote_dir} && {env_prefix}bash {q_bash_script}{cli_suffix}; "
-                    f"EXIT_CODE=$?; exit $EXIT_CODE",
-                    timeout=timeout,
-                    stdin=asyncssh.DEVNULL,
-                )
-                raise_if_cancelled()
-                return _checked_output(result, operation="Remediation script")
-            except (asyncio.CancelledError, asyncssh.ConnectionLost, asyncssh.DisconnectError) as exc:
-                if cancel_event and cancel_event.is_set():
-                    raise InterruptedError("Job run cancelled") from exc
-                raise
+                    if script_content_override is not None:
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".sh")
+                        tmp.write(script_content_override.encode("utf-8"))
+                        tmp.close()
+                        override_local = Path(tmp.name)
+                        await sftp.put(str(override_local), remote_override)
             finally:
-                watcher.cancel()
-                try:
-                    await watcher
-                except asyncio.CancelledError:
-                    pass
-    finally:
-        archive_path.unlink(missing_ok=True)
+                if override_local is not None:
+                    override_local.unlink(missing_ok=True)
+
+            raise_if_cancelled()
+            result = await conn.run(
+                remote_cmd,
+                timeout=timeout,
+                stdin=stdin_data if stdin_data is not None else asyncssh.DEVNULL,
+            )
+            raise_if_cancelled()
+            return _checked_output(result, operation="Remediation script")
+        except (asyncio.CancelledError, asyncssh.ConnectionLost, asyncssh.DisconnectError) as exc:
+            if cancel_event and cancel_event.is_set():
+                raise InterruptedError("Job run cancelled") from exc
+            raise
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except asyncio.CancelledError:
+                pass
 
 
 def run_package_script_over_ssh(
@@ -302,6 +424,10 @@ def run_package_script_over_ssh(
     cancel_event: threading.Event | None = None,
     key_passphrase: str | None = None,
     extra_env: dict[str, str] | None = None,
+    become_method: str | None = None,
+    become_username: str | None = None,
+    become_password: str | None = None,
+    script_content_override: str | None = None,
 ) -> str:
     if not package_dir.is_dir():
         raise FileNotFoundError(f"Package directory not found: {package_dir}")
@@ -334,5 +460,9 @@ def run_package_script_over_ssh(
                 cancel_event=cancel_event,
                 key_passphrase=key_passphrase,
                 extra_env=extra_env,
+                become_method=become_method,
+                become_username=become_username,
+                become_password=become_password,
+                script_content_override=script_content_override,
             )
         )

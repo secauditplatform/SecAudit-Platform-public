@@ -186,6 +186,45 @@ def parse_xccdf_results_xml(content: bytes) -> dict[str, str]:
     return outcomes
 
 
+_OVAL_TO_XCCDF_RESULT = {
+    "true": "pass",
+    "false": "fail",
+    "error": "error",
+    "unknown": "notchecked",
+    "not evaluated": "notchecked",
+    "not applicable": "notapplicable",
+}
+
+
+def oval_result_to_xccdf_result(result: str) -> str:
+    """Map worker-side OVAL definition results to XCCDF rule-result strings."""
+    return _OVAL_TO_XCCDF_RESULT.get((result or "").strip().lower(), "error")
+
+
+def parse_xccdf_rule_oval_map(content: bytes) -> dict[str, str]:
+    """Map XCCDF Rule id → first OVAL definition id from check-content-ref/@name."""
+    try:
+        root = DefusedET.fromstring(content)
+    except DefusedET.ParseError as exc:
+        raise ValueError(f"Invalid XCCDF XML: {exc}") from exc
+
+    mapping: dict[str, str] = {}
+    for node in root.iter():
+        if _local_name(node.tag) != "Rule":
+            continue
+        rule_id = (node.get("id") or "").strip()
+        if not rule_id or rule_id in mapping:
+            continue
+        for child in node.iter():
+            if _local_name(child.tag) not in ("check-content-ref", "check_content_ref"):
+                continue
+            name = (child.get("name") or "").strip()
+            if name.startswith("oval:"):
+                mapping[rule_id] = name
+                break
+    return mapping
+
+
 def merge_scap_and_script_results(
     *,
     db_rules: list[dict],

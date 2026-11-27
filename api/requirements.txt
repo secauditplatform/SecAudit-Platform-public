@@ -10,6 +10,7 @@ pydantic==2.10.3
 pydantic-settings==2.6.1
 python-multipart==0.0.32
 celery==5.4.0
+kombu>=5.3.4,<5.4
 redis==5.2.1
 httpx==0.28.1
 python-jose[cryptography]==3.5.0
@@ -20,7 +21,6 @@ aiofiles==24.1.0
 cryptography==50.0.2
 croniter==5.0.1
 ansible-core==2.18.19
-xhtml2pdf==0.2.26
 redis[hiredis]==5.2.1
 boto3==1.43.114
 reportlab==5.0.1

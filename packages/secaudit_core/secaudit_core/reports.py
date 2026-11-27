@@ -1,6 +1,5 @@
 from datetime import UTC, datetime
 import re
-from io import BytesIO
 import os
 from pathlib import Path
 import shutil
@@ -21,16 +20,9 @@ from secaudit_core.report_i18n import (
     status_labels_for_locale,
 )
 
-try:
-    from xhtml2pdf import pisa
-except ImportError:
-    pisa = None
-
-_FONT_DIR_CANDIDATES = (
-    Path("/usr/share/fonts/truetype/dejavu"),
-    Path("C:/Windows/Fonts"),
-)
-_FONTS_REGISTERED = False
+# Pack/PDF with this many checks or more is built asynchronously.
+REPORT_PACK_ASYNC_THRESHOLD = 2000
+_EXECUTIVE_STATUSES = frozenset({CheckStatus.FAIL, CheckStatus.ERROR})
 
 _STATUS_ACCENT = {
     "pass": "#2f7d4a",
@@ -40,66 +32,6 @@ _STATUS_ACCENT = {
     "waived": "#5b6b9a",
 }
 
-
-def _resolve_font_file(*names: str) -> Path | None:
-    for directory in _FONT_DIR_CANDIDATES:
-        if not directory.is_dir():
-            continue
-        for name in names:
-            candidate = directory / name
-            if candidate.is_file():
-                return candidate
-    return None
-
-
-def _ensure_pdf_fonts() -> None:
-    global _FONTS_REGISTERED
-    if _FONTS_REGISTERED:
-        return
-
-    from reportlab.lib.fonts import addMapping
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
-
-    regular = _resolve_font_file("DejaVuSans.ttf", "arial.ttf", "segoeui.ttf")
-    bold = _resolve_font_file("DejaVuSans-Bold.ttf", "arialbd.ttf", "segoeuib.ttf")
-    mono = _resolve_font_file("DejaVuSansMono.ttf", "cour.ttf", "consola.ttf")
-    if regular is None:
-        raise RuntimeError("No Unicode font found for PDF generation (install fonts-dejavu-core)")
-
-    pdfmetrics.registerFont(TTFont("DejaVuSans", str(regular)))
-    pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", str(bold or regular)))
-    pdfmetrics.registerFont(TTFont("DejaVuMono", str(mono or regular)))
-    addMapping("DejaVuSans", 0, 0, "DejaVuSans")
-    addMapping("DejaVuSans", 1, 0, "DejaVuSans-Bold")
-    addMapping("DejaVuSans", 0, 1, "DejaVuSans")
-    addMapping("DejaVuSans", 1, 1, "DejaVuSans-Bold")
-    _FONTS_REGISTERED = True
-
-
-def _pdf_font_paths() -> dict[str, str]:
-    regular = _resolve_font_file("DejaVuSans.ttf", "arial.ttf", "segoeui.ttf")
-    bold = _resolve_font_file("DejaVuSans-Bold.ttf", "arialbd.ttf", "segoeuib.ttf")
-    mono = _resolve_font_file("DejaVuSansMono.ttf", "cour.ttf", "consola.ttf")
-    if regular is None:
-        raise RuntimeError("No Unicode font found for PDF generation (install fonts-dejavu-core)")
-
-    return {
-        "font_regular": str(regular).replace("\\", "/"),
-        "font_bold": str(bold or regular).replace("\\", "/"),
-        "font_mono": str(mono or regular).replace("\\", "/"),
-    }
-
-
-def _pdf_link_callback(uri: str, _rel) -> str:
-    candidate = uri[7:] if uri.startswith("file://") else uri
-    path = Path(candidate).resolve()
-    allowed_roots = [root.resolve() for root in _FONT_DIR_CANDIDATES if root.is_dir()]
-    if path.is_file() and any(path == root or root in path.parents for root in allowed_roots):
-        return str(path)
-    raise ValueError("PDF resource is outside the approved font directories")
-
-
 _REPORT_ENV = Environment(
     autoescape=select_autoescape(
         enabled_extensions=("html", "htm", "xml"),
@@ -108,8 +40,7 @@ _REPORT_ENV = Environment(
     )
 )
 
-# Table/bgcolor-first layout: xhtml2pdf often ignores div backgrounds and % width fills.
-# Keep column widths as HTML attributes and avoid text overflow between cells.
+# Chromium print CSS (for_pdf=False). Legacy for_pdf=True branch kept for template macros only.
 REPORT_TEMPLATE = _REPORT_ENV.from_string("""{% macro pdf_spacer(height_pt=8) %}
 <table width="100%" cellpadding="0" cellspacing="0"><tr><td style="height: {{ height_pt }}pt; font-size: 1pt; line-height: 1pt; padding: 0;">&nbsp;</td></tr></table>
 {% endmacro %}
@@ -945,7 +876,7 @@ def _compliance_color(compliance: float) -> str:
 
 
 def _soft_break(text: str, *, chunk: int = 18) -> str:
-    """Insert zero-width spaces so xhtml2pdf can wrap long tokens inside fixed cells."""
+    """Insert zero-width spaces so long tokens wrap inside fixed cells."""
     if not text:
         return text
     out: list[str] = []
@@ -1094,6 +1025,7 @@ def render_run_report_html(
     for_pdf: bool = False,
     locale: str | None = None,
     waived_check_ids: set[int] | None = None,
+    executive: bool = False,
 ) -> str:
     checks = job_run.check_results or []
     waived_ids = waived_check_ids or set()
@@ -1117,8 +1049,11 @@ def render_run_report_html(
     status_labels = status_labels_for_locale(lang, for_pdf=for_pdf)
     rules_lookup = _build_rules_lookup(profile)
 
+    visible_checks = (
+        [c for c in checks if c.status in _EXECUTIVE_STATUSES] if executive else checks
+    )
     rows = []
-    for c in sorted(checks, key=lambda x: (x.host_id, x.rule_tech_name)):
+    for c in sorted(visible_checks, key=lambda x: (x.host_id, x.rule_tech_name)):
         host = hosts.get(c.host_id)
         host_label = host.name if host else f"host#{c.host_id}"
         rows.append(
@@ -1151,11 +1086,7 @@ def render_run_report_html(
     if for_pdf and excluded_version_label:
         excluded_version_label = _soft_break(excluded_version_label, chunk=24)
 
-    if for_pdf:
-        _ensure_pdf_fonts()
-        font_paths = _pdf_font_paths()
-    else:
-        font_paths = {"font_regular": "", "font_bold": "", "font_mono": ""}
+    font_paths = {"font_regular": "", "font_bold": "", "font_mono": ""}
 
     return REPORT_TEMPLATE.render(
         run=job_run,
@@ -1199,76 +1130,58 @@ def render_run_report_pdf(
     *,
     locale: str | None = None,
     waived_check_ids: set[int] | None = None,
+    executive: bool = True,
 ) -> bytes:
     chromium = (
         shutil.which("chromium")
         or shutil.which("chromium-browser")
         or shutil.which("google-chrome")
     )
-    if chromium:
-        html = render_run_report_html(
-            job_run,
-            profile,
-            hosts,
-            for_pdf=False,
-            locale=locale,
-            waived_check_ids=waived_check_ids,
-        )
-        with tempfile.TemporaryDirectory(prefix="secaudit-report-") as tmp:
-            workdir = Path(tmp)
-            html_path = workdir / "report.html"
-            pdf_path = workdir / "report.pdf"
-            profile_path = workdir / "chromium-profile"
-            html_path.write_text(html, encoding="utf-8")
-            result = subprocess.run(
-                [
-                    chromium,
-                    "--headless",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    "--disable-breakpad",
-                    "--disable-crash-reporter",
-                    "--allow-file-access-from-files",
-                    "--no-pdf-header-footer",
-                    "--print-to-pdf-no-header",
-                    "--print-to-pdf=" + str(pdf_path),
-                    "--user-data-dir=" + str(profile_path),
-                    html_path.as_uri(),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-                env={
-                    **os.environ,
-                    "HOME": str(workdir),
-                    "XDG_CACHE_HOME": str(workdir / "cache"),
-                    "XDG_CONFIG_HOME": str(workdir / "config"),
-                },
-            )
-            if result.returncode != 0 or not pdf_path.is_file():
-                detail = (result.stderr or result.stdout or "unknown Chromium error").strip()
-                raise RuntimeError(f"Chromium PDF generation failed: {detail[-1000:]}")
-            return pdf_path.read_bytes()
-
-    if pisa is None:
-        raise RuntimeError("No PDF renderer is installed")
+    if not chromium:
+        raise RuntimeError("Chromium is required for PDF generation")
     html = render_run_report_html(
         job_run,
         profile,
         hosts,
-        for_pdf=True,
+        for_pdf=False,
         locale=locale,
         waived_check_ids=waived_check_ids,
+        executive=executive,
     )
-    buffer = BytesIO()
-    result = pisa.CreatePDF(
-        html,
-        dest=buffer,
-        encoding="utf-8",
-        link_callback=_pdf_link_callback,
-    )
-    if result.err:
-        raise RuntimeError(f"PDF generation failed with {result.err} error(s)")
-    return buffer.getvalue()
+    with tempfile.TemporaryDirectory(prefix="secaudit-report-") as tmp:
+        workdir = Path(tmp)
+        html_path = workdir / "report.html"
+        pdf_path = workdir / "report.pdf"
+        profile_path = workdir / "chromium-profile"
+        html_path.write_text(html, encoding="utf-8")
+        result = subprocess.run(
+            [
+                chromium,
+                "--headless",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-breakpad",
+                "--disable-crash-reporter",
+                "--allow-file-access-from-files",
+                "--no-pdf-header-footer",
+                "--print-to-pdf-no-header",
+                "--print-to-pdf=" + str(pdf_path),
+                "--user-data-dir=" + str(profile_path),
+                html_path.as_uri(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env={
+                **os.environ,
+                "HOME": str(workdir),
+                "XDG_CACHE_HOME": str(workdir / "cache"),
+                "XDG_CONFIG_HOME": str(workdir / "config"),
+            },
+        )
+        if result.returncode != 0 or not pdf_path.is_file():
+            detail = (result.stderr or result.stdout or "unknown Chromium error").strip()
+            raise RuntimeError(f"Chromium PDF generation failed: {detail[-1000:]}")
+        return pdf_path.read_bytes()

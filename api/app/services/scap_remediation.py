@@ -372,15 +372,25 @@ def build_template_shell(
     return None
 
 
+def _ansible_rule_tags(rule_id: str, *extra: str, mnemonic: str | None = None) -> str:
+    """Dual-tag SCAP rule_id and SecAudit mnemonic so --tags from either id matches."""
+    parts = ["scap", *[p for p in extra if p], rule_id]
+    if mnemonic and mnemonic not in parts:
+        parts.append(mnemonic)
+    return "tags: [" + ", ".join(parts) + "]\n"
+
+
 def build_template_ansible_yaml(
     kind: str,
     *,
     rule_id: str,
     title: str,
     description: str = "",
+    mnemonic: str | None = None,
 ) -> str | None:
     """YAML task block (list item) for Ansible remediation playbook."""
     safe = title.replace('"', "'")[:120]
+    tags = _ansible_rule_tags(rule_id, "template", mnemonic=mnemonic)
 
     if kind == "package":
         pkg = _extract_package_name(title, description)
@@ -392,7 +402,7 @@ def build_template_ansible_yaml(
             f"      ansible.builtin.package:\n"
             f'        name: "{pkg}"\n'
             f"        state: {state}\n"
-            f"      tags: [scap, template, {rule_id}]\n"
+            f"      {tags}"
         )
 
     if kind == "service":
@@ -406,7 +416,7 @@ def build_template_ansible_yaml(
             f'        name: "{svc}"\n'
             f"        enabled: {str(enabled).lower()}\n"
             f"        state: {'started' if enabled else 'stopped'}\n"
-            f"      tags: [scap, template, {rule_id}]\n"
+            f"      {tags}"
         )
 
     if kind == "sysctl":
@@ -418,7 +428,7 @@ def build_template_ansible_yaml(
             f'        value: "1"\n'
             f"        state: present\n"
             f"        reload: true\n"
-            f"      tags: [scap, template, {rule_id}]\n"
+            f"      {tags}"
             f"      # TEMPLATE: confirm value against SCAP recommendation\n"
         )
 
@@ -430,7 +440,7 @@ def build_template_ansible_yaml(
             f'        owner: root\n'
             f'        group: root\n'
             f"        mode: \"0640\"\n"
-            f"      tags: [scap, template, unsupported, {rule_id}]\n"
+            f"      {_ansible_rule_tags(rule_id, 'template', 'unsupported', mnemonic=mnemonic)}"
             f"      when: false  # placeholder until path is filled\n"
         )
 
@@ -446,7 +456,7 @@ def build_template_ansible_yaml(
             f"          install {mod} /bin/true\n"
             f"          blacklist {mod}\n"
             f"        mode: \"0644\"\n"
-            f"      tags: [scap, template, {rule_id}]\n"
+            f"      {tags}"
         )
 
     return None
@@ -482,7 +492,9 @@ def plan_rule_remediation(
         ]
         ansible_yaml = None
         if ansible_fix:
-            ansible_yaml = _ansible_from_fixtext(ansible_fix.text, rule_id=rule_id, title=safe)
+            ansible_yaml = _ansible_from_fixtext(
+                ansible_fix.text, rule_id=rule_id, title=safe, mnemonic=mnemonic
+            )
         else:
             # Wrap shell fix as an Ansible shell task for the ansible remediation playbook.
             indented = "\n".join(f"          {line}" if line else "" for line in body)
@@ -492,7 +504,7 @@ def plan_rule_remediation(
                 f"{indented}\n"
                 f"      args:\n"
                 f"        executable: /bin/bash\n"
-                f"      tags: [scap, fixtext, {rule_id}]\n"
+                f"      {_ansible_rule_tags(rule_id, 'fixtext', mnemonic=mnemonic)}"
             )
         return RemediationPlan(
             rule_id=rule_id,
@@ -504,7 +516,9 @@ def plan_rule_remediation(
         )
 
     if ansible_fix:
-        ansible_yaml = _ansible_from_fixtext(ansible_fix.text, rule_id=rule_id, title=safe)
+        ansible_yaml = _ansible_from_fixtext(
+            ansible_fix.text, rule_id=rule_id, title=safe, mnemonic=mnemonic
+        )
         # Provide a shell runner that applies via ansible-playbook when available on target,
         # otherwise marks unsupported for SSH-only remediations.
         shell_lines = [
@@ -536,7 +550,11 @@ def plan_rule_remediation(
             template_kind, mnemonic=mnemonic, title=title, description=description
         )
         ansible_yaml = build_template_ansible_yaml(
-            template_kind, rule_id=rule_id, title=title, description=description
+            template_kind,
+            rule_id=rule_id,
+            title=title,
+            description=description,
+            mnemonic=mnemonic,
         )
         if shell:
             return RemediationPlan(
@@ -575,13 +593,15 @@ def _unsupported_plan(rule_id: str, title: str, mnemonic: str, reason: str) -> R
             f'    - name: "UNSUPPORTED: {safe}"\n'
             f"      ansible.builtin.debug:\n"
             f'        msg: "UNSUPPORTED — {reason}"\n'
-            f"      tags: [scap, unsupported, {rule_id}]\n"
+            f"      {_ansible_rule_tags(rule_id, 'unsupported', mnemonic=mnemonic)}"
             f"      changed_when: false\n"
         ),
     )
 
 
-def _ansible_from_fixtext(text: str, *, rule_id: str, title: str) -> str:
+def _ansible_from_fixtext(
+    text: str, *, rule_id: str, title: str, mnemonic: str | None = None
+) -> str:
     stripped = text.strip()
     # Full playbook or task list from SCAP content — embed carefully.
     if stripped.startswith("---") or stripped.startswith("- ") or stripped.startswith("tasks:"):
@@ -600,7 +620,7 @@ def _ansible_from_fixtext(text: str, *, rule_id: str, title: str) -> str:
                 f"{indented}\n"
                 f"      args:\n"
                 f"        executable: /bin/bash\n"
-                f"      tags: [scap, fixtext_ansible_play, {rule_id}]\n"
+                f"      {_ansible_rule_tags(rule_id, 'fixtext_ansible_play', mnemonic=mnemonic)}"
             )
         indented_tasks = "\n".join(f"    {line}" if line else "" for line in lines)
         # Ensure list items are preserved
@@ -612,7 +632,7 @@ def _ansible_from_fixtext(text: str, *, rule_id: str, title: str) -> str:
                 + "\n"
                 f"      args:\n"
                 f"        executable: /bin/bash\n"
-                f"      tags: [scap, fixtext_ansible, {rule_id}]\n"
+                f"      {_ansible_rule_tags(rule_id, 'fixtext_ansible', mnemonic=mnemonic)}"
             )
         return indented_tasks + "\n"
 
@@ -624,8 +644,31 @@ def _ansible_from_fixtext(text: str, *, rule_id: str, title: str) -> str:
         f"{indented}\n"
         f"      args:\n"
         f"        executable: /bin/bash\n"
-        f"      tags: [scap, fixtext, {rule_id}]\n"
+        f"      {_ansible_rule_tags(rule_id, 'fixtext', mnemonic=mnemonic)}"
     )
+
+
+_SECAUDIT_RULE_HELPER_BASH = """
+secaudit_rule_enabled() {
+    local raw="${SECAUDIT_RULES:-${SECAUDIT_REMEDIATE_RULES:-}}" id="$1" token n want
+    [ -z "$raw" ] && return 0
+    n="${id#RULE}"; n="${n#rule}"; n="${n#Rule}"
+    case "$n" in (*[!0-9]*|"") want=$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]') ;;
+        *) want="RULE$((10#$n))" ;;
+    esac
+    local IFS=','
+    for token in $raw; do
+        token=$(printf '%s' "$token" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+        [ -z "$token" ] && continue
+        local tn="${token#RULE}"
+        case "$tn" in (*[!0-9]*|"") ;;
+            *) token="RULE$((10#$tn))" ;;
+        esac
+        [ "$token" = "$want" ] && return 0
+    done
+    return 1
+}
+""".strip()
 
 
 def render_remediation_shell(benchmark_id: str, plans: list[RemediationPlan]) -> str:
@@ -638,9 +681,15 @@ def render_remediation_shell(benchmark_id: str, plans: list[RemediationPlan]) ->
         "export LC_ALL=C",
         'cd "$(dirname "$0")" 2>/dev/null || true',
         "",
+        _SECAUDIT_RULE_HELPER_BASH,
+        "",
     ]
     for plan in plans:
+        lines.append(f"# {plan.mnemonic}:")
+        lines.append(f'if secaudit_rule_enabled "{plan.mnemonic}"; then')
         lines.extend(plan.shell_lines)
+        lines.append("fi")
+        lines.append("")
     return "\n".join(lines) + "\n"
 
 

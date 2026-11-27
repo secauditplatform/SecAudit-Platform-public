@@ -21,6 +21,15 @@ from secaudit_core.tracing import start_span
 logger = logging.getLogger(__name__)
 
 ConnectionMode = Literal["auto", "ssh", "paramiko", "winrm"]
+_BECOME_TRUE = re.compile(r"^(\s*)become:\s*(?:true|yes|True|YES)\s*(?:#.*)?$")
+
+
+def playbook_without_become(content: str) -> str:
+    """Turn play and task become flags off so the login user runs the check."""
+    return "\n".join(
+        _BECOME_TRUE.sub(r"\1become: false", line) if _BECOME_TRUE.match(line) else line
+        for line in content.splitlines()
+    )
 
 
 class AnsiblePlaybookError(RuntimeError):
@@ -103,6 +112,20 @@ def resolve_connection_mode(
     return "paramiko"
 
 
+def _apply_become_settings(host_vars: dict, credentials: dict | None) -> None:
+    if not credentials:
+        return
+    method = str(credentials.get("become_method") or "").strip().lower()
+    if not method:
+        return
+    host_vars["ansible_become"] = True
+    host_vars["ansible_become_method"] = method
+    host_vars["ansible_become_user"] = str(credentials.get("become_username") or "root").strip() or "root"
+    become_password = credentials.get("become_password")
+    if become_password:
+        host_vars["ansible_become_password"] = become_password
+
+
 def _apply_connection_settings(
     host_vars: dict,
     credentials: dict | None,
@@ -140,6 +163,7 @@ def _apply_connection_settings(
             host_vars["ansible_password"] = credentials["password"]
         if key_file is not None:
             host_vars["ansible_ssh_private_key_file"] = str(key_file)
+        _apply_become_settings(host_vars, credentials)
         return
 
     host_vars["ansible_connection"] = "ssh"
@@ -147,6 +171,7 @@ def _apply_connection_settings(
         host_vars["ansible_password"] = credentials["password"]
     if key_file is not None:
         host_vars["ansible_ssh_private_key_file"] = str(key_file)
+    _apply_become_settings(host_vars, credentials)
 
 
 def _extract_event_message(event: dict) -> tuple[str, str, str]:
@@ -740,7 +765,7 @@ def _run_playbook(
 
         redact_values = [
             str(credentials.get(key) or "")
-            for key in ("password", "key_passphrase", "private_key")
+            for key in ("password", "key_passphrase", "private_key", "become_password")
         ] if credentials else []
         output, errors = _collect_runner_output(
             runner, check_mode=check_mode, redact_values=redact_values

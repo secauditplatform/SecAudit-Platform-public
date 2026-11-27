@@ -7,6 +7,7 @@ from app.core.database import get_db
 from app.core.demo_operators import hide_demo_operators_from_actor, is_demo_operator_username
 from app.core.passwords import hash_password
 from app.models import Job, User, UserRole
+from secaudit_core.access_scope import clean_scope_values
 from app.schemas import UserCreate, UserRead, UserUpdate
 from app.services.audit_log import log_audit_event
 from app.services.mfa import clear_mfa, discard_pending_secret
@@ -28,6 +29,13 @@ async def _get_user_or_404(db: AsyncSession, user_id: int) -> User:
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+
+def _scope_list(values: list[str] | None) -> list[str]:
+    try:
+        return clean_scope_values(values)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Scope value is too long") from None
 
 
 def _reject_hidden_demo_operator(actor: AuthUser, user: User) -> None:
@@ -70,6 +78,9 @@ async def create_user(
         role=data.role,
         hashed_password=hash_password(data.password),
         is_active=True,
+        access_sites=_scope_list(data.access_sites),
+        access_environments=_scope_list(data.access_environments),
+        access_tags=_scope_list(data.access_tags),
     )
     db.add(user)
     await db.flush()
@@ -148,6 +159,10 @@ async def update_user(
         if not new_active and user.role == UserRole.ADMIN and (await _count_admins(db)) <= 1:
             raise HTTPException(status_code=409, detail="Cannot deactivate the last active admin")
         user.is_active = new_active
+
+    for field in ("access_sites", "access_environments", "access_tags"):
+        if field in updates:
+            setattr(user, field, _scope_list(updates[field]))
 
     if password:
         user.hashed_password = hash_password(password)

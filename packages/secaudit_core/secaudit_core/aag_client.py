@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -19,12 +20,11 @@ import httpx
 from secaudit_core.sensitive_data import REDACTED, redact_sensitive
 from secaudit_core.url_safety import UnsafeOutboundURLError, validate_outbound_webhook_url
 
-TASK_KINDS = ("explain", "generate")
 AAG_MAX_TIMEOUT_SECONDS = 120 * 60
+AAG_DEFAULT_IDLE_READ_SECONDS = 90
 EXPLAIN_MIN_TOKENS = 4000
 GENERATE_MIN_TOKENS = 8192
 DRAFT_TYPES = ("waiver", "remediation_plan", "audit_flow", "network", "playbook", "mapping")
-HOST_FILTER_KEYS = ("site", "environment", "tag", "os_type", "criticality", "active_only")
 MAX_FINDINGS = 25
 _OFFICIAL_MARKERS = ("cis", "stig", "fstek", "fstec", "фстэк")
 
@@ -41,6 +41,7 @@ _SYSTEM_PROMPTS = {
         "did: at least two sentences. Quote the message, then say what that recorded value "
         "means for this control. Cite run_id=<id> and rule=<rule>. "
         "Copy status from the input. Do not change PASS, FAIL, ERROR, or SKIP. "
+        "When a finding includes hosts=N, it is the same result on N hosts: keep one check and name that count. "
         "Do not add a check that is not in the input."
     ),
     "generate": (
@@ -202,6 +203,101 @@ def _read_completion(payload: Any) -> str:
     return content.strip()
 
 
+def _delta_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    delta = choices[0].get("delta")
+    if isinstance(delta, dict):
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content
+    message = choices[0].get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    return ""
+
+
+def _raise_if_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    if should_cancel is not None and should_cancel():
+        raise AagClientError("Task cancelled", error_code="cancelled")
+
+
+def _stream_chat(
+    *,
+    client: httpx.Client,
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str],
+    api_key: str | None,
+    overall_deadline: float,
+    should_cancel: Callable[[], bool] | None,
+    on_delta: Callable[[str], None] | None,
+) -> AagChatResult:
+    """Read OpenAI-compatible SSE chunks until [DONE] or the idle/overall deadline."""
+    parts: list[str] = []
+    token_count: int | None = None
+    with client.stream("POST", url, json=body, headers=headers) as response:
+        if response.status_code >= 400:
+            try:
+                error_payload = response.json()
+            except Exception:
+                error_payload = None
+            raise AagClientError(
+                provider_status_error(error_payload, api_key),
+                error_code=f"http_{response.status_code}",
+            )
+        content_type = (response.headers.get("content-type") or "").lower()
+        # Some gateways ignore stream=true and return one JSON object.
+        if "text/event-stream" not in content_type and "json" in content_type:
+            try:
+                payload = response.json()
+            except Exception:
+                raise AagClientError(
+                    "Provider response was not a chat completion",
+                    error_code="invalid_response",
+                ) from None
+            text = _read_completion(payload)
+            if on_delta is not None:
+                on_delta(text)
+            return AagChatResult(text=text, token_count=_token_count(payload))
+        for line in response.iter_lines():
+            _raise_if_cancelled(should_cancel)
+            if time.monotonic() >= overall_deadline:
+                raise AagClientError("Provider request timed out", error_code="timeout")
+            if not line:
+                continue
+            if line.startswith(":"):
+                continue
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                break
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            piece = _delta_text(payload)
+            if piece:
+                parts.append(piece)
+                if on_delta is not None:
+                    on_delta(piece)
+            usage_tokens = _token_count(payload)
+            if usage_tokens is not None:
+                token_count = usage_tokens
+    text = "".join(parts).strip()
+    if not text:
+        raise AagClientError("Provider response was empty", error_code="empty")
+    return AagChatResult(text=text, token_count=token_count)
+
+
 def complete_chat(
     *,
     provider: str,
@@ -211,12 +307,15 @@ def complete_chat(
     kind: str,
     api_key: str | None = None,
     timeout_seconds: int = 30,
+    idle_read_timeout_seconds: int = AAG_DEFAULT_IDLE_READ_SECONDS,
     max_tokens: int = 2000,
     retry_on_network_error: bool = True,
     allow_private: bool = False,
     citation: Mapping[str, Any] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    on_delta: Callable[[str], None] | None = None,
 ) -> AagChatResult:
-    """Call the configured provider. ``fragment`` is redacted before the request."""
+    """Call the configured provider over SSE. Idle gaps and cancel abort the read."""
     if provider not in {"internal", "external"}:
         raise AagClientError("AAG provider is not configured")
     redacted = redact_fragment(fragment)
@@ -235,7 +334,7 @@ def complete_chat(
     except UnsafeOutboundURLError as exc:
         raise AagClientError(str(exc)) from None
     url = chat_completions_url(safe_url)
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if provider == "external":
         key = (api_key or "").strip()
         if not key:
@@ -251,28 +350,28 @@ def complete_chat(
             {"role": "user", "content": _user_content(redacted, citation)},
         ],
         "max_tokens": max_tokens,
+        "stream": True,
     }
     attempts = 2 if retry_on_network_error else 1
-    timeout = max(1, min(int(timeout_seconds or 30), AAG_MAX_TIMEOUT_SECONDS))
+    overall = max(1, min(int(timeout_seconds or 30), AAG_MAX_TIMEOUT_SECONDS))
+    idle = max(5, min(int(idle_read_timeout_seconds or AAG_DEFAULT_IDLE_READ_SECONDS), overall))
+    timeout = httpx.Timeout(connect=min(30.0, float(overall)), read=float(idle), write=30.0, pool=30.0)
     last_error: AagClientError | None = None
     for attempt in range(attempts):
+        _raise_if_cancelled(should_cancel)
+        started = time.monotonic()
         try:
             with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-                response = client.post(url, json=body, headers=headers)
-            if response.status_code >= 400:
-                try:
-                    error_payload = response.json()
-                except Exception:
-                    error_payload = None
-                raise AagClientError(
-                    provider_status_error(error_payload, key),
-                    error_code=f"http_{response.status_code}",
+                return _stream_chat(
+                    client=client,
+                    url=url,
+                    body=body,
+                    headers=headers,
+                    api_key=key,
+                    overall_deadline=started + overall,
+                    should_cancel=should_cancel,
+                    on_delta=on_delta,
                 )
-            try:
-                payload = response.json()
-            except Exception:
-                raise AagClientError("Provider response was not a chat completion", error_code="invalid_response") from None
-            return AagChatResult(text=_read_completion(payload), token_count=_token_count(payload))
         except AagClientError:
             raise
         except httpx.TimeoutException as exc:
@@ -287,10 +386,49 @@ def complete_chat(
     raise last_error or AagClientError("Provider request failed")
 
 
+def group_explain_findings(findings: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse identical FAIL rows for one rule into a single finding."""
+    grouped: list[dict[str, Any]] = []
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for item in findings:
+        status = str(item.get("status") or "")
+        if status.lower() != "fail":
+            row = dict(item)
+            if item.get("id") is not None:
+                row["member_ids"] = [item["id"]]
+            grouped.append(row)
+            continue
+        rule = str(item.get("rule_tech_name") or "").strip()
+        message = str(item.get("message") or "").strip()
+        host = str(item.get("host_name") or item.get("host_id") or "").strip()
+        current = index.get((rule, message))
+        if current is None:
+            current = dict(item)
+            current["hosts"] = [host] if host else []
+            current["member_ids"] = [item["id"]] if item.get("id") is not None else []
+            index[(rule, message)] = current
+            grouped.append(current)
+            continue
+        hosts = current.setdefault("hosts", [])
+        if host and host not in hosts:
+            hosts.append(host)
+        if item.get("id") is not None:
+            current.setdefault("member_ids", []).append(item["id"])
+    for row in grouped:
+        hosts = row.get("hosts")
+        if not isinstance(hosts, list) or len(hosts) < 2:
+            continue
+        shown = ", ".join(str(host) for host in hosts[:8])
+        extra = len(hosts) - 8
+        row["host_name"] = f"{shown} (+{extra})" if extra else shown
+        row["host_count"] = len(hosts)
+    return grouped
+
+
 def build_explain_fragment(findings: list[Mapping[str, Any]], *, run_id: int) -> str:
     """Facts the screen already stored. Raw command output is never included."""
     lines = [f"run_id={run_id}", "Findings:"]
-    for item in findings[:MAX_FINDINGS]:
+    for item in group_explain_findings(findings)[:MAX_FINDINGS]:
         rule = str(item.get("rule_tech_name") or "").strip()
         host = str(item.get("host_name") or item.get("host_id") or "").strip()
         os_type = str(item.get("os_type") or "").strip()
@@ -300,6 +438,9 @@ def build_explain_fragment(findings: list[Mapping[str, Any]], *, run_id: int) ->
         rule_text = str(item.get("rule_text") or "").strip()
         ready = "yes" if item.get("has_remediation") else "no"
         parts = [f"rule={rule}", f"status={status}", f"host={host}", f"os={os_type}"]
+        host_count = item.get("host_count")
+        if isinstance(host_count, int) and host_count > 1:
+            parts.append(f"hosts={host_count}")
         if title:
             parts.append(f"title={title}")
         parts.append(f"remediation_script={ready}")
@@ -676,7 +817,8 @@ def generated_package_files(raw: str, *, profile_name: str = "") -> dict[str, An
 
 
 def write_generated_package(files: Mapping[str, Any], directory: Path) -> list[str]:
-    """Write the three package files and run the same check as import."""
+    """Write the three package files, lint the script, and run the same check as import."""
+    from secaudit_core.aag_script_lint import lint_generated_script, script_contract_errors
     from secaudit_core.profile_packages import validate_profile_package
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -695,6 +837,15 @@ def write_generated_package(files: Mapping[str, Any], directory: Path) -> list[s
     name = str(description.get("profile_name") or description.get("tech_name") or "")
     if official_benchmark_name(name):
         errors.append("Package cannot be signed as CIS, STIG, or FSTEK")
+    errors.extend(lint_generated_script(script_name, script))
+    if script.strip():
+        rule_rows = rules.get("rules") if isinstance(rules, dict) else None
+        rule_ids = [
+            str(item.get("requirement_id") or "").strip()
+            for item in rule_rows or []
+            if isinstance(item, dict) and str(item.get("requirement_id") or "").strip()
+        ]
+        errors.extend(script_contract_errors(script, rule_ids))
     (directory / "description.json").write_text(
         json.dumps(description, ensure_ascii=False, indent=2),
         encoding="utf-8",

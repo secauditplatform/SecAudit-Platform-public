@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
+import socket
+import ssl
 from typing import TypedDict
 from xml.etree.ElementTree import Element
 
+from secaudit_core.audit_flow_match import detect_family
 from secaudit_core.inventory_scan import (
     _load_nmap_xml_root,
     infer_host_defaults,
@@ -15,7 +19,6 @@ AUDITFLOW_PORT_SPEC = (
     "1433,1521,2049,2376,3128,3306,5432,5900,6379,6443,8000,8080,8291,8443,9042,9090,9200,11211,27017"
 )
 AUDITFLOW_MANAGEMENT_PORTS = frozenset({22, 23, 445, 3389, 5985, 5986, 830})
-AUDITFLOW_WINDOWS_PORTS = frozenset({139, 445, 3389})
 
 # Phase 1: ICMP + ARP + TCP SYN to common ports. Default -sn only pings 80/443;
 # Docker/NAT RSTs those and nmap would mark the whole /24 up. skip_unreliable
@@ -83,17 +86,56 @@ NMAP_AUDITFLOW_OS = (
     "--max-retries",
     "2",
 )
+# Second pass for live hosts that are still generic or missing a release.
+# shortcut: one nmap per 4 unclear hosts; split further if a large LAN of
+# generic Linux answers makes this pass too slow.
+NMAP_AUDITFLOW_DEEP = (
+    "-Pn",
+    "-n",
+    "-sT",
+    "-sU",
+    "-sV",
+    "--version-intensity",
+    "7",
+    "-O",
+    "--osscan-guess",
+    "-p",
+    "T:22,23,80,443,8080,8443,U:161",
+    "--script",
+    "banner,http-server-header,snmp-sysdescr",
+    "--script-timeout",
+    "12s",
+    "-T4",
+    "--max-retries",
+    "1",
+    "--host-timeout",
+    "45s",
+    "--open",
+)
+NMAP_AUDITFLOW_DEEP_TCP = (
+    "-Pn",
+    "-n",
+    "-sT",
+    "-sV",
+    "--version-intensity",
+    "7",
+    "-p",
+    "22,23,80,443,8080,8443",
+    "--script",
+    "banner,http-server-header",
+    "--script-timeout",
+    "12s",
+    "-T4",
+    "--max-retries",
+    "1",
+    "--host-timeout",
+    "45s",
+    "--open",
+)
 PORT_SCAN_CHUNK_SIZE = 8
 _GENERIC_OS_LABELS = frozenset(
     {"", "linux", "linux or unix", "windows", "network device", "unix"}
 )
-
-
-def nmap_service_args(*, syn: bool = False) -> list[str]:
-    args = list(NMAP_AUDITFLOW_SERVICE)
-    if syn:
-        return ["-sS" if token == "-sT" else token for token in args]
-    return args
 
 
 def host_from_open_ports(
@@ -128,17 +170,98 @@ def needs_os_fingerprint(host: AuditFlowNmapHost | None) -> bool:
     return guess in _GENERIC_OS_LABELS
 
 
-def needs_windows_script(host: AuditFlowNmapHost | None) -> bool:
+_HINT_KEEP = re.compile(
+    r"asus|ubuntu|debian|alt[\s-]*linux|altlinux|basealt|windows|mikrotik|cisco|juniper|routeros",
+    re.IGNORECASE,
+)
+_HINT_PORTS = (22, 80, 443, 8443)
+
+
+def grab_endpoint_hints(ip: str, open_ports: list[int] | None, *, timeout: float = 2.0) -> tuple[str, list[int]]:
+    """Read SSH banner, HTTP title, or TLS certificate. No root, unlike nmap -O."""
+    ports = [int(port) for port in (open_ports or [])]
+    if ports:
+        targets = [port for port in _HINT_PORTS if port in ports]
+    else:
+        targets = list(_HINT_PORTS)
+    lines: list[str] = []
+    answered: list[int] = []
+    for port in targets:
+        text = _ssh_banner(ip, port, timeout) if port == 22 else _http_hint(ip, port, timeout)
+        if not text:
+            continue
+        answered.append(port)
+        lines.append(text)
+    return "\n".join(lines)[:2000], answered
+
+
+def _ascii_hints(blob: str) -> str:
+    kept: list[str] = []
+    for run in re.findall(r"[\x20-\x7e]{4,120}", blob or ""):
+        line = run.strip()
+        if line.startswith("SSH-") or _HINT_KEEP.search(line):
+            kept.append(line)
+        if len(kept) >= 8:
+            break
+    return "\n".join(kept)
+
+
+def _ssh_banner(ip: str, port: int, timeout: float) -> str | None:
+    try:
+        with socket.create_connection((ip, port), timeout) as sock:
+            sock.settimeout(timeout)
+            data = sock.recv(256)
+    except OSError:
+        return None
+    text = data.decode("utf-8", errors="ignore").strip()
+    return _ascii_hints(text) or None
+
+
+def _http_hint(ip: str, port: int, timeout: float) -> str | None:
+    tls = port in {443, 8443}
+    try:
+        raw = socket.create_connection((ip, port), timeout)
+    except OSError:
+        return None
+    try:
+        raw.settimeout(timeout)
+        sock = raw
+        cert_text = ""
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            try:
+                sock = ctx.wrap_socket(raw, server_hostname=ip)
+                der = sock.getpeercert(True) or b""
+                cert_text = der.decode("latin1", errors="ignore")
+            except OSError:
+                return _ascii_hints(cert_text) or None
+        try:
+            sock.sendall(f"GET / HTTP/1.0\r\nHost: {ip}\r\n\r\n".encode())
+            page = sock.recv(8192).decode("latin1", errors="ignore")
+        except OSError:
+            page = ""
+        return _ascii_hints(f"{cert_text}\n{page}") or None
+    finally:
+        raw.close()
+
+
+def host_needs_deep_probe(host: AuditFlowNmapHost | None) -> bool:
+    """True when the first pass left no family, or a family without a release."""
     if not host:
-        return False
-    ports = set(host.get("open_ports") or [])
-    if not ports & AUDITFLOW_WINDOWS_PORTS:
-        return False
-    guess = (host.get("os_guess") or "").strip().lower()
-    return guess in _GENERIC_OS_LABELS or "windows" in guess
+        return True
+    guess = (host.get("os_guess") or "").strip()
+    if not guess or guess.lower() in _GENERIC_OS_LABELS:
+        return True
+    family = detect_family(guess)
+    if not family:
+        return True
+    return not bool(re.search(r"\d", guess))
 
 
 _OS_SCRIPT_IDS = frozenset({"smb-os-discovery", "rdp-ntlm-info"})
+_BANNER_SCRIPT_IDS = frozenset({"banner", "http-server-header", "snmp-sysdescr"})
 _WIN_NTLM_RELEASE = (
     (26100, "Windows 11 / Server 2025"),
     (22621, "Windows 11"),
@@ -171,6 +294,7 @@ class AuditFlowNmapHost(TypedDict, total=False):
     os_accuracy: int
     mac_vendor: str | None
     device_type: str | None
+    os_source: str | None
     scripts: dict[str, str]
 
 
@@ -231,42 +355,95 @@ def merge_auditflow_hosts(
     return merged
 
 
+def _mac_os_label(vendor: str, device: str) -> str | None:
+    blob = vendor.lower()
+    if "asustek" in blob or re.search(r"(?<![a-z])asus(?![a-z])", blob):
+        kind = device.lower()
+        if kind in {"router", "wap", "bridge", "firewall", "broadband router"}:
+            return "ASUS router"
+        return "ASUS"
+    return None
+
+
+def _banner_os_label(scripts: dict[str, str]) -> str | None:
+    chunks = [
+        scripts.get("snmp-sysdescr") or "",
+        scripts.get("http-server-header") or "",
+        scripts.get("http-title") or "",
+        scripts.get("ssl-cert") or "",
+        scripts.get("endpoint-hint") or "",
+        scripts.get("banner") or "",
+    ]
+    blob = "\n".join(chunk for chunk in chunks if chunk)
+    if not blob:
+        return None
+    lower = blob.lower()
+    if "asuswrt" in lower or "asustek" in lower or re.search(r"(?<![a-z])asus(?![a-z])", lower):
+        for chunk in chunks:
+            line = chunk.strip().splitlines()[0].strip() if chunk.strip() else ""
+            if line and re.search(r"asus", line, re.IGNORECASE):
+                return line[:120]
+        return "ASUS router"
+    alt = re.search(
+        r"alt(?:\s+linux)?(?:\s+(?:server|sp|workstation))?\s*\d+(?:\.\d+)?",
+        lower,
+        re.IGNORECASE,
+    )
+    if alt or "altlinux" in lower or "basealt" in lower:
+        return alt.group(0) if alt else "ALT Linux"
+    ubuntu = re.search(r"ubuntu(?:\s+linux)?(?:\s+\d{2}(?:\.\d{1,2})?)?", lower, re.IGNORECASE)
+    if ubuntu:
+        return ubuntu.group(0)
+    return None
+
+
 def compose_os_guess(host: AuditFlowNmapHost) -> str | None:
     """Best unauthenticated OS label: nmap -O, then NSE, then banners, then MAC/ports."""
     accuracy = int(host.get("os_accuracy") or 0)
     nmap_os = (host.get("os_guess") or "").strip()
-    script_os = _os_from_scripts(host.get("scripts") or {})
-    banner_os = _os_from_services(host.get("services") or [])
+    scripts = host.get("scripts") or {}
+    script_os = _os_from_scripts(scripts)
+    banner_os = _os_from_services(host.get("services") or []) or _banner_os_label(scripts)
     specific = script_os or banner_os
-    if nmap_os and accuracy >= 80:
-        if specific and _more_specific(specific, nmap_os):
-            return specific[:256]
-        return nmap_os[:256]
-    if script_os:
-        return script_os[:256]
-    if nmap_os and accuracy >= 50:
-        if specific and _more_specific(specific, nmap_os):
-            return specific[:256]
-        return nmap_os[:256]
-    if banner_os:
-        return banner_os[:256]
-    if nmap_os:
-        return nmap_os[:256]
     vendor = (host.get("mac_vendor") or "").strip()
     device = (host.get("device_type") or "").strip()
+    mac_label = _mac_os_label(vendor, device)
+
+    def finish(label: str | None, source: str) -> str | None:
+        if not label:
+            return None
+        host["os_source"] = source
+        return label[:256]
+
+    if nmap_os and accuracy >= 80:
+        if specific and _more_specific(specific, nmap_os):
+            return finish(specific, "banner")
+        return finish(nmap_os, "nmap")
+    if script_os:
+        return finish(script_os, "nmap")
+    if nmap_os and accuracy >= 50:
+        if specific and _more_specific(specific, nmap_os):
+            return finish(specific, "banner")
+        return finish(nmap_os, "nmap")
+    if banner_os:
+        return finish(banner_os, "banner")
+    if mac_label and (not nmap_os or accuracy <= 0):
+        return finish(mac_label, "mac")
+    if nmap_os:
+        return finish(nmap_os, "nmap" if accuracy else (host.get("os_source") or "banner"))
     ports = set(host.get("open_ports") or [])
     if vendor and device:
-        return f"{vendor} {device}"[:256]
+        return finish(f"{vendor} {device}", "mac")
     if vendor:
-        return f"{vendor} device"[:256]
+        return finish(f"{vendor} device", "mac")
     if ports & {3389, 445, 139, 5985, 5986}:
-        return "Windows"
+        return finish("Windows", "ports")
     if 8291 in ports:
-        return "MikroTik RouterOS"
+        return finish("MikroTik RouterOS", "ports")
     if ports & {23, 830}:
-        return "Network device"
+        return finish("Network device", "ports")
     if 22 in ports:
-        return "Linux or Unix"
+        return finish("Linux or Unix", "ports")
     return None
 
 
@@ -389,7 +566,11 @@ def _parse_host(host: Element) -> AuditFlowNmapHost | None:
         for script in hostscript.findall("script"):
             scripts.update(_script_fields(script))
 
-    os_guess, os_accuracy, device_type = _os_from_nmap_os(host.find("os"))
+    os_el = host.find("os")
+    evidence = _os_evidence(os_el)
+    if evidence:
+        scripts["os_evidence"] = evidence
+    os_guess, os_accuracy, device_type = _os_from_nmap_os(os_el)
     parsed: AuditFlowNmapHost = {
         "ip": ip,
         "hostname": hostname,
@@ -458,9 +639,32 @@ def _os_from_nmap_os(os_el: Element | None) -> tuple[str | None, int, str | None
     return None, 0, device_type
 
 
+def _os_evidence(os_el: Element | None) -> str:
+    if os_el is None:
+        return ""
+    lines: list[str] = []
+    for cpe in os_el.iter("cpe"):
+        text = (cpe.text or "").strip()
+        if text:
+            lines.append(text)
+    for osclass in os_el.iter("osclass"):
+        vendor = (osclass.get("vendor") or "").strip()
+        family = (osclass.get("osfamily") or "").strip()
+        gen = (osclass.get("osgen") or "").strip()
+        if not gen or family.lower() in {"linux", "unix", ""}:
+            continue
+        lines.append(" ".join(part for part in (vendor, family, gen) if part))
+    return "\n".join(lines)
+
+
 def _script_fields(script: Element) -> dict[str, str]:
     script_id = (script.get("id") or "").strip()
     fields: dict[str, str] = {}
+    if script_id in _BANNER_SCRIPT_IDS:
+        output = (script.get("output") or "").strip()
+        if script_id and output:
+            fields[script_id] = output
+        return fields
     if script_id not in _OS_SCRIPT_IDS and script_id != "nbstat":
         return fields
     for elem in script.findall("elem"):
@@ -534,6 +738,9 @@ def _more_specific(candidate: str, baseline: str) -> bool:
                 "opensuse",
                 "fedora",
                 "astra",
+                "alt linux",
+                "altlinux",
+                "asus",
                 "openwrt",
                 "xiaomi",
                 "miwifi",
@@ -603,6 +810,10 @@ def _looks_like_os_label(text: str) -> bool:
         "mikrotik",
         "freebsd",
         "darwin",
+        "alt linux",
+        "altlinux",
+        "basealt",
+        "asus",
     )
     return any(token in blob for token in tokens)
 

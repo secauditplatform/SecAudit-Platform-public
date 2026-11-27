@@ -22,9 +22,12 @@ type UserForm = {
   role: UserRole;
   password: string;
   is_active: boolean;
+  access_sites: string;
+  access_environments: string;
+  access_tags: string;
 };
 
-const ROLES: UserRole[] = ["admin", "operator", "auditor"];
+const ROLES: UserRole[] = ["admin", "operator", "auditor", "security_approver"];
 const MIN_PASSWORD_LENGTH = 8;
 
 const emptyForm = (): UserForm => ({
@@ -34,7 +37,30 @@ const emptyForm = (): UserForm => ({
   role: "operator",
   password: "",
   is_active: true,
+  access_sites: "",
+  access_environments: "",
+  access_tags: "",
 });
+
+function parseScopeList(value: string): string[] {
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const part of value.split(",")) {
+    const item = part.trim();
+    if (!item || seen.has(item)) continue;
+    seen.add(item);
+    items.push(item);
+  }
+  return items;
+}
+
+function scopePayload(form: UserForm) {
+  return {
+    access_sites: parseScopeList(form.access_sites),
+    access_environments: parseScopeList(form.access_environments),
+    access_tags: parseScopeList(form.access_tags),
+  };
+}
 
 function isPasswordTooShort(password: string, required: boolean): boolean {
   if (!password) return required;
@@ -67,6 +93,8 @@ function roleVariant(role: UserRole): "success" | "info" | "warning" | "neutral"
       return "info";
     case "auditor":
       return "warning";
+    case "security_approver":
+      return "neutral";
     default:
       return "neutral";
   }
@@ -175,6 +203,9 @@ export function UsersPage() {
       role: user.role,
       password: "",
       is_active: user.is_active,
+      access_sites: (user.access_sites ?? []).join(", "),
+      access_environments: (user.access_environments ?? []).join(", "),
+      access_tags: (user.access_tags ?? []).join(", "),
     });
   };
 
@@ -369,6 +400,38 @@ export function UsersPage() {
                         {isSelf ? <p className="pf-form__hint">{t("users.selfEditHint")}</p> : null}
                       </div>
                     ) : null}
+                    {form.role === "operator" ? (
+                      <>
+                        <div className="pf-form__group">
+                          <label htmlFor="user-sites">{t("users.accessSites")}</label>
+                          <input
+                            id="user-sites"
+                            className="pf-input"
+                            value={form.access_sites}
+                            onChange={(e) => setForm({ ...form, access_sites: e.target.value })}
+                          />
+                        </div>
+                        <div className="pf-form__group">
+                          <label htmlFor="user-environments">{t("users.accessEnvironments")}</label>
+                          <input
+                            id="user-environments"
+                            className="pf-input"
+                            value={form.access_environments}
+                            onChange={(e) => setForm({ ...form, access_environments: e.target.value })}
+                          />
+                        </div>
+                        <div className="pf-form__group">
+                          <label htmlFor="user-tags">{t("users.accessTags")}</label>
+                          <input
+                            id="user-tags"
+                            className="pf-input"
+                            value={form.access_tags}
+                            onChange={(e) => setForm({ ...form, access_tags: e.target.value })}
+                          />
+                          <p className="pf-form__hint">{t("users.accessHint")}</p>
+                        </div>
+                      </>
+                    ) : null}
                   </div>
                 </section>
               </div>
@@ -387,6 +450,7 @@ export function UsersPage() {
                             full_name: form.full_name || null,
                             role: form.role,
                             is_active: form.is_active,
+                            ...scopePayload(form),
                             ...(form.password ? { password: form.password } : {}),
                           },
                         });
@@ -409,6 +473,7 @@ export function UsersPage() {
                         full_name: form.full_name || undefined,
                         role: form.role,
                         password: form.password,
+                        ...scopePayload(form),
                       });
                     }}
                     disabled={!canSubmitAccount}

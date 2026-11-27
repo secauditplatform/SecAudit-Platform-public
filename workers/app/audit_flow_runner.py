@@ -32,11 +32,15 @@ from secaudit_core.audit_flow_match import (
 )
 from secaudit_core.ssh_fingerprint import fingerprint_from_known_hosts_line, scan_ssh_host_key, verify_or_pin_host_key
 from secaudit_core.audit_flow_nmap import (
+    NMAP_AUDITFLOW_DEEP,
+    NMAP_AUDITFLOW_DEEP_TCP,
     NMAP_AUDITFLOW_DISCOVERY,
     NMAP_AUDITFLOW_IDENTITY,
     NMAP_AUDITFLOW_IDENTITY_NO_OS,
     PORT_SCAN_CHUNK_SIZE,
+    grab_endpoint_hints,
     has_management_port,
+    host_needs_deep_probe,
     merge_auditflow_hosts,
     parse_nmap_gnmap_hosts,
     parse_nmap_service_xml,
@@ -149,6 +153,8 @@ def _apply_nmap_identity(db: Session, run_id: int, discovered_ips: dict[str, str
             nmap_os=nmap_host.get("os_guess"),
             services=blob,
             open_ports=ports,
+            os_source=nmap_host.get("os_source"),
+            accuracy=nmap_host.get("os_accuracy") or None,
         )
         if fp.get("platform"):
             row.platform = fp["platform"]
@@ -174,6 +180,24 @@ def _identify_live_chunk(
     except RuntimeError as exc:
         _log(run_id, f"OS fingerprint unavailable, retrying services only: {exc}", "warning")
     xml = _run_nmap([*NMAP_AUDITFLOW_IDENTITY_NO_OS, *extra, *chunk], run_id, redis_url)
+    return parse_nmap_service_xml(xml)
+
+
+def _deep_identify_chunk(
+    chunk: list[str],
+    run_id: int,
+    redis_url: str,
+    *,
+    family_args: list[str] | None = None,
+) -> dict:
+    """HTTP, SSH banner, SNMP sysDescr and OS guess for hosts the first pass left vague."""
+    extra = family_args or []
+    try:
+        xml = _run_nmap([*NMAP_AUDITFLOW_DEEP, *extra, *chunk], run_id, redis_url)
+        return parse_nmap_service_xml(xml)
+    except RuntimeError as exc:
+        _log(run_id, f"Deep identify fell back to TCP banners: {exc}", "warning")
+    xml = _run_nmap([*NMAP_AUDITFLOW_DEEP_TCP, *extra, *chunk], run_id, redis_url)
     return parse_nmap_service_xml(xml)
 
 
@@ -776,6 +800,8 @@ def _apply_probe_result(
     open_ports: list[int],
     blob: str,
     nmap_os: str | None,
+    os_source: str | None = None,
+    accuracy: int | None = None,
     cred_id: int | None,
     auth_fp: Fingerprint | None,
     skip: str | None,
@@ -794,6 +820,8 @@ def _apply_probe_result(
         nmap_os=nmap_os,
         services=blob,
         open_ports=open_ports,
+        os_source=os_source,
+        accuracy=accuracy,
     )
     decision = decide_profile(fp, profiles, authenticated=bool(cred_id))
     apps = rank_application_profiles(services=blob, open_ports=open_ports, profiles=profiles)
@@ -920,6 +948,53 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                                 if nmap_host.get("hostname"):
                                     discovered_ips[ip] = nmap_host["hostname"]
 
+                unclear = [ip for ip in live_ips if host_needs_deep_probe(service_hosts.get(ip))]
+                if unclear:
+                    _cancelled(redis_url, run_id)
+                    _log(run_id, f"Deep identify {len(unclear)} unclear host(s)")
+                    for family_flags, family_targets in nmap_address_groups(unclear):
+                        for index in range(0, len(family_targets), 4):
+                            chunk = family_targets[index : index + 4]
+                            set_audit_flow_progress(
+                                redis_url, run_id, phase="services", target=None, address=chunk[0]
+                            )
+                            _log(run_id, f"Deep identify {', '.join(chunk)}")
+                            parsed = _deep_identify_chunk(
+                                chunk, run_id, redis_url, family_args=family_flags
+                            )
+                            for ip, nmap_host in parsed.items():
+                                service_hosts[ip] = merge_auditflow_hosts(
+                                    service_hosts.get(ip), nmap_host
+                                )
+                                if nmap_host.get("hostname"):
+                                    discovered_ips[ip] = nmap_host["hostname"]
+
+                for ip in live_ips:
+                    current = service_hosts.get(ip)
+                    if not host_needs_deep_probe(current):
+                        continue
+                    known_ports = list(current.get("open_ports") or []) if current else []
+                    hint, answered = grab_endpoint_hints(ip, known_ports)
+                    if not hint and not answered:
+                        continue
+                    host = current or {
+                        "ip": ip,
+                        "hostname": discovered_ips.get(ip),
+                        "open_ports": [],
+                        "services": [],
+                        "os_guess": None,
+                        "os_accuracy": 0,
+                        "scripts": {},
+                    }
+                    if answered:
+                        host["open_ports"] = sorted(set(host.get("open_ports") or []) | set(answered))
+                    if hint:
+                        scripts = dict(host.get("scripts") or {})
+                        scripts["endpoint-hint"] = hint
+                        host["scripts"] = scripts
+                    service_hosts[ip] = host
+                    _log(run_id, f"{ip}: endpoint hint {hint or 'open ' + ','.join(str(p) for p in answered)}")
+
                 _apply_nmap_identity(db, run_id, discovered_ips, service_hosts)
                 _refresh_hosts_found(db, run)
                 db.commit()
@@ -945,6 +1020,8 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                         open_ports=open_ports,
                         blob=blob,
                         nmap_os=nmap_os,
+                        os_source=nmap_host.get("os_source") if nmap_host else None,
+                        accuracy=nmap_host.get("os_accuracy") if nmap_host else None,
                         cred_id=None,
                         auth_fp=None,
                         skip="unreachable",
@@ -993,6 +1070,8 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                                 open_ports=open_ports,
                                 blob=blob,
                                 nmap_os=nmap_os,
+                                os_source=nmap_host.get("os_source") if nmap_host else None,
+                                accuracy=nmap_host.get("os_accuracy") if nmap_host else None,
                                 cred_id=cred_id,
                                 auth_fp=auth_fp,
                                 skip=skip,
@@ -1019,6 +1098,8 @@ def run_audit_flow_scan_sync(run_id: int, *, database_url: str, redis_url: str) 
                             open_ports=open_ports,
                             blob=blob,
                             nmap_os=nmap_os,
+                            os_source=nmap_host.get("os_source") if nmap_host else None,
+                            accuracy=nmap_host.get("os_accuracy") if nmap_host else None,
                             cred_id=None,
                             auth_fp=None,
                             skip=None,
@@ -1089,8 +1170,6 @@ def run_audit_flow_reprobe_sync(
             ).scalar_one_or_none()
             if run is None:
                 return
-            run.status = AuditFlowStatus.SCANNING
-            db.commit()
             _log(run_id, "Re-probing hosts with new credentials")
             profiles = _profile_inputs(db)
             creds = list(run.credentials)
@@ -1147,10 +1226,9 @@ def run_audit_flow_reprobe_sync(
                     _log_match(run_id, ip, cred_id, skip, decision, row.extra_profiles_json)
                     db.commit()
                 run = db.get(AuditFlowRun, run_id)
-                if run:
+                if run and run.status == AuditFlowStatus.SCANNING:
                     run.status = AuditFlowStatus.READY
                     run.finished_at = datetime.now(UTC)
-                    _maybe_enqueue_auto_execute(db, run)
                     db.commit()
                 _log(run_id, f"Re-probe finished ({len(targets)} host(s))")
             except ScanCancelledError:
